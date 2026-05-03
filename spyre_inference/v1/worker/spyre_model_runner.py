@@ -32,6 +32,7 @@ from torch.utils._pytree import tree_map
 
 import numpy as np
 
+from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig, CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
@@ -231,8 +232,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
 
-        # Compile for Spyre (no-op if enforce_eager=True)
-        self._compile_for_spyre()
+        # Compile using upstream STOCK_TORCH_COMPILE logic.
+        # When enforce_eager=True, vLLM's config defaulting already sets
+        # mode=NONE, so this block is skipped automatically.
+        #
+        # fullgraph=False because Spyre custom ops (linear, rms_norm, etc.)
+        # use convert()/.to() with torch-spyre's monkey-patched Tensor.to,
+        # which Dynamo cannot trace — causing graph breaks. Once all ops
+        # are natively compilable, this can be changed to fullgraph=True.
+        if (
+            self.compilation_config.mode
+            == CompilationMode.STOCK_TORCH_COMPILE
+        ):
+            backend = self.compilation_config.init_backend(self.vllm_config)
+            compilation_counter.stock_torch_compile_count += 1
+            self.model.compile(backend=backend)
+            logger.info("Model compiled for Spyre (backend=%s)", backend)
 
         # Wrap model so ALL forward() calls to the entire model,
         # for example in execute_model, _dummy_run, etc.,
@@ -243,44 +258,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         logger.info("Model loaded and compiled for Spyre.")
 
-    def _compile_for_spyre(self) -> None:
-        """Apply torch.compile for Spyre with static shapes.
-
-        Spyre compilation is handled here (not by vLLM's @support_torch_compile)
-        because Spyre requires static shapes — dynamic shapes (SymInt) are not
-        supported by the Spyre Inductor backend.
-
-        Supported modes:
-        - enforce_eager=True: no compilation (eager execution)
-        - CompilationMode.NONE: Spyre-managed compilation with torch.compile
-        Other vLLM compilation modes (VLLM_COMPILE, STOCK_TORCH_COMPILE) are
-        not supported — the platform forces CompilationMode.NONE in
-        apply_config_platform_defaults().
-        """
-        mode = self.compilation_config.mode
-        if mode != CompilationMode.NONE:
-            raise ValueError(
-                f"Unsupported compilation mode {mode} for Spyre. "
-                f"Only CompilationMode.NONE is supported. Spyre handles "
-                f"compilation internally via _compile_for_spyre(). "
-                f"Use enforce_eager=True to disable compilation entirely."
-            )
-
-        if self.vllm_config.model_config.enforce_eager:
-            logger.info("Compilation disabled (enforce_eager=True)")
-            return
-
-        # Custom ops (spyre_rmsnorm, spyre_cpu_fallback, etc.) are opaque
-        # to dynamo but don't cause graph breaks — fullgraph=True is safe.
-        # dynamic=False ensures static shapes (Spyre can't handle SymInt).
-        self.model = torch.compile(
-            self.model,
-            backend="inductor",
-            fullgraph=True,
-            dynamic=False,
-        )
-        logger.info("Model compiled for Spyre (backend=inductor)")
-
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up the model.
 
@@ -289,7 +266,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         embedding thus runs on Spyre and hidden_states flow on Spyre.
         _SpyreModelWrapper also converts final outputs back to CPU.
 
-        When enforce_eager=False, this also triggers torch.compile.
+        With STOCK_TORCH_COMPILE, model.compile() was called in load_model()
+        but compilation is lazy — the first forward pass here triggers the
+        actual Inductor compilation.
         """
         logger.info("Warming up model...")
         num_tokens = min(
@@ -329,9 +308,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model = self.model
         if isinstance(model, _SpyreModelWrapper):
             model = model._model
-        # Unwrap torch.compile's OptimizedModule (has _orig_mod attribute)
-        if hasattr(model, "_orig_mod"):
-            model = model._orig_mod
         return model
 
     # --- Buffer management ---
