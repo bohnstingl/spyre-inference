@@ -10,7 +10,6 @@ Limitations:
     *) FP16 multiply diverges from CPU, which flips tokens under greedy decoding. 
     Thus, for the moment, the multiplications in `SpyreApplyRotaryEmb` need to run on CPU
     *) No promotion of the data types, as this is not yet supported in torch-spyre.
-    
 """
 
 import torch
