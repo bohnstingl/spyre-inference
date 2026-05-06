@@ -18,6 +18,5 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     vocab_parallel_embedding.register()
     parallel_lm_head.register()
-    rotary_embedding.register()
     rms_norm.register()
     linear.register()
