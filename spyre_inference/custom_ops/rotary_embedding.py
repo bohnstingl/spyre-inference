@@ -45,8 +45,9 @@ class SpyreApplyRotaryEmb(ApplyRotaryEmb):
 
         origin_dtype = x_cpu.dtype
         if self.enable_fp32_compute:
+            # As soon as torch-spyre supports dtype conversions
+            # we can remove this restriction.
             raise RuntimeError("Spyre currently doesn't support dtype upcasting!")
-            x_cpu = x_cpu.float()
 
         cos_cpu = cos_cpu.unsqueeze(-2).to(x_cpu.dtype)
         sin_cpu = sin_cpu.unsqueeze(-2).to(x_cpu.dtype)
@@ -65,8 +66,6 @@ class SpyreApplyRotaryEmb(ApplyRotaryEmb):
         else:
             output = torch.stack((o1, o2), dim=-1).flatten(-2)
 
-        if self.enable_fp32_compute:
-            output = output.to(origin_dtype)
         return convert(output, device=device)
 
 
