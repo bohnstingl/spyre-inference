@@ -59,6 +59,57 @@ from spyre_inference.custom_ops.utils import convert
 logger = init_logger(__name__)
 
 
+def _log_fp32_upcasts(inner_backend):
+    """Wrap an Inductor backend to print fx nodes that upcast to fp32.
+
+    Only prints nodes whose meta/args indicate torch.float32, plus a short
+    stack trace (node.stack_trace) pointing back to the Python source line.
+    """
+    from functools import wraps
+
+    # `init_backend()` can return a registered backend name (e.g. "inductor")
+    # instead of a callable. Resolve it so we can actually call it.
+    if isinstance(inner_backend, str):
+        from torch._dynamo.backends.registry import lookup_backend
+        inner_backend = lookup_backend(inner_backend)
+
+    @wraps(inner_backend)
+    def _wrapped(gm, example_inputs):
+        logger.info("=== Spyre backend received fx graph (readable) ===")
+        try:
+            logger.info("%s", gm.print_readable(print_output=False))
+        except Exception as e:
+            logger.info("print_readable failed: %s", e)
+
+        logger.info("=== fp32 suspects with stack traces ===")
+        found = False
+        for node in gm.graph.nodes:
+            dtype_in_args = any(
+                a is torch.float32 for a in (*node.args, *node.kwargs.values())
+            )
+            meta_dtype = None
+            if "val" in node.meta and hasattr(node.meta["val"], "dtype"):
+                meta_dtype = node.meta["val"].dtype
+            if dtype_in_args or meta_dtype is torch.float32:
+                found = True
+                users = list(node.users)
+                logger.info(
+                    "FP32 node: %s target=%s meta_dtype=%s users=%s",
+                    node.name,
+                    node.target,
+                    meta_dtype,
+                    [u.name for u in users],
+                )
+                if node.stack_trace:
+                    logger.info("  stack:\n%s", node.stack_trace)
+        if not found:
+            logger.info("No fp32 nodes detected in this subgraph.")
+        logger.info("=== end fx graph dump ===")
+        return inner_backend(gm, example_inputs)
+
+    return _wrapped
+
+
 class SpyreCpuGpuBuffer:
     """Spyre-specific CpuGpuBuffer with Spyre-safe copies and split dtypes.
     This buffer is closely related to the CpuGpuBuffer in vllm/v1/utils.py.
@@ -263,6 +314,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             == CompilationMode.STOCK_TORCH_COMPILE
         ):
             backend = self.compilation_config.init_backend(self.vllm_config)
+            backend = _log_fp32_upcasts(backend)
             compilation_counter.stock_torch_compile_count += 1
             self.model.compile(backend=backend)
             logger.info("Model compiled for Spyre (backend=%s)", backend)
