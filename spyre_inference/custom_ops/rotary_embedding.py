@@ -49,7 +49,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        target_device = query.device
+        target_device = positions.device
         target_dtype = query.dtype
 
         cpu_positions = convert(positions, device="cpu")
