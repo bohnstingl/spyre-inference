@@ -24,7 +24,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
 )
-from spyre_inference import envs
 
 
 def _spyre_available() -> bool:
@@ -46,7 +45,6 @@ def configure_device(request, monkeypatch):
     device_mode = request.param
     if device_mode == "spyre" and not _spyre_available():
         pytest.skip("Spyre device not available")
-    envs.clear_env_cache()
     return device_mode
 
 
@@ -62,7 +60,7 @@ def configure_compilation(request, monkeypatch):
 
     # Reset dynamo cache first to ensure config changes take effect
     torch._dynamo.reset()
-    
+
     cfg = get_cached_compilation_config()
     original_mode = cfg.mode
 
@@ -73,6 +71,11 @@ def configure_compilation(request, monkeypatch):
     # Increase recompilation limit to handle list-based page_indices
     # which trigger recompilation on each unique block index value
     torch._dynamo.config.accumulated_recompile_limit = 1024
+
+    # Sync module-level compile gate with the test's compilation mode
+    from spyre_inference.v1.attention.backends import spyre_attn
+
+    monkeypatch.setattr(spyre_attn, "_ENABLE_COMPILE", compilation_mode != CompilationMode.NONE)
 
     yield mode_name
 
@@ -233,7 +236,7 @@ def ref_attn(
     "num_heads",
     [
         pytest.param((32, 8), id="GQA"),
-        pytest.param((32, 32), id="MHA"),
+        # pytest.param((32, 32), id="MHA"),
         # pytest.param((32, 1), id="MQA"),
     ],
 )
@@ -369,6 +372,10 @@ def test_spyre_attn(
 
     output = torch.empty_like(query).to(cache_device)
     kv_cache = (k_pages, v_pages)
+    # Note: attn_impl.forward() internally calls _reshape_and_cache() to write
+    # the new K/V tokens into the cache, so this test exercises both the cache
+    # writing and attention computation paths. TODO: Add a dedicated unit test
+    # for _reshape_and_cache to independently verify cache writes.
     attn_impl.forward(
         layer=None,
         query=query,
@@ -398,7 +405,4 @@ def test_spyre_attn(
     else:
         atol, rtol = 0.2, 0.2
 
-    if configure_device == "spyre":
-        torch.testing.assert_close(output.to("cpu"), ref_output, atol=atol, rtol=rtol)
-    else:
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(output.to("cpu"), ref_output, atol=atol, rtol=rtol)

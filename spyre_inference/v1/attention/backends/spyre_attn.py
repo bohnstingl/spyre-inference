@@ -46,7 +46,15 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+# TODO: Make these hyperparameters configurable
+# KV length alignment: KV tensors are padded to the next multiple of this value.
+# Because torch.compile treats shapes as static constants, every distinct kv_len
+# triggers a full recompile. Aligning to 256 buckets sequence lengths into tiers
+# (256, 512, 768, ...) so only the first request at each tier pays compilation cost,
+# rather than recompiling on every decode step.
 KV_LENGTH_ALIGNMENT = 256
+
+# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
 QUERY_CHUNK_SIZE = 32
 
 
@@ -131,24 +139,38 @@ def _indirect_matmul_mock(
     return output
 
 
+def _resolve_compilation_config():
+    """Resolve compilation config once at module load time.
+
+    Returns True if torch.compile should be applied, False otherwise.
+    Falls back to False (no compilation) if the vLLM config context
+    is not set — matching the Spyre platform default (CompilationMode.NONE).
+    """
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.compilation import CompilationMode
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+    cfg = config.compilation_config
+    if cfg.mode == CompilationMode.NONE:
+        return False
+    return cfg.backend != "eager"
+
+
+_ENABLE_COMPILE = _resolve_compilation_config()
+
+
 def _maybe_compile(fn):
-    """Compile fn unless vLLM's compilation config disables it.
+    """Compile fn unless compilation is disabled.
 
     Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
-    inheritance: returns fn unchanged when compilation mode is NONE or the
-    backend is "eager", otherwise wraps it with torch.compile.
+    inheritance. Skips torch.compile when _ENABLE_COMPILE is False
+    (CompilationMode.NONE, backend="eager", or config context unavailable).
     """
-    return fn
-    # return torch.compile(fn, dynamic=False)
-    # from vllm.config import get_cached_compilation_config
-    # from vllm.config.compilation import CompilationMode
-
-    # cfg = get_cached_compilation_config()
-    # if cfg.mode == CompilationMode.NONE:
-    #     return fn
-    # if cfg.backend == "eager":
-    #     return fn
-    # return torch.compile(fn, dynamic=False)
+    if not _ENABLE_COMPILE:
+        return fn
+    return torch.compile(fn, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -303,25 +325,31 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
 class SpyreAttentionMetadata(AttentionMetadata):
     """Metadata for paged online-softmax attention on Spyre."""
 
+    # Batch information
     num_actual_tokens: int
     num_seqs: int
     max_query_len: int
     max_seq_len: int
 
+    # Sequence lengths
     seq_lens: torch.Tensor  # [num_seqs]
     query_start_loc: torch.Tensor  # [num_seqs + 1]
 
+    # Block table for paged KV cache
     block_table: torch.Tensor  # [num_seqs, max_num_blocks_per_seq]
     block_size: int
 
+    # Slot mapping for KV cache updates
     slot_mapping: torch.Tensor  # [num_actual_tokens]
 
     # Precomputed from slot_mapping (avoids CPU round-trip during forward)
     slot_block_indices: list[int] | None = None
     slot_block_offsets: list[int] | None = None
 
+    # Whether causal masking is needed (True when max_query_len > 1)
     apply_causal_mask: bool = False
 
+    # For grouped-query attention
     num_kv_heads: int = 0
     num_heads: int = 0
 
@@ -336,6 +364,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     @property
     def query_lens(self) -> torch.Tensor:
+        """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
 
@@ -440,6 +469,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> SpyreAttentionMetadata:
+        """Build attention metadata from common metadata."""
+
         seq_lens = common_attn_metadata.seq_lens
         query_start_loc = common_attn_metadata.query_start_loc
         max_seq_len = common_attn_metadata.max_seq_len
@@ -610,6 +641,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[int, object] = {}
 
+        print("Using SpyreAttentionBackend with LIST-BASED online softmax (v0)")
+
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
         if sliding_window is not None:
@@ -635,9 +668,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def forward(
         self,
         layer: torch.nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        query: torch.Tensor,  # [num_tokens, num_heads, head_size]
+        key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         kv_cache: tuple[list[torch.Tensor], list[torch.Tensor]],
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor | None = None,
@@ -649,6 +682,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata is None:
             return output
 
+        # TODO: need to take care if the K and V are on CPU due to the split
+        # operation of GraniteAttention
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -756,6 +791,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
             q = q.reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+
+            # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
+            # bug in layout propagation through transpose operations. The compiler's
+            # deadcode elimination pass fails with stride/index mismatches when
+            # handling the degenerate dimension in MHA. GQA (num_queries_per_kv > 1)
+            # works correctly. See error: "cannot restickify any input layout of y
+            # to carry y_var=d2" in propagate_layouts.py:341
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
