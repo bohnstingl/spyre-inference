@@ -138,15 +138,17 @@ def _maybe_compile(fn):
     inheritance: returns fn unchanged when compilation mode is NONE or the
     backend is "eager", otherwise wraps it with torch.compile.
     """
-    from vllm.config import get_cached_compilation_config
-    from vllm.config.compilation import CompilationMode
+    return fn
+    # return torch.compile(fn, dynamic=False)
+    # from vllm.config import get_cached_compilation_config
+    # from vllm.config.compilation import CompilationMode
 
-    cfg = get_cached_compilation_config()
-    if cfg.mode == CompilationMode.NONE:
-        return fn
-    if cfg.backend == "eager":
-        return fn
-    return torch.compile(fn, dynamic=False)
+    # cfg = get_cached_compilation_config()
+    # if cfg.mode == CompilationMode.NONE:
+    #     return fn
+    # if cfg.backend == "eager":
+    #     return fn
+    # return torch.compile(fn, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -192,20 +194,69 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             mask_tiles: [num_blocks]
         """
 
-        tile_max = None
-        tile_sum = None
-        tile_output = None
+        
+        # tile_max = None
+        # tile_sum = None
+        # tile_output = None
+        # for i in range(num_blocks):
+        #     page_idx = page_indices[i]
+        #     # Syntax with views and indirect access
+        #     # (i.e. instead of _indirect_matmul_mock)
+        #     # k_page = k_pages[page_idx]
+        #     # v_page = v_pages[page_idx]
+        #     # k_page_4d = k_page.unsqueeze(1)
+        #     # v_page_4d = v_page.unsqueeze(1)
 
-        for i in range(num_blocks):
-            page_idx = page_indices[i]
-            # Syntax with views and indirect access
-            # (i.e. instead of _indirect_matmul_mock)
-            # k_page = k_pages[page_idx]
-            # v_page = v_pages[page_idx]
-            # k_page_4d = k_page.unsqueeze(1)
-            # v_page_4d = v_page.unsqueeze(1)
+        #     mask_tile = mask_tiles[i]
 
-            mask_tile = mask_tiles[i]
+        #     # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+        #     # NOTE: for true "varlen" layout, q would be
+        #     # an indirect access too (avoided here for simplicity...)
+        #     scores = _indirect_matmul_mock(
+        #         q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+        #     )
+        #     scores *= scale
+        #     scores = scores + mask_tile
+        #     scores_max = scores.max(dim=-1, keepdim=True)[0]
+
+        #     if i == 0:
+        #         tile_max = scores_max
+        #         tile_probs = torch.exp(scores - tile_max)
+        #         # tile_output = torch.matmul(tile_probs, v_page_4d)
+        #         tile_output = _indirect_matmul_mock(
+        #             tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+        #         )
+        #         tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+        #     else:
+        #         new_max = torch.maximum(tile_max, scores_max)
+        #         rescale = torch.exp(tile_max - new_max)
+        #         tile_output = tile_output * rescale
+        #         tile_sum = tile_sum * rescale
+        #         tile_probs = torch.exp(scores - new_max)
+        #         # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+        #         tile_output += _indirect_matmul_mock(
+        #             tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+        #         )
+        #         tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+        #         tile_max = new_max
+        
+        tile_max = torch.empty(*q.shape[:-1], 1)
+        tile_sum = torch.empty(*q.shape[:-1], 1)
+        tile_output = torch.empty_like(q)
+        
+        # def cond(block_idx, page_idx, mask_tile, tile_max, tile_sum, tile_output):
+        #     return block_idx < num_blocks
+        
+        def body(tile_max, tile_sum, tile_output, page_idx, mask_tile):
+            # page_idx = page_indices[block_idx]
+            # # Syntax with views and indirect access
+            # # (i.e. instead of _indirect_matmul_mock)
+            # # k_page = k_pages[page_idx]
+            # # v_page = v_pages[page_idx]
+            # # k_page_4d = k_page.unsqueeze(1)
+            # # v_page_4d = v_page.unsqueeze(1)
+
+            # mask_tile = mask_tiles[block_idx]
 
             # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
             # NOTE: for true "varlen" layout, q would be
@@ -217,26 +268,31 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             scores = scores + mask_tile
             scores_max = scores.max(dim=-1, keepdim=True)[0]
 
-            if i == 0:
-                tile_max = scores_max
-                tile_probs = torch.exp(scores - tile_max)
-                # tile_output = torch.matmul(tile_probs, v_page_4d)
-                tile_output = _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                )
-                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-            else:
-                new_max = torch.maximum(tile_max, scores_max)
-                rescale = torch.exp(tile_max - new_max)
-                tile_output = tile_output * rescale
-                tile_sum = tile_sum * rescale
-                tile_probs = torch.exp(scores - new_max)
-                # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
-                tile_output += _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                )
-                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-                tile_max = new_max
+            # if block_idx == 0:
+            #     tile_max = scores_max
+            #     tile_probs = torch.exp(scores - tile_max)
+            #     # tile_output = torch.matmul(tile_probs, v_page_4d)
+            #     tile_output = _indirect_matmul_mock(
+            #         tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+            #     )
+            #     tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            # else:
+            #     new_max = torch.maximum(tile_max, scores_max)
+            #     rescale = torch.exp(tile_max - new_max)
+            #     tile_output = tile_output * rescale
+            #     tile_sum = tile_sum * rescale
+            #     tile_probs = torch.exp(scores - new_max)
+            #     # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+            #     tile_output += _indirect_matmul_mock(
+            #         tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+            #     )
+            #     tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+            #     tile_max = new_max
+            
+            return tile_max + 1, tile_sum, tile_output + 1
+        
+        from torch._higher_order_ops.scan import scan
+        final_outs = scan(body, (tile_max, tile_sum, tile_output), (torch.stack([torch.tensor(i) for i in page_indices]), torch.concat(mask_tiles)))
 
         return tile_output / tile_sum
 
