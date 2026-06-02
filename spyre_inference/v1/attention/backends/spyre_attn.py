@@ -119,17 +119,17 @@ def _indirect_matmul_mock(
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
-        if isinstance(address_or_index_of_a, torch.Tensor):
-            assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
-            address_or_index_of_a = address_or_index_of_a.item()
+        # if isinstance(address_or_index_of_a, torch.Tensor):
+        #     assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
+        #     address_or_index_of_a = address_or_index_of_a.item()
         # pytorch syntax is the same like for python lists here
         a = a[address_or_index_of_a]
         if transform_a:
             a = transform_a(a)
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
-        if isinstance(address_or_index_of_b, torch.Tensor):
-            assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
-            address_or_index_of_b = address_or_index_of_b.item()
+        # if isinstance(address_or_index_of_b, torch.Tensor):
+        #     assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
+        #     address_or_index_of_b = address_or_index_of_b.item()
         b = b[address_or_index_of_b]
         if transform_b:
             b = transform_b(b)
@@ -168,9 +168,10 @@ def _maybe_compile(fn):
     inheritance. Skips torch.compile when _ENABLE_COMPILE is False
     (CompilationMode.NONE, backend="eager", or config context unavailable).
     """
-    if not _ENABLE_COMPILE:
-        return fn
-    return torch.compile(fn, dynamic=False)
+    return fn
+    # if not _ENABLE_COMPILE:
+    #     return fn
+    # return torch.compile(fn, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +270,7 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
         # def cond(block_idx, page_idx, mask_tile, tile_max, tile_sum, tile_output):
         #     return block_idx < num_blocks
         
+        # def body(carries, xs):
         def body(tile_max, tile_sum, tile_output, page_idx, mask_tile):
             # page_idx = page_indices[block_idx]
             # # Syntax with views and indirect access
@@ -279,6 +281,9 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             # # v_page_4d = v_page.unsqueeze(1)
 
             # mask_tile = mask_tiles[block_idx]
+            
+            # tile_max, tile_sum, tile_output = carries
+            # page_idx, mask_tile = xs
 
             # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
             # NOTE: for true "varlen" layout, q would be
@@ -311,10 +316,10 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             #     tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
             #     tile_max = new_max
             
-            return tile_max + 1, tile_sum, tile_output + 1
+            return (tile_max + 1, tile_sum, tile_output + 1), scores
         
         from torch._higher_order_ops.scan import scan
-        final_outs = scan(body, (tile_max, tile_sum, tile_output), (torch.stack([torch.tensor(i) for i in page_indices]), torch.concat(mask_tiles)))
+        final_outs = scan(body, (tile_max, tile_sum, tile_output), (torch.stack([torch.tensor(i) for i in page_indices]), torch.stack(mask_tiles)))
 
         return tile_output / tile_sum
 
