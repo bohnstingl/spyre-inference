@@ -168,10 +168,9 @@ def _maybe_compile(fn):
     inheritance. Skips torch.compile when _ENABLE_COMPILE is False
     (CompilationMode.NONE, backend="eager", or config context unavailable).
     """
-    return fn
-    # if not _ENABLE_COMPILE:
-    #     return fn
-    # return torch.compile(fn, dynamic=False)
+    if not _ENABLE_COMPILE:
+        return fn
+    return torch.compile(fn, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -186,14 +185,23 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """
 
     def specialized_reshape_and_cache_kernel(
-        key, value, k_pages, v_pages, block_indices, block_offsets
+        key_cpu,
+        value_cpu,
+        target_device,
+        target_dtype,
+        k_pages,
+        v_pages,
+        block_indices,
+        block_offsets,
     ):
         # this kernels specializes (i.e. compiles for specific constants) for num_tokens
+        # Slice on CPU (Spyre slicing corrupts memory),
+        # then transfer each contiguous per-token slice to Spyre for the scatter.
         for t in range(num_tokens):
             block_idx = block_indices[t]
             block_offset = block_offsets[t]
-            k_tok = key[t].unsqueeze(1)
-            v_tok = value[t].unsqueeze(1)
+            k_tok = convert(key_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype)
+            v_tok = convert(value_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype)
             _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
             _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
 
@@ -590,7 +598,7 @@ class SpyreAttentionBackend(AttentionBackend):
         # TODO this should be:
         #     return (num_blocks, 2, block_size, num_kv_heads, head_size)
         # but for the lists it is actually
-        return [
+        return [  # ty: ignore[invalid-return-type]
             (num_blocks, block_size, num_kv_heads, head_size),
             (num_blocks, block_size, num_kv_heads, head_size),
         ]
@@ -687,19 +695,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata is None:
             return output
 
-        # TODO: need to take care if the K and V are on CPU due to the split
-        # operation of GraniteAttention
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        assert (
+            attn_metadata.slot_block_indices is not None
+            and attn_metadata.slot_block_offsets is not None
+        ), "slot_block_indices/offsets must be precomputed by the metadata builder"
 
         # Derive target device from the pages themselves
         if self._target_device is None:
             self._target_device = k_pages[0].device
 
+        # Spyre slicing corrupts memory, so
+        # bring q/k/v to CPU once for all slicing below; per-token slices get
+        # transferred to Spyre individually inside the scatter and attention paths.
+        key_cpu = convert(key, "cpu")
+        value_cpu = convert(value, "cpu")
+        query_cpu = convert(query, "cpu")
+
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
+            key_cpu[:num_actual_tokens],
+            value_cpu[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
@@ -708,7 +726,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            query[:num_actual_tokens],
+            convert(query_cpu[:num_actual_tokens], self._target_device),
             k_pages,
             v_pages,
             attn_metadata,
@@ -719,8 +737,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _reshape_and_cache(
         self,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key_cpu: torch.Tensor,
+        value_cpu: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         block_indices: list[int],
@@ -732,14 +750,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
-        num_tokens = key.shape[0]
-
-        # Ensure tensors are on the target device and in the correct dtype
-        k_dev = convert(key, self._target_device, self._target_dtype)
-        v_dev = convert(value, self._target_device, self._target_dtype)
+        num_tokens = key_cpu.shape[0]
 
         fn = self._get_reshape_fn(num_tokens)
-        fn(k_dev, v_dev, k_pages, v_pages, block_indices, block_offsets)
+        fn(
+            key_cpu,
+            value_cpu,
+            self._target_device,
+            self._target_dtype,
+            k_pages,
+            v_pages,
+            block_indices,
+            block_offsets,
+        )
 
     def _online_softmax_attention(
         self,
@@ -769,6 +792,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
         padded_query_lens = attn_metadata.padded_query_lens  # [num_seqs]
+        assert mask_tiles_all is not None and padded_query_lens is not None, (
+            "attention_mask_tiles and padded_query_lens must be precomputed by the metadata builder"
+        )
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -781,7 +807,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Use per-sequence padded query length
             padded_query_len = int(padded_query_lens[seq_idx].item())
 
-            q_seq = query[q_start:q_end]
+            query_cpu = convert(query, device="cpu")
+            q_seq = convert(query_cpu[q_start:q_end], device=self._target_device)
 
             # Pad query to per-sequence padded_query_len
             if padded_query_len > query_len:
@@ -815,13 +842,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]
-            result = result.reshape(1, num_heads, padded_query_len, head_size)
-            result = result.transpose(1, 2).contiguous()
-            seq_result = result[0, :query_len, :, :]
-
-            # Convert to output dtype and write into output buffer
-            seq_result = convert(seq_result, self._target_device, output.dtype)
-            for i in range(seq_result.shape[0]):
-                _overwrite(seq_result[i : i + 1], output, [0], [q_start + i])
+            # Pull result to CPU before slicing (Spyre slicing is broken),
+            # then transfer each per-token contiguous slice back for scatter.
+            result_cpu = convert(result, "cpu", output.dtype)
+            result_cpu = result_cpu.reshape(1, num_heads, padded_query_len, head_size)
+            result_cpu = result_cpu.transpose(1, 2).contiguous()
+            for i in range(query_len):
+                tok = convert(
+                    result_cpu[0, i : i + 1, :, :].contiguous(),
+                    self._target_device,
+                    output.dtype,
+                )
+                _overwrite(tok, output, [0], [q_start + i])
 
         return output
