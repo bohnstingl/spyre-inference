@@ -20,10 +20,18 @@ vllm/model_executor/layers/activation.py when instantiated.
 
 Architecture:
     - OOT Registration: @SiluAndMul.register_oot() replaces upstream at instantiation
-    - forward_oot(): Entry point for OOT dispatch, fully transparent to the outer
-      torch.compile graph (no opaque custom-op boundary)
-    - CPU slicing workaround: Slice on CPU, transfer to Spyre separately to avoid
-      memory corruption from slicing Spyre tensors directly
+    - forward_oot(): Entry point for OOT dispatch. When called inside an outer
+      torch.compile graph, delegates to the opaque custom op
+      torch.ops.vllm.spyre_siluandmul so that Dynamo never traces the
+      device-transferring body. When called eagerly with Spyre inputs (no
+      compile graph), runs _forward_spyre_impl directly because the custom op
+      would otherwise need to fabricate an output via copy_, which Spyre
+      cannot do for in-device tensors.
+    - Custom Op Boundary: torch.ops.vllm.spyre_siluandmul is opaque to
+      torch.compile and returns the result tensor directly (no mutates_args),
+      avoiding any copy_ on the Spyre device.
+    - CPU slicing workaround: Slice on CPU, transfer to Spyre separately to
+      avoid memory corruption from slicing Spyre tensors directly.
 
 Output Shape Note:
     input shape: [..., 2*d] -> output shape: [..., d]
@@ -36,9 +44,11 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.model_executor.layers.activation import SiluAndMul
+from functools import lru_cache
 
-from .utils import convert
+from .utils import convert, register_layer, get_layer
 
 logger = init_logger(__name__)
 
@@ -58,9 +68,26 @@ class SpyreSiluAndMul(SiluAndMul):
     def __init__(self, *args, **kwargs):
         """Initialize SpyreSiluAndMul layer."""
         super().__init__(*args, **kwargs)
+        self._layer_name = register_layer(self, "spyre_siluandmul")
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-        """Spyre-optimized SiLU and multiply activation (SwiGLU).
+        """OOT forward pass.
+
+        Routes through the opaque custom op so that the device transfers in
+        _forward_spyre_impl are never traced by Dynamo. The custom op returns
+        the result tensor directly (no in-place copy_, which Spyre cannot
+        execute between two Spyre tensors).
+
+        Args:
+            x: Input tensor of shape [..., 2*d]
+
+        Returns:
+            Activated output tensor of shape [..., d] with same device and dtype as input.
+        """
+        return torch.ops.vllm.spyre_siluandmul(x, self._layer_name)
+
+    def _forward_spyre_impl(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """Spyre device execution: CPU slicing workaround, kernel call.
 
         Computes silu(x[..., :d]) * x[..., d:] where d = x.shape[-1] // 2.
 
@@ -73,20 +100,39 @@ class SpyreSiluAndMul(SiluAndMul):
         Returns:
             Activated output tensor of shape [..., d] with same device and dtype as input.
         """
-        original_device = x.device
-
-        # Move to CPU if on Spyre (slicing Spyre tensors causes corruption).
-        if x.device.type == "spyre":
-            x = convert(x, device="cpu")
-
-        # Slice and make contiguous before transferring to Spyre.
-        # Non-contiguous slices get corrupted during transfer to Spyre!
-        d = x.shape[-1] // 2
-        x1 = x[..., :d].contiguous()
-        x2 = x[..., d:].contiguous()
-
-        # Transfer contiguous slices back to original device.
-        x1 = convert(x1, device=original_device)
-        x2 = convert(x2, device=original_device)
-
         return F.silu(x1) * x2
+
+
+def _op_func(x: torch.Tensor, layer_name: str) -> torch.Tensor:
+    """Custom op implementation — runs outside torch.compile graph."""
+    layer = get_layer(layer_name)
+    
+    # Slice and make contiguous before transferring to Spyre.
+    # Non-contiguous slices get corrupted during transfer to Spyre!
+    x_device = x.device
+    x = convert(x, device="cpu")
+    d = x.shape[-1] // 2
+    x1 = x[..., :d].contiguous()
+    x2 = x[..., d:].contiguous()
+
+    x1 = convert(x1, device=x_device)
+    x2 = convert(x2, device=x_device)
+    
+    return layer._forward_spyre_impl(x1, x2)
+
+
+def _op_fake(x: torch.Tensor, layer_name: str) -> torch.Tensor:
+    """Fake impl: shape-correct empty tensor for Dynamo tracing."""
+    d = x.shape[-1] // 2
+    return torch.empty(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
+
+
+@lru_cache(maxsize=1)
+def register():
+    """Register the spyre_siluandmul custom op with vLLM."""
+    direct_register_custom_op(
+        op_name="spyre_siluandmul",
+        op_func=_op_func,
+        fake_impl=_op_fake,
+    )
+    logger.info("Registered custom op: SpyreSiluAndMul")

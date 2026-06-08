@@ -56,11 +56,6 @@ def get_layer(name: str) -> Any:
     return _LAYER_REGISTRY[name]
 
 
-def _fake_impl(*args, **kwargs) -> None:
-    """No-op fake implementation for shape inference during torch.compile tracing."""
-    return
-
-
 def convert(tensor, device=None, dtype=None):
     """Convert tensor device and/or dtype. No-op when both are None.
 

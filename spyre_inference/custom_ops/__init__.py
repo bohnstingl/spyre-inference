@@ -17,7 +17,7 @@
 from functools import lru_cache
 
 from . import parallel_lm_head
-from . import rms_norm
+from . import rms_norm  # noqa: F401  -- forward_oot is fully traceable, no op to register
 from . import rotary_embedding
 from . import linear
 from . import silu_and_mul
@@ -31,4 +31,6 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     rotary_embedding.register()
-    rms_norm.register()
+    silu_and_mul.register()
+    linear.register()
+    parallel_lm_head.register()

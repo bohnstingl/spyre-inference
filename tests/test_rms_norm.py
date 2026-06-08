@@ -112,9 +112,13 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
 
     residual = torch.randn(4, 128, dtype=torch.float32) if use_residual else None
 
-    # Mock _forward_spyre_impl (called by the custom op) with a known transform
+    # Mock forward_oot (the OOT entry point) with a known transform.
+    # Both `forward_oot` (in case anyone calls it directly) and `_forward_method`
+    # (the cached bound method that `forward()` actually dispatches through)
+    # need to be rebound — `_forward_method` was captured at __init__ time.
     if residual is not None:
-        monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot_with_residual)
+        monkeypatch.setattr(layer, "forward_oot", mock_forward_oot_with_residual)
+        monkeypatch.setattr(layer, "_forward_method", mock_forward_oot_with_residual)
         out_x, out_residual = layer.forward(dummy_tensor, residual)
 
         assert torch.allclose(out_x, 2 * dummy_tensor)
@@ -122,7 +126,8 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
         # The residual is modified in-place
         assert torch.allclose(out_residual, 2 * residual)
     else:
-        monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot)
+        monkeypatch.setattr(layer, "forward_oot", mock_forward_oot)
+        monkeypatch.setattr(layer, "_forward_method", mock_forward_oot)
         out_x = layer.forward(dummy_tensor, residual)
 
         assert torch.allclose(out_x, dummy_tensor + 1)
