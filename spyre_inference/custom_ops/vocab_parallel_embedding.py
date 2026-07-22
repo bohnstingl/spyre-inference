@@ -41,7 +41,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
-    def _apply(self, fn):
+    def _apply(self, fn, recurse=True):
         # F.embedding has no Spyre kernel; keep the weight on CPU.
         return self
 

@@ -356,7 +356,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
-        Attention._apply = lambda self, fn, recurse=True: self
+        Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
