@@ -65,6 +65,20 @@ on:
         required: false
         type: string
         default: ""
+      test_type:
+        description: |
+          Suite subset to run: smoke | core | full (default). Selects which of
+          the matrix configs below run — each entry declares the test_types it
+          belongs to, and a job is skipped unless test_type is in its set:
+            smoke — fast per-op unit tests only (1 config, single card)
+            core  — all spyre-native tests (per-op + attention + distributed),
+                    excludes the heavy upstream-vLLM suites
+            full  — every config (default; back-compatible)
+          Same knob and vocabulary as the sibling repos (torch-spyre PR #2924,
+          hf-adapters #106); the mapping to configs is repo-internal.
+        required: false
+        type: string
+        default: full
 
 defaults:
   run:
@@ -83,59 +97,62 @@ jobs:
       matrix:
         include:
           - cfg: Non-distributed spyre tests
+            # Fast per-op unit tests: the smoke set.
+            test_types: smoke core full
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "not (distributed or upstream or attention)"
+            # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
+            test_target: test-smoke
           - cfg: Spyre attention tests
+            test_types: core full
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "attention and not (distributed or upstream)"
+            test_target: test-attention
           - cfg: Distributed spyre tests
+            test_types: core full
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m distributed
+            test_target: test-distributed
           - cfg: Upstream vLLM tests
+            # Upstream-vLLM suites are excluded from smoke/core (heavy).
+            test_types: full
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and not distributed and not model"
+            test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
+            test_types: full
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and distributed"
+            test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
+            test_types: full
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and model and not distributed"
+            test_target: test-upstream-model
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label.
@@ -179,14 +196,34 @@ jobs:
             spyre_inference/**/*.py
             spyre_inference/**/*.yaml
 
-      # Single run/skip decision for every build+test step below. The dispatch
-      # flow (skip_if_no_changes=false) always runs; the PR flow runs only when
-      # source files changed.
+      # Single run/skip decision for every build+test step below. A job runs
+      # only when BOTH hold:
+      #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
+      #      flow passes only when source files changed;
+      #   2. this config's test_types set contains the requested test_type
+      #      (so test_type selects a subset of the matrix; full = every config).
       - name: Decide whether to run
         id: gate
         run: |
+          # Reject an unrecognized test_type loudly. type: choice guards the
+          # workflow_dispatch entrypoint, but this reusable workflow_call path
+          # accepts any string, and an unknown value would match no config and
+          # silently skip every job -> a green run that tested nothing.
+          case "${{ inputs.test_type }}" in
+            smoke|core|full) ;;
+            *) echo "::error::Invalid test_type '${{ inputs.test_type }}'. Valid: smoke | core | full"; exit 1 ;;
+          esac
           if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
              || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then
+            changed=true
+          else
+            changed=false
+          fi
+          case " ${{ matrix.test_types }} " in
+            *" ${{ inputs.test_type }} "*) selected=true ;;
+            *) selected=false ;;
+          esac
+          if [[ "$changed" == "true" && "$selected" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -263,15 +300,30 @@ jobs:
 
       - name: Run tests
         if: ${{ steps.gate.outputs.run == 'true' }}
+        # Env setup (aiu-setup sourcing, topo.json cleanup) and the marker
+        # expression for this config both live in the Makefile's
+        # test_target now -- the single entrypoint/owner for one
+        # marker-combo invocation, so the marker set is not duplicated here.
         run: |
-          unset _IBM_AIU_SETUP
-          rm /tmp/etc/ibm/spyre/topo.json
-          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
-          # fails on image_torch_spyre; env vars are already exported by then.
-          set +e
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          set -e
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          uv run pytest -s -vvv ${{ matrix.flags }}
+          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ strategy.job-index }}.xml
           echo "tests done"
+
+      - name: Upload JUnit results
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ strategy.job-index }}
+          path: junit-${{ strategy.job-index }}.xml
+          retention-days: 14
+
+      - name: Publish JUnit test report
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: 'Test report (${{ matrix.cfg }})'
+          path: junit-${{ strategy.job-index }}.xml
+          # dorny/test-reporter@v1 has no python-specific reporter; java-junit
+          # parses the generic JUnit-XML schema pytest's --junit-xml emits.
+          reporter: java-junit
+          fail-on-error: false
