@@ -71,8 +71,7 @@ jobs:
       - x86_64
       - spyre_pf_x4__pvc_1tb_x1
       - linux
-      # - image_torch_spyre
-      - image_torch_spyre_pinned
+      - image_torch_spyre
     timeout-minutes: 240
     env:
       CI: ''
@@ -100,7 +99,11 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
+          # Invalidate only on lock changes; setup-uv's default glob also hashes
+          # pyproject.toml, so config-only edits would needlessly bust the cache.
+          cache-dependency-glob: |
+            uv.lock
+            spyre-rpms.lock
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
           prune-cache: false
 

@@ -103,8 +103,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
           - cfg: Spyre attention tests
@@ -113,8 +112,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-attention
           - cfg: Distributed spyre tests
             test_types: core full
@@ -122,8 +120,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-distributed
           - cfg: Upstream vLLM tests
             # Upstream-vLLM suites are excluded from smoke/core (heavy).
@@ -132,8 +129,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
             test_types: full
@@ -141,8 +137,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
             test_types: full
@@ -150,8 +145,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
+            image_label: image_torch_spyre
             test_target: test-upstream-model
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
@@ -239,9 +233,11 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true
-          # Key the uv wheel cache on the RPM lock file: different library
-          # versions may require torch-spyre to be recompiled.
-          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
+          # Invalidate only on lock changes; setup-uv's default glob also hashes
+          # pyproject.toml, so config-only edits would needlessly bust the cache.
+          cache-dependency-glob: |
+            uv.lock
+            spyre-rpms.lock
           # Use local runner temp to avoid ownership/permission issues on $HOME.
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
           # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,

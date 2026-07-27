@@ -59,9 +59,6 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.custom_ops.vocab_parallel_embedding import (
-    SpyreVocabParallelEmbedding,
-)
 
 logger = init_logger(__name__)
 
@@ -138,7 +135,9 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
 
     For float dtypes: .cpu on CPU, .gpu on Spyre (float16).
     For int/bool dtypes: .gpu aliased to .cpu (CPUModelRunner pattern).
-    All copies are currently synchronous as torch-spyre does not yet support `non_blocking`.
+    Float H2D uses ``non_blocking=True``; callers must sync via
+    ``TorchSpyreModelRunner._sync_device`` (``torch.spyre.synchronize``)
+    before consuming the Spyre tensors.
 
     Inherits from `CpuGpuBuffer` (without invoking its `__init__`) so that
     `_make_buffer` overrides remain Liskov-compatible with `GPUModelRunner`.
@@ -175,7 +174,9 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
             return self.gpu if n is None else self.gpu[:n]
         src = self.cpu if n is None else self.cpu[:n]
         dst = self.gpu if n is None else self.gpu[:n]
-        dst.copy_(src)
+        # Async H2D via torch-spyre's aten::_copy_from / copyAsync path.
+        # GPUModelRunner calls _sync_device before the tensors are consumed.
+        dst.copy_(src, non_blocking=True)
         return dst
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
@@ -391,27 +392,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         analyze_and_unfuse(self.model)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-        # Attention is nn.Module (not PluggableLayer) so OOT registration is
-        # not possible. Patch _apply to no-op before model.to("spyre") so
-        # the CPU attention backend can access scale buffers without device
-        # mismatch.
-        for module in self.model.modules():
-            if isinstance(module, Attention):
-                module._apply = lambda fn, recurse=True, _m=module: _m
+        # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
+        # an nn.Module, but just the attention implementation.
+        Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
-        # Move layer weights to Spyre device. The Attention._apply no-op
-        # patched above keeps attention scale buffers on CPU; every other
-        # module (linear, embedding, RMSNorm, SiluAndMul, ParallelLMHead)
-        # has its weights moved to Spyre.
+        # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
-
-        # F.embedding has no Spyre kernel; keep the weight on CPU.
-        # RoPE cos_sin_cache is index_select'd on the host; keep it on CPU.
-        for module in self.model.modules():
-            if isinstance(module, SpyreVocabParallelEmbedding):
-                module.weight = nn.Parameter(module.weight.data.to("cpu"), requires_grad=False)
-            elif isinstance(module, _SpyreRotaryMixin):
-                module.cos_sin_cache = module.cos_sin_cache.to("cpu")
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
@@ -580,10 +566,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         pass
 
     def _sync_device(self) -> None:
-        # TODO: Replace with torch.spyre.synchronize() when available.
-        # For now, all copies are synchronous (no non_blocking), so
-        # explicit sync is not needed.
-        pass
+        # Wait for outstanding async H2D from SpyreCpuGpuBuffer.copy_to_gpu
+        # (and any other non_blocking copies) before the runner consumes
+        # Spyre tensors. torch.spyre is registered by torch-spyre autoload.
+        torch.spyre.synchronize(self._spyre_device)
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         return 0, None

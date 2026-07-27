@@ -17,7 +17,8 @@
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
-    - No quantization support: only UnquantizedEmbeddingMethod is replaced
+    - Quantization: Fp8Config supported (resolves to UnquantizedEmbeddingMethod).
+      Other quantization methods raise NotImplementedError.
 """
 
 import torch
@@ -78,24 +79,17 @@ class SpyreParallelLMHead(ParallelLMHead):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        quant_config = kwargs.get("quant_config")
-        if quant_config is not None:
+        # Only UnquantizedEmbeddingMethod supported. Fp8Config resolves to it;
+        # other quantization methods are rejected.
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
-                "SpyreParallelLMHead does not support quantization "
-                f"(quant_config={quant_config}). Only quant_config=None is supported."
+                f"SpyreParallelLMHead does not support {type(self.quant_method).__name__}."
             )
 
         logger.debug("Building SpyreParallelLMHead with TP size %d ", self.tp_size)
 
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
-
-    def _apply(self, fn, recurse=True):
-        # Do NOT move `self.weight`, must stay on CPU.
-        self.padded_weight = fn(self.padded_weight)
-        if getattr(self, "bias", None) is not None:
-            self.bias = fn(self.bias)
-        return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """OOT forward pass.
