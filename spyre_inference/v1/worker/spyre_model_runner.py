@@ -449,7 +449,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 f"are supported."
             )
 
-        if self.vllm_config.model_config.enforce_eager:
+        if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 

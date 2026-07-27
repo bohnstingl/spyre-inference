@@ -32,6 +32,7 @@ def test_basic_llm_inference() -> None:
         model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
         dtype="float16",
         enforce_eager=False,
+        compilation_config={"mode": "STOCK_TORCH_COMPILE"},
         max_model_len=128,
         max_num_seqs=2,
     )
