@@ -311,6 +311,8 @@ def _run_spyre_attn_test(
     configure_device: str,
     use_alibi: bool = False,
     soft_cap: float | None = None,
+    num_query_heads: int = 32,
+    num_kv_heads: int = 8,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
@@ -318,7 +320,6 @@ def _run_spyre_attn_test(
     if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
         pytest.skip("STOCK + device_spyre, currently fails.")
 
-    num_query_heads, num_kv_heads = 32, 8
     head_size = 128
     num_blocks = 256
     dtype = torch.float16
@@ -691,6 +692,88 @@ def test_spyre_attn_soft_cap(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         soft_cap=soft_cap,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+def test_spyre_attn_mha(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """MHA correctness: num_query_heads == num_kv_heads."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=8,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+def test_spyre_attn_mqa(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """MQA correctness: num_kv_heads == 1."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=1,
     )
 
 

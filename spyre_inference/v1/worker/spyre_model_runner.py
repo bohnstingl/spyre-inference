@@ -406,9 +406,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model.to(device=self._spyre_device)
 
         # F.embedding has no Spyre kernel; keep the weight on CPU.
+        # RoPE cos_sin_cache is index_select'd on the host; keep it on CPU.
         for module in self.model.modules():
             if isinstance(module, SpyreVocabParallelEmbedding):
                 module.weight = nn.Parameter(module.weight.data.to("cpu"), requires_grad=False)
+            elif isinstance(module, _SpyreRotaryMixin):
+                module.cos_sin_cache = module.cos_sin_cache.to("cpu")
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
