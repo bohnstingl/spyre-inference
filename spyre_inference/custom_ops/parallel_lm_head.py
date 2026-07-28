@@ -31,7 +31,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -109,4 +108,5 @@ class SpyreParallelLMHead(ParallelLMHead):
             out = out[:, : -self.padding].contiguous()
         # Logits must land on CPU: the subsequent all_gather (TP > 1) would
         # crash on a Spyre tensor.
-        return convert(out, device="cpu")
+        # return convert(out, device="cpu")
+        return out
