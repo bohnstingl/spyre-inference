@@ -106,7 +106,5 @@ class SpyreParallelLMHead(ParallelLMHead):
         if self.padding > 0:
             # .contiguous() kept for safety
             out = out[:, : -self.padding].contiguous()
-        # Logits must land on CPU: the subsequent all_gather (TP > 1) would
-        # crash on a Spyre tensor.
-        # return convert(out, device="cpu")
+        # Logits stay on the Spyre device.
         return out
