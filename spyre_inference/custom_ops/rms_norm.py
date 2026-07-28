@@ -55,11 +55,6 @@ class SpyreRMSNorm(RMSNorm):
             x = x + residual
             residual = x
 
-        if x.shape[-1] != self.hidden_size:
-            raise ValueError(
-                f"Expected hidden_size to be {self.hidden_size}, but found: {x.shape[-1]}"
-            )
-
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
         x = x * torch.rsqrt(variance + self.variance_epsilon)

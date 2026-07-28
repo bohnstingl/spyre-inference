@@ -20,24 +20,36 @@ import pytest
 
 
 @pytest.mark.compile
-def test_basic_llm_inference() -> None:
-    """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
-    """
+@pytest.mark.parametrize(
+    "model",
+    [
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        pytest.param(
+            "google/gemma-3-1b-it",
+            marks=pytest.mark.skip(reason="Gemma3 currently doesn't work with torch.compile"),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "ref_output",
+    ["\n\nA list of Identified Benefits under thisones main businesses", "\n\nIBM's main"],
+)
+def test_basic_llm_inference(model, ref_output) -> None:
+    """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
     from vllm import LLM
-    
+
     prompt = "What are IBMs main businesses?"
-    reference_output = "\n\nA list of Identified Benefits under thisones main businesses"
 
     engine = LLM(
-        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        dtype="float16",
+        model=model,
+        # dtype="float16",
         enforce_eager=False,
         compilation_config={"mode": "STOCK_TORCH_COMPILE"},
         max_model_len=128,
         max_num_seqs=2,
     )
-    
+
     output = engine.generate(prompt, use_tqdm=False)
-    
+
     assert prompt == output[0].prompt, "Model output contained wrong prompt!"
-    assert reference_output == output[0].outputs[0].text, "Model produced wrong output!"
+    assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"

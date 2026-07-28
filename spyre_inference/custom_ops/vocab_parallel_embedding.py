@@ -20,7 +20,6 @@ import torch
 
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
