@@ -42,6 +42,24 @@ YARN_ROPE_PARAMS = {
 HEAD_SIZES = [64, 128, 256]
 
 
+@pytest.fixture(autouse=True)
+def _reset_rope_cache():
+    """Clear vLLM's global get_rope cache between tests.
+
+    get_rope memoizes instances in `_ROPE_DICT` keyed by config, so tests
+    sharing a head_size get the same rope. Since `_prime_expand_matrix`
+    caches `_expand_matrix` on the first target device it sees (and then
+    early-returns), a CPU-reference test would otherwise leave a CPU expand
+    matrix on the instance that a following Spyre test reuses, causing a
+    device mismatch in the rotation matmul.
+    """
+    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+
+    _ROPE_DICT.clear()
+    yield
+    _ROPE_DICT.clear()
+
+
 def _prime_rope(rope, positions):
     """Mimic _SpyreModelWrapper: pre-gather the rotation slice and stash it in the
     forward context so a direct forward_oot can fetch it. Returns the slice (or None

@@ -32,7 +32,7 @@ import pytest
 )
 @pytest.mark.parametrize(
     "ref_output",
-    ["\n\nA list of Identified Benefits under thisones main businesses", "\n\nIBM's main"],
+    ["\n\nA list of Identified Benefits under Debt Management – Count", "\n\nIBM's main"],
 )
 def test_basic_llm_inference(model, ref_output) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
