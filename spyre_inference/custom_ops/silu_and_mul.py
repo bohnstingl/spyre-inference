@@ -38,9 +38,10 @@ class SpyreSiluAndMul(SiluAndMul):
     def forward_oot(self, x) -> torch.Tensor:
         """SwiGLU: silu(gate) * up, output shape [..., d]."""
 
-        if any((d % 64) > 0 for d in x.shape):
+        if (x.shape[1] % 64) > 0:
             raise RuntimeError(
-                f"SpyreSiluAndMul only works with shapes divisible by 64, but got {x.shape}"
+                f"SpyreSiluAndMul only works with inner dimension being divisible \
+                    by 64, but got {x.shape[1]}"
             )
 
         return self._forward(x)
