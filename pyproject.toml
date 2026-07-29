@@ -104,7 +104,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.25.1" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "7073e9cf5b137ea576808aafc3f702babc2aafd4" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "6ea824ef9dc9bc6422fd1c3e32a6d6b55918e265" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   { index = "pytorch-cpu" },
@@ -223,7 +223,6 @@ markers = [
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
-    "compile: torch.compile end-to-end tests (tests/test_compile.py)",
     "fp8: FP8 quantization tests (tests/test_fp8.py)",
 ]
 # --8<-- [end:test-markers-definition]
