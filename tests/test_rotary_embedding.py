@@ -110,8 +110,16 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
 
     rot = rope.gather_rotation(positions, torch.device("cpu"))
     assert rot is not None and rot.device.type == "cpu"
-    actual_query = _rotate_neox_2x2(query, rot, head_size)
-    actual_key = _rotate_neox_2x2(key, rot, head_size)
+    # gather_rotation primes the expand matrix on the target device; it is present
+    # only for the pad-to-stick regime (head_size=64 -> inner dim 32), None for the
+    # stick-aligned pure-view regime (128->64, 256->128).
+    expand_matrix = rope._expand_matrix
+    assert rope._needs_expand == (head_size == 64)
+    assert (expand_matrix is not None) == rope._needs_expand
+    if expand_matrix is not None:
+        assert expand_matrix.device.type == "cpu"
+    actual_query = _rotate_neox_2x2(query, rot, head_size, expand_matrix)
+    actual_key = _rotate_neox_2x2(key, rot, head_size, expand_matrix)
 
     expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
     torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
@@ -406,8 +414,10 @@ def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_para
 
     rot = rope.gather_rotation(positions, torch.device("cpu"))
     assert rot is not None and rot.device.type == "cpu"
-    actual_query = _rotate_neox_2x2(query, rot, head_size)
-    actual_key = _rotate_neox_2x2(key, rot, head_size)
+    expand_matrix = rope._expand_matrix
+    assert (expand_matrix is not None) == (head_size == 64)
+    actual_query = _rotate_neox_2x2(query, rot, head_size, expand_matrix)
+    actual_key = _rotate_neox_2x2(key, rot, head_size, expand_matrix)
 
     expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
         rope, positions, query, key
