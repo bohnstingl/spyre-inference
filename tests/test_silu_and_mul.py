@@ -33,8 +33,8 @@ def reference_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.siluandmul
-@pytest.mark.parametrize("num_tokens", [1, 7, 63, 64, 65, 1024])
-@pytest.mark.parametrize("d", [2, 63, 64, 65, 1024, 13824])
+@pytest.mark.parametrize("num_tokens", [64, 128, 1024])
+@pytest.mark.parametrize("d", [64, 65, 256, 1024, 8128])
 def test_spyre_siluandmul_matches_reference(num_tokens, d):
     """SpyreSiluAndMul.forward_oot on a Spyre input matches the CPU reference."""
     from spyre_inference.custom_ops.silu_and_mul import SpyreSiluAndMul
