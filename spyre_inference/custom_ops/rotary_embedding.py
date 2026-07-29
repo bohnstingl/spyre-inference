@@ -193,9 +193,19 @@ class _SpyreRotaryMixin:
         e = self._expand_matrix
         if e is None:
             e = query.new_empty(0)
-        out_query = torch.ops.vllm.spyre_rope_rotate(query, rot, e, self.head_size)
+        out_query = torch.ops.vllm.spyre_rope_rotate(
+            query,  # ty: ignore[invalid-argument-type]
+            rot,
+            e,  # ty: ignore[invalid-argument-type]
+            self.head_size,
+        )
         out_key = (
-            torch.ops.vllm.spyre_rope_rotate(key, rot, e, self.head_size)
+            torch.ops.vllm.spyre_rope_rotate(
+                key,  # ty: ignore[invalid-argument-type]
+                rot,
+                e,  # ty: ignore[invalid-argument-type]
+                self.head_size,
+            )
             if key is not None
             else None
         )

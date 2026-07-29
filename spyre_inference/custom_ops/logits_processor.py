@@ -15,20 +15,17 @@
 import torch
 
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+from .utils import convert
 
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(LogitsProcessor):
-    def _get_logits(
-        self,
-        hidden_states: torch.Tensor,
-        lm_head: VocabParallelEmbedding,
-        embedding_bias: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        logits = super()._get_logits(hidden_states, lm_head, embedding_bias)
-        if logits is not None:
-            # NOTE: The downstream in-place `logits *= self.scale` operation
-            # would trigger a compile issue in torch-spyre
-            logits = logits.contiguous()
-        return logits
+    def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Gather TP-sharded logits on Spyre, then move the result to CPU.
+
+        Logits arrive on Spyre (SpyreParallelLMHead.forward_oot) so the TP
+        all_gather can dispatch the PrivateUse1-only `torch.ops.vllm.all_gather`.
+        The subsequent vocab slice and scale must run on CPU, so convert here.
+        """
+        return convert(super()._gather_logits(logits), device="cpu")

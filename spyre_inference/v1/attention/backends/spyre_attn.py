@@ -761,7 +761,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
     @_record_function("spyre_attn::forward")
-    def forward(  # ty: ignore[invalid-method-override]
+    def forward(
         self,
         layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]

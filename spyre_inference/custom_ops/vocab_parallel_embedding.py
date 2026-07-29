@@ -52,7 +52,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
         cpu_input = convert(input_, device="cpu")
         if self.tp_size > 1:
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
-                cpu_input,  # ty: ignore[invalid-argument-type]
+                cpu_input,
                 self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]

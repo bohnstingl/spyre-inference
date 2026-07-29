@@ -276,14 +276,14 @@ class _SpyreModelWrapper:
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
         on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU. Thus, convert here, perform the lm_head operation and
-        then convert the resulting logits back to CPU
-        for downstream sampling.
+        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
+        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
+        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
+        converts back to CPU right after the gather (before the vocab slice
+        and scale), so downstream sampling gets CPU logits.
         """
         hidden_states = convert(hidden_states, device=self._spyre_device)
-        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
-
-        return convert(logits, device="cpu")
+        return self._model.compute_logits(hidden_states, *args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -330,9 +330,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
         # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
-        import vllm.v1.worker.block_table
+        from vllm.v1.worker import block_table
 
-        vllm.v1.worker.block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
+        # Deliberately swap the Triton JITFunction for the grid-launch-compatible
+        # _FuncWrapper; the type mismatch is the point of the patch.
+        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
 
     @staticmethod
     def _patch_encoder_ops_for_spyre(model_config) -> None:
