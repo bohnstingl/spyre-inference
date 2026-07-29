@@ -40,10 +40,4 @@ class SpyreGeluAndMul(GeluAndMul):
     def forward_oot(self, x) -> torch.Tensor:
         """GeGLU: gelu(gate) * up, output shape [..., d]."""
 
-        if (x.shape[1] % 64) > 0:
-            raise RuntimeError(
-                f"SpyreGeluAndMul only works with inner dimension being divisible \
-                    by 64, but got {x.shape[1]}"
-            )
-
         return self._forward(x)
