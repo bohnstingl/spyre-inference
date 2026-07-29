@@ -46,9 +46,7 @@ from vllm.model_executor.layers.linear import (
 from .gelu_and_mul import SpyreGeluAndMul
 from .silu_and_mul import SpyreSiluAndMul
 
-# Gated-MLP activations whose sibling gate_up_proj should be un-fused. Both
-# consume a pre-split gate/up pair (`gate, up = proj`); the unfuse path is
-# identical, so it is shared here.
+# Gated-MLP activations whose sibling gate_up_proj should be un-fused.
 _GATED_MLP_ACTIVATIONS = (SpyreSiluAndMul, SpyreGeluAndMul)
 
 logger = init_logger(__name__)
@@ -204,12 +202,7 @@ def _unfuse_gate_up(module: MergedColumnParallelLinear) -> None:
 
 
 def _feeds_gated_mlp(gate_up: nn.Module, parent: nn.Module) -> bool:
-    """True if `gate_up`'s sibling activation is a gated-MLP op we handle.
-
-    The activation is looked up from the shared parent MLP rather than the
-    projection so this stays correct even when models reuse one activation
-    instance across every layer (e.g. Gemma3's cached `get_act_and_mul_fn`).
-    """
+    """True if `gate_up`'s sibling activation is a gated-MLP op we handle."""
     return any(isinstance(child, _GATED_MLP_ACTIVATIONS) for child in parent.children())
 
 
@@ -221,10 +214,6 @@ def analyze_and_unfuse(model: nn.Module) -> None:
       * Gated MLP: every 2-way gate_up_proj whose sibling activation is a
         gated-MLP op (SpyreSiluAndMul / SpyreGeluAndMul) is un-fused.
 
-    The gate/up pass is driven from the projections rather than the
-    activations: a model may share a single activation instance across all
-    layers (Gemma3), which `model.modules()` de-duplicates to one, whereas each
-    layer has its own gate_up_proj.
     """
     parent_of = {id(model): model}
     for parent in model.modules():

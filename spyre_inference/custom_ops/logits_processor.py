@@ -22,10 +22,5 @@ from .utils import convert
 @LogitsProcessor.register_oot(name="LogitsProcessor")
 class SpyreLogitsProcessor(LogitsProcessor):
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Gather TP-sharded logits on Spyre, then move the result to CPU.
-
-        Logits arrive on Spyre (SpyreParallelLMHead.forward_oot) so the TP
-        all_gather can dispatch the PrivateUse1-only `torch.ops.vllm.all_gather`.
-        The subsequent vocab slice and scale must run on CPU, so convert here.
-        """
+        """Gather TP-sharded logits on Spyre, then move the result to CPU."""
         return convert(super()._gather_logits(logits), device="cpu")
