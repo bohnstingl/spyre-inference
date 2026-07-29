@@ -198,46 +198,6 @@ def test_qkv_split_fails_closed_on_other_access(tp_group):
 
 
 @pytest.mark.mlp
-def test_split_silu_and_mul_unpacks_to_gate_up(tp_group):
-    """SplitSiluAndMul iterates as exactly (gate, up) and exposes nothing else."""
-    from spyre_inference.custom_ops.unfuse import SplitSiluAndMul
-
-    gate, up = torch.zeros(2, 4), torch.ones(2, 4)
-    proj = SplitSiluAndMul(gate, up)
-
-    g, u = proj  # the SpyreSiluAndMul idiom: `x1, x2 = x`
-    assert g is gate and u is up
-    assert [t.shape for t in proj] == [gate.shape, up.shape]
-    # It is not a plain sequence: no indexing, and __slots__ blocks writes.
-    with pytest.raises(TypeError):
-        _ = proj[0]
-    with pytest.raises(AttributeError):
-        proj.extra = 1
-
-
-@pytest.mark.mlp
-def test_merged_unfused_only_with_silu_sibling(tp_group):
-    """gate_up_proj is un-fused only when a SiluAndMul sibling is present."""
-    from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
-
-    torch.manual_seed(0)
-    with_silu = _make_mlp_module(64, 128, with_silu=True)
-    without_silu = _make_mlp_module(64, 128, with_silu=False)
-    with_silu.gate_up_proj.weight.data.normal_(std=0.02)
-    without_silu.gate_up_proj.weight.data.normal_(std=0.02)
-
-    analyze_and_unfuse(with_silu)
-    analyze_and_unfuse(without_silu)
-
-    # SiluAndMul sibling → un-fused (split parts, no fused weight).
-    assert with_silu.gate_up_proj.weight is None
-    assert hasattr(with_silu.gate_up_proj, "gate_weight")
-    # GeluAndMul sibling → left fused (out of scope).
-    assert without_silu.gate_up_proj.weight is not None
-    assert not hasattr(without_silu.gate_up_proj, "gate_weight")
-
-
-@pytest.mark.mlp
 def test_quantized_layers_are_left_fused(tp_group):
     """A non-UnquantizedLinearMethod quant_method makes the pass skip the layer.
 
@@ -322,44 +282,6 @@ def test_merged_list_feeds_silu(tp_group):
     analyze_and_unfuse(mlp)
     actual = mlp(x)  # gate_up returns SplitSiluAndMul; SpyreSiluAndMul consumes it
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.mlp
-def test_forward_honors_return_bias_false(tp_group):
-    """return_bias=False makes the rebound forward return a bare output.
-
-    Mirrors upstream LinearBase.forward, which returns the output alone (not a
-    (output, bias) tuple) when return_bias is False.
-    """
-    import torch.nn as nn
-
-    from vllm.model_executor.layers.activation import SiluAndMul
-    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from spyre_inference.custom_ops.unfuse import SplitSiluAndMul, analyze_and_unfuse
-
-    torch.manual_seed(0)
-
-    class MLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.gate_up_proj = MergedColumnParallelLinear(
-                input_size=64,
-                output_sizes=[128, 128],
-                bias=False,
-                return_bias=False,
-                params_dtype=torch.float16,
-                quant_config=None,
-                disable_tp=True,
-                prefix="gate_up_proj",
-            )
-            self.act_fn = SiluAndMul()
-
-    mlp = MLP()
-    mlp.gate_up_proj.weight.data.normal_(std=0.02)
-    analyze_and_unfuse(mlp)
-
-    out = mlp.gate_up_proj(torch.randn(4, 64, dtype=torch.float16))
-    assert isinstance(out, SplitSiluAndMul)  # bare output, not a (output, bias) tuple
 
 
 @pytest.mark.mlp

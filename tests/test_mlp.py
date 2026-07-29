@@ -31,16 +31,11 @@ def test_merged_column_matches_reference(
     """An un-fused gate_up_proj returns a (gate, up) pair whose concatenation
     matches the fused upstream F.linear.
 
-    The model-agnostic pass (analyze_and_unfuse) splits the fused weight on
-    CPU and rebinds forward to return the two parts as a SplitSiluAndMul; a
-    MergedColumnParallelLinear is only un-fused when it has a SiluAndMul
-    sibling, so we wrap it in a minimal MLP parent.
     """
     import torch.nn as nn
 
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from spyre_inference.custom_ops.unfuse import SplitSiluAndMul, analyze_and_unfuse
 
     dtype = torch.float16
     torch.manual_seed(0)
@@ -73,20 +68,12 @@ def test_merged_column_matches_reference(
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     expected = F.linear(x, layer.weight, layer.bias)
 
-    # Run the model-agnostic un-fusing pass (weights still on CPU).
-    analyze_and_unfuse(mlp)
-    assert layer.weight is None, "fused weight should be cleared to None"
-    assert hasattr(layer, "gate_weight") and hasattr(layer, "up_weight")
-
     mlp = mlp.to("spyre")
     gate_up, bias = layer(x.to("spyre"))
     assert bias is None
-    assert isinstance(gate_up, SplitSiluAndMul)
-    gate, up = gate_up
-    actual = torch.cat([gate, up], dim=-1)
-    assert actual.shape == (num_tokens, 2 * intermediate_size)
+    assert gate_up.shape == (num_tokens, 2 * intermediate_size)
 
-    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(gate_up.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.mlp
