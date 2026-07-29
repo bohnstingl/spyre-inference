@@ -21,30 +21,22 @@ override with GELU instead of SiLU.
 """
 
 import torch
-import torch.nn.functional as F
 
 from vllm.model_executor.layers.activation import GeluAndMul
-
-from .utils import convert
 
 
 @GeluAndMul.register_oot(name="GeluAndMul")
 class SpyreGeluAndMul(GeluAndMul):
     """Out-of-tree (OOT) GeluAndMul implementation for IBM's Spyre device."""
 
-    def forward_oot(self, x) -> torch.Tensor:
-        """GeGLU: gelu(gate) * up, output shape [..., d].
+    def __init__(self, *args, **kwargs):
+        """Initialize SpyreGeluAndMul layer."""
+        super().__init__(*args, **kwargs)
 
-        `x` is either a pre-split gate/up pair (from unfuse.py) or a fused
-        [..., 2*d] tensor. Slicing a Spyre tensor corrupts memory, so the fused
-        path slices on CPU (mirrors SpyreSiluAndMul).
-        """
-        if not isinstance(x, torch.Tensor):
-            x1, x2 = x
-        else:
-            original_device = x.device
-            x = convert(x, device="cpu")
-            d = x.shape[-1] // 2
-            x1 = convert(x[..., :d].contiguous(), device=original_device)
-            x2 = convert(x[..., d:].contiguous(), device=original_device)
-        return F.gelu(x1, approximate=self.approximate) * x2
+        # With fullgraph compile enabled, the _forward will be compiled anyways
+        if not torch.compiler.is_dynamo_compiling():
+            self._forward = torch.compile(self.forward_native, dynamic=False)
+
+    def forward_oot(self, x) -> torch.Tensor:
+        """GeGLU: gelu(gate) * up, output shape [..., d]."""
+        return self._forward(x)

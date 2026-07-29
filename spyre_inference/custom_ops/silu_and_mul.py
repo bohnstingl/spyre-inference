@@ -15,12 +15,10 @@
 """Spyre-specific SiluAndMul implementation"""
 
 import torch
-import torch.nn.functional as F
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 
-from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -33,22 +31,11 @@ class SpyreSiluAndMul(SiluAndMul):
         """Initialize SpyreSiluAndMul layer."""
         super().__init__(*args, **kwargs)
 
-    def forward_oot(self, x) -> torch.Tensor:
-        """SwiGLU: silu(gate) * up, output shape [..., d].
+        # With fullgraph compile enabled, the _forward will be compiled anyways
+        if not torch.compiler.is_dynamo_compiling():
+            self._forward = torch.compile(self.forward_native, dynamic=False)
 
-        `x` is either a pre-split gate/up pair (a SplitSiluAndMul from an
-        un-fused gate_up_proj, see unfuse.py) or a fused [..., 2*d] tensor.
-        The fused path only runs for layers unfuse left alone (e.g. quantized).
-        """
-        if not isinstance(x, torch.Tensor):
-            # Unfused path: gate/up already split, both contiguous on device.
-            x1, x2 = x
-        else:
-            # Fused path: slice on CPU — slicing a Spyre tensor corrupts memory,
-            # and non-contiguous slices corrupt again on transfer back.
-            original_device = x.device
-            x = convert(x, device="cpu")
-            d = x.shape[-1] // 2
-            x1 = convert(x[..., :d].contiguous(), device=original_device)
-            x2 = convert(x[..., d:].contiguous(), device=original_device)
-        return F.silu(x1) * x2
+    def forward_oot(self, x) -> torch.Tensor:
+        """SwiGLU: silu(gate) * up, output shape [..., d]."""
+
+        return self._forward(x)

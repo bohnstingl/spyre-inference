@@ -43,7 +43,6 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
-from .silu_and_mul import SpyreSiluAndMul
 
 logger = init_logger(__name__)
 
@@ -229,12 +228,6 @@ def analyze_and_unfuse(model: nn.Module) -> None:
         if isinstance(module, QKVParallelLinear) and _unfusable(module):
             _unfuse_qkv(module)
             n_qkv += 1
-        # Gate/up projections feeding SiluAndMul.
-        if isinstance(module, SpyreSiluAndMul):
-            gate_up = _gate_up_sibling(module, parent_of)
-            if gate_up is not None and _unfusable(gate_up):
-                _unfuse_silu_and_mul(gate_up)
-                n_silu_and_mul += 1
 
     logger.debug(
         "Spyre weight-unfusing: unfused %d QKV and %d gate/up projections.",
