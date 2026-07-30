@@ -21,28 +21,28 @@ import pytest
 
 @pytest.mark.compile
 @pytest.mark.parametrize(
-    "model",
+    "model_ref_output",
     [
-        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        (
+            "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+            "\n\nA list of Identified Benefits under Debt Management – Count",
+        ),
         pytest.param(
-            "google/gemma-3-1b-it",
+            ("google/gemma-3-1b-it", "\n\nIBM's main"),
             marks=pytest.mark.skip(reason="Gemma3 currently doesn't work with torch.compile"),
         ),
     ],
 )
-@pytest.mark.parametrize(
-    "ref_output",
-    ["\n\nA list of Identified Benefits under Debt Management – Count", "\n\nIBM's main"],
-)
-def test_basic_llm_inference(model, ref_output) -> None:
+def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
     from vllm import LLM
 
     prompt = "What are IBMs main businesses?"
 
+    model, ref_output = model_ref_output
+
     engine = LLM(
         model=model,
-        # dtype="float16",
         enforce_eager=False,
         compilation_config={"mode": "STOCK_TORCH_COMPILE"},
         max_model_len=128,
