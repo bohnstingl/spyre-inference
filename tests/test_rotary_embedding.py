@@ -42,24 +42,6 @@ YARN_ROPE_PARAMS = {
 HEAD_SIZES = [64, 128, 256]
 
 
-@pytest.fixture(autouse=True)
-def _reset_rope_cache():
-    """Clear vLLM's global get_rope cache between tests.
-
-    get_rope memoizes instances in `_ROPE_DICT` keyed by config, so tests
-    sharing a head_size get the same rope. Since `_prime_expand_matrix`
-    caches `_expand_matrix` on the first target device it sees (and then
-    early-returns), a CPU-reference test would otherwise leave a CPU expand
-    matrix on the instance that a following Spyre test reuses, causing a
-    device mismatch in the rotation matmul.
-    """
-    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
-
-    _ROPE_DICT.clear()
-    yield
-    _ROPE_DICT.clear()
-
-
 def _prime_rope(rope, positions):
     """Mimic _SpyreModelWrapper: pre-gather the rotation slice and stash it in the
     forward context so a direct forward_oot can fetch it. Returns the slice (or None
@@ -128,16 +110,8 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
 
     rot = rope.gather_rotation(positions, torch.device("cpu"))
     assert rot is not None and rot.device.type == "cpu"
-    # gather_rotation primes the expand matrix on the target device; it is present
-    # only for the pad-to-stick regime (head_size=64 -> inner dim 32), None for the
-    # stick-aligned pure-view regime (128->64, 256->128).
-    expand_matrix = rope._expand_matrix
-    assert rope._needs_expand == (head_size == 64)
-    assert (expand_matrix is not None) == rope._needs_expand
-    if expand_matrix is not None:
-        assert expand_matrix.device.type == "cpu"
-    actual_query = _rotate_neox_2x2(query, rot, head_size, expand_matrix)
-    actual_key = _rotate_neox_2x2(key, rot, head_size, expand_matrix)
+    actual_query = _rotate_neox_2x2(query, rot, head_size)
+    actual_key = _rotate_neox_2x2(key, rot, head_size)
 
     expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
     torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
@@ -432,10 +406,8 @@ def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_para
 
     rot = rope.gather_rotation(positions, torch.device("cpu"))
     assert rot is not None and rot.device.type == "cpu"
-    expand_matrix = rope._expand_matrix
-    assert (expand_matrix is not None) == (head_size == 64)
-    actual_query = _rotate_neox_2x2(query, rot, head_size, expand_matrix)
-    actual_key = _rotate_neox_2x2(key, rot, head_size, expand_matrix)
+    actual_query = _rotate_neox_2x2(query, rot, head_size)
+    actual_key = _rotate_neox_2x2(key, rot, head_size)
 
     expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
         rope, positions, query, key
