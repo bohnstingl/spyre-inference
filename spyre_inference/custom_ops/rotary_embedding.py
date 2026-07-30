@@ -171,10 +171,8 @@ class _SpyreRotaryMixin:
             self._rope_key,  # ty: ignore[invalid-argument-type]
             self.head_size,
         )
-        # query/key arrive on Spyre from the QKV projection; rot is primed on Spyre.
         # Apply the rotation through the opaque spyre_rope_rotate op so the 2x2
-        # rotation runs eagerly on Spyre rather than being fused into (and
-        # mis-lowered by) the compiled graph.
+        # rotation runs eagerly on Spyre.
         out_query = torch.ops.vllm.spyre_rope_rotate(
             query,  # ty: ignore[invalid-argument-type]
             rot,
