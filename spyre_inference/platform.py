@@ -190,6 +190,13 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode is None:
             vllm_config.compilation_config.mode = CompilationMode.NONE
         else:
+            # Warn the user if a different compile mode has been selected
+            if vllm_config.compilation_config.mode is not CompilationMode.STOCK_TORCH_COMPILE:
+                logger.warn_once(
+                    "Spyre-inference currently only supports ``STOCK_TORCH_COMPILE``"
+                    + f", but {vllm_config.compilation_config.mode} selected!"
+                )
+
             # Only if enforce_eager=False and a particular CompilationMode is selected,
             # continue in compile mode
             vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE

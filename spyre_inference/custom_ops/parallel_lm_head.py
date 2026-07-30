@@ -63,8 +63,7 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
             )
         else:
             # Clone → INDEPENDENT storage from `weight`. With
-            # tie_word_embeddings, `weight` IS `embed_tokens.weight` and must
-            # stay on CPU; `_apply` below moves only `padded_weight` to Spyre.
+            # tie_word_embeddings, `weight` IS `embed_tokens.weight`.
             layer.padded_weight = Parameter(layer.weight.data.clone())
 
 

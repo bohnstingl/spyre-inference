@@ -46,7 +46,7 @@ def _convert_op_func(
     if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
         raise RuntimeError(
             f"Trying to convert a tensor to the same device ({tensor.device.type}) "
-            + "and same dtype ({tensor.dtype}), should never happen!"
+            + f"and same dtype ({tensor.dtype}), should never happen!"
         )
 
     # Spyre requires CPU for dtype changes

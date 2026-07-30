@@ -19,7 +19,6 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.mark.compile
 @pytest.mark.parametrize(
     "model_ref_output",
     [
