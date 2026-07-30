@@ -42,17 +42,45 @@ def spyre_device():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Spyre returns a non-contiguous last-dim slice whose values are "
-        "correct, but using it as a binary-op operand silently produces "
-        "wrong results (the second operand appears to ignore its storage "
-        "offset). This blocks removing the CPU detour in SpyreSiluAndMul "
-        "(fused gate|up slice) and SpyreParallelLMHead (unpad slice)."
-    ),
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "compile",
+        pytest.param(
+            "eager",
+            marks=pytest.mark.xfail(
+                reason=(
+                    "Spyre returns a non-contiguous last-dim slice whose values are "
+                    "correct, but using it as a binary-op operand silently produces "
+                    "wrong results (the second operand appears to ignore its storage "
+                    "offset). This blocks removing the CPU detour in SpyreSiluAndMul "
+                    "(fused gate|up slice) and SpyreParallelLMHead (unpad slice)."
+                ),
+            ),
+        ),
+    ],
 )
-def test_spyre_last_dim_slice(spyre_device):
+def test_spyre_last_dim_slice_eager(spyre_device, mode):
+    """Last-dim slice of a Spyre tensor (fused gate|up path)."""
+    x = torch.randn(32, 8192, dtype=torch.float16, device=spyre_device)
+
+    def fn(x):
+        d = x.shape[-1] // 2
+        gate = x[..., :d]
+        up = x[..., d:]
+        return F.silu(gate) * up
+
+    if mode == "compile":
+        fn = torch.compile(fn, dynamic=False, backend="inductor")
+
+    expected = F.silu(x.cpu()[..., : x.shape[-1] // 2]) * x.cpu()[..., x.shape[-1] // 2 :]
+
+    out = fn(x)
+
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+def test_spyre_last_dim_slice_compiled(spyre_device):
     """Last-dim slice of a Spyre tensor (fused gate|up path)."""
     x = torch.randn(32, 8192, dtype=torch.float16, device=spyre_device)
     d = x.shape[-1] // 2
