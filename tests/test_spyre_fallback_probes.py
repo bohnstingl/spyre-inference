@@ -60,7 +60,7 @@ def spyre_device():
         ),
     ],
 )
-def test_spyre_last_dim_slice_eager(spyre_device, mode):
+def test_spyre_last_dim_slice(spyre_device, mode):
     """Last-dim slice of a Spyre tensor (fused gate|up path)."""
     x = torch.randn(32, 8192, dtype=torch.float16, device=spyre_device)
 
@@ -77,17 +77,6 @@ def test_spyre_last_dim_slice_eager(spyre_device, mode):
 
     out = fn(x)
 
-    torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
-
-
-def test_spyre_last_dim_slice_compiled(spyre_device):
-    """Last-dim slice of a Spyre tensor (fused gate|up path)."""
-    x = torch.randn(32, 8192, dtype=torch.float16, device=spyre_device)
-    d = x.shape[-1] // 2
-    gate = x[..., :d]
-    up = x[..., d:]
-    out = F.silu(gate) * up
-    expected = F.silu(x.cpu()[..., :d]) * x.cpu()[..., d:]
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
