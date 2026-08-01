@@ -388,7 +388,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV / gate-up projections.
+        # Un-fuse QKV projections.
         analyze_and_unfuse(self.model)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.

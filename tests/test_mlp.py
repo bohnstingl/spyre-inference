@@ -28,10 +28,7 @@ import torch.nn.functional as F
 def test_merged_column_matches_reference(
     tp_group, num_tokens, hidden_size, intermediate_size, use_bias
 ):
-    """An un-fused gate_up_proj returns a (gate, up) pair whose concatenation
-    matches the fused upstream F.linear.
-
-    """
+    """A fused gate_up_proj on Spyre matches the upstream CPU F.linear."""
     import torch.nn as nn
 
     from vllm.model_executor.layers.activation import SiluAndMul
@@ -63,7 +60,6 @@ def test_merged_column_matches_reference(
     if layer.bias is not None:
         layer.bias.data.zero_()
 
-    # Capture the fused reference BEFORE the pass destructively un-fuses.
     torch.manual_seed(1)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     expected = F.linear(x, layer.weight, layer.bias)

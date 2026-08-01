@@ -56,9 +56,9 @@ def _make_attention_module(num_heads, num_kv_heads, head_size, bias=False):
     return Attn()
 
 
-def _make_mlp_module(hidden, inter, bias=False, with_silu=True):
-    """A minimal MLP: gate_up_proj + (optional) SiluAndMul act_fn."""
-    from vllm.model_executor.layers.activation import GeluAndMul, SiluAndMul
+def _make_mlp_module(hidden, inter, bias=False):
+    """A minimal MLP: gate_up_proj + SiluAndMul act_fn."""
+    from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
     class MLP(nn.Module):
@@ -73,7 +73,7 @@ def _make_mlp_module(hidden, inter, bias=False, with_silu=True):
                 disable_tp=True,
                 prefix="gate_up_proj",
             )
-            self.act_fn = SiluAndMul() if with_silu else GeluAndMul()
+            self.act_fn = SiluAndMul()
 
         def forward(self, x):
             gate_up, _ = self.gate_up_proj(x)
@@ -201,87 +201,23 @@ def test_qkv_split_fails_closed_on_other_access(tp_group):
 def test_quantized_layers_are_left_fused(tp_group):
     """A non-UnquantizedLinearMethod quant_method makes the pass skip the layer.
 
-    Spyre only supports the unquantized path; a quantized QKV/gate-up must be
-    left fused (weight untouched, forward unchanged) rather than split apart.
+    Spyre only supports the unquantized path; a quantized QKV must be left
+    fused (weight untouched, forward unchanged) rather than split apart.
     """
     from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 
     torch.manual_seed(0)
     attn = _make_attention_module(8, 2, 64)
-    mlp = _make_mlp_module(64, 128, with_silu=True)
 
     # Simulate a quantized layer: any object that is not an
     # UnquantizedLinearMethod trips the `_is_unquantized` guard.
     attn.qkv_proj.quant_method = object()
-    mlp.gate_up_proj.quant_method = object()
 
     analyze_and_unfuse(attn)
-    analyze_and_unfuse(mlp)
 
     # Left fully fused: original weight kept, no per-part params, forward intact.
     assert attn.qkv_proj.weight is not None
     assert not hasattr(attn.qkv_proj, "q_weight")
-    assert mlp.gate_up_proj.weight is not None
-    assert not hasattr(mlp.gate_up_proj, "gate_weight")
-
-
-@pytest.mark.mlp
-def test_merged_with_non_two_parts_is_left_fused(tp_group):
-    """A MergedColumnParallelLinear with != 2 output parts is out of scope.
-
-    The gate/up un-fuse only handles the 2-part (gate, up) case; a 3-part
-    merged projection must be left fused.
-    """
-    import torch.nn as nn
-
-    from vllm.model_executor.layers.activation import SiluAndMul
-    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
-
-    torch.manual_seed(0)
-
-    class MLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.gate_up_proj = MergedColumnParallelLinear(
-                input_size=64,
-                output_sizes=[128, 128, 128],  # three parts, not (gate, up)
-                bias=False,
-                params_dtype=torch.float16,
-                quant_config=None,
-                disable_tp=True,
-                prefix="gate_up_proj",
-            )
-            self.act_fn = SiluAndMul()
-
-    mlp = MLP()
-    assert len(mlp.gate_up_proj.output_partition_sizes) == 3
-
-    analyze_and_unfuse(mlp)
-
-    # Left fused: 3-part projection is not the (gate, up) idiom.
-    assert mlp.gate_up_proj.weight is not None
-    assert not hasattr(mlp.gate_up_proj, "gate_weight")
-
-
-@pytest.mark.mlp
-def test_merged_list_feeds_silu(tp_group):
-    """The un-fused MLP end-to-end matches the fused reference on CPU."""
-    from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
-
-    torch.manual_seed(0)
-    mlp = _make_mlp_module(64, 128, with_silu=True)
-    mlp.gate_up_proj.weight.data.normal_(std=0.02)
-
-    x = torch.randn(4, 64, dtype=torch.float16)
-    # Fused reference: gate_up then SiluAndMul native.
-    fused = F.linear(x, mlp.gate_up_proj.weight)
-    d = fused.shape[-1] // 2
-    expected = F.silu(fused[..., :d]) * fused[..., d:]
-
-    analyze_and_unfuse(mlp)
-    actual = mlp(x)  # gate_up returns SplitSiluAndMul; SpyreSiluAndMul consumes it
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.mlp
@@ -365,10 +301,9 @@ def test_repr_after_unfuse_does_not_crash(tp_group):
 
 @pytest.mark.mlp
 def test_fullgraph_traces_through_unfused(tp_group):
-    """torch.compile(fullgraph=True) traces the unmodified split/act idioms
-    after un-fusing — the SplitQKV.split() and SplitSiluAndMul unpack do not
-    break Dynamo. This mirrors the Spyre runtime, which compiles the whole
-    model with fullgraph=True.
+    """torch.compile(fullgraph=True) traces the unmodified split idiom after
+    un-fusing — SplitQKV.split() does not break Dynamo. This mirrors the Spyre
+    runtime, which compiles the whole model with fullgraph=True.
     """
     from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 
@@ -378,7 +313,7 @@ def test_fullgraph_traces_through_unfused(tp_group):
         def __init__(self):
             super().__init__()
             self.attn = _make_attention_module(4, 2, 16)
-            self.mlp = _make_mlp_module(4 * 16, 128, with_silu=True)
+            self.mlp = _make_mlp_module(4 * 16, 128)
 
         def forward(self, x):
             q, k, v = self.attn(x)

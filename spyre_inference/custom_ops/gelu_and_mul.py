@@ -15,9 +15,10 @@
 """Spyre-specific GeluAndMul implementation (GeGLU).
 
 Gemma models use `gelu_pytorch_tanh` gated MLPs -> vLLM's `GeluAndMul`. The stock
-`forward_native` slices the fused `[..., 2*d]` tensor on-device, which corrupts
-Spyre memory (same hazard `SpyreSiluAndMul` works around). This mirrors that
-override with GELU instead of SiLU.
+`forward_native` slices the fused `[..., 2*d]` tensor on the last dim; on Spyre
+that slice is only correct under `torch.compile` (indirect access), so
+`forward_oot` runs a compiled `forward_native`. Mirrors `SpyreSiluAndMul` with
+GELU instead of SiLU.
 """
 
 import torch

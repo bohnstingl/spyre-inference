@@ -57,7 +57,7 @@ invisible to `torch.compile`.
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | CPU | Wrapped in the opaque `spyre_rotary_cpu` custom op; the whole rotary (incl. `index_select`) runs eagerly on CPU so Inductor sees one fallback kernel |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre + CPU | TP shard mask computed on CPU (Spyre inductor rejects int64 constants); the `aten.embedding` gather itself is a **silent CPU fallback** in torch-spyre ([torch-spyre#420](https://github.com/torch-spyre/torch-spyre/issues/420)); weights and output live on Spyre; `all_reduce` when TP>1 |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
-| `SiluAndMul` | `SpyreSiluAndMul` | Spyre | Consumes the pre-split `gate`/`up` parts (see un-fusing); the fused fallback path slices on CPU (Spyre slicing corrupts views) |
+| `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
 
@@ -66,19 +66,18 @@ invisible to `torch.compile`.
 - `RowParallelLinear` (`o_proj`, `down_proj`) runs the upstream class unchanged — `F.linear`
   dispatches to Spyre, and `all_reduce` (via `SpyreCommunicator`) fires when `reduce_results=True`
   under TP>1.
-- `MergedColumnParallelLinear` (`gate_up_proj`) is un-fused at load into separate `gate`/`up`
-  Parameters (see below).
+- `MergedColumnParallelLinear` (`gate_up_proj`) runs the upstream class unchanged: the
+  fused `[..., 2*d]` output feeds straight into `SpyreSiluAndMul`, which slices gate/up
+  on-device.
 
 ### Weight un-fusing
 
 `analyze_and_unfuse` (`custom_ops/unfuse.py`) runs once after the checkpoint is loaded,
-while weights are still on CPU. Fused projections are a problem on Spyre: splitting a
-fused weight's output on-device yields strided views that corrupt when transferred. So
-the pass splits each fused weight (`QKVParallelLinear`, and the `MergedColumnParallelLinear`
-feeding a `SpyreSiluAndMul`) into contiguous per-part Parameters and rebinds `forward` to
-run one `F.linear` per part. The result is a `SplitQKV` / `SplitSiluAndMul` container that
-the unmodified downstream idioms — `q, k, v = qkv.split(...)` and `gate, up = proj` — keep
-consuming unchanged.
+while weights are still on CPU. The fused `QKVParallelLinear` weight is a problem on Spyre:
+splitting its output on-device yields strided views that corrupt when transferred. So the
+pass splits the fused weight into contiguous per-part Parameters and rebinds `forward` to
+run one `F.linear` per part. The result is a `SplitQKV` container that the unmodified
+downstream idiom — `q, k, v = qkv.split(...)` — keeps consuming unchanged.
 
 ## Attention Backend
 
