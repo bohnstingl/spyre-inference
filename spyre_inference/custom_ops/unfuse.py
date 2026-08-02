@@ -39,9 +39,6 @@ from vllm.model_executor.layers.linear import (
 )
 
 
-# Gated-MLP activations whose sibling gate_up_proj should be un-fused.
-_GATED_MLP_ACTIVATIONS = (SpyreSiluAndMul, SpyreGeluAndMul)
-
 logger = init_logger(__name__)
 
 
