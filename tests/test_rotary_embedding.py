@@ -42,23 +42,6 @@ YARN_ROPE_PARAMS = {
 HEAD_SIZES = [64, 128, 256]
 
 
-def _prime_rope(rope, positions):
-    """Mimic _SpyreModelWrapper: pre-gather the rotation slice and stash it in the
-    forward context so a direct forward_oot can fetch it. Returns the slice (or None
-    for CPU-fallback configs).
-
-    Uses ``setdefault`` (not the single-shot dict rebuild of the production
-    ``_prime_rope_rotation``) so multiple modules primed by successive calls
-    accumulate under distinct ``_rope_key`` entries in one dict."""
-    from vllm.forward_context import get_forward_context
-
-    rot = rope.gather_rotation(positions, positions.device)
-    if rot is not None:
-        cache = get_forward_context().additional_kwargs.setdefault("spyre_rope_rot", {})
-        cache[rope._rope_key] = rot
-    return rot
-
-
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
     """Build (query, key) on CPU as 2D [T, H*D] (production) or 3D [T, H, D]."""
     query = torch.randn(num_tokens, num_q_heads, head_size, dtype=torch.float16)
@@ -147,7 +130,6 @@ def test_rotary_forward_oot_on_spyre(
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten)
 
-    _prime_rope(rope, positions)
     actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
 
     expected_query, expected_key = RotaryEmbedding.forward_native(
@@ -190,7 +172,6 @@ def test_llama3_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flat
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, flatten)
 
-    _prime_rope(rope, positions)
     actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
     expected_query, expected_key = Llama3RotaryEmbedding.forward_native(
         rope, positions.cpu(), query.cpu(), key.cpu()
@@ -216,7 +197,6 @@ def test_rotary_forward_oot_key_none_on_spyre(default_vllm_config, head_size):
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
 
-    _prime_rope(rope, positions)
     actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), None)
     assert actual_key is None
 
@@ -229,10 +209,10 @@ def test_rotary_forward_oot_key_none_on_spyre(default_vllm_config, head_size):
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size):
-    """Two distinct rope modules (different rope_theta -> different rotations) prime
-    their own slices into one spyre_rope_rot dict under distinct _rope_key entries;
-    each forward_oot fetches its own slice and matches its own reference. A key mixup
-    would rotate with the wrong frequencies and fail the per-module assert_close."""
+    """Two distinct rope modules (different rope_theta -> different rotations) each keep
+    their own device rotation cache; each forward_oot gathers from its own cache and
+    matches its own reference. A cache mixup would rotate with the wrong frequencies and
+    fail the per-module assert_close."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -246,14 +226,10 @@ def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size)
         rope_parameters={"rope_theta": 1000000.0},
         dtype=torch.float16,
     )
-    assert rope_a._rope_key != rope_b._rope_key
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     qa = torch.randn(num_tokens, nh * head_size, dtype=torch.float16)
     qb = torch.randn(num_tokens, nh * head_size, dtype=torch.float16)
-
-    _prime_rope(rope_a, positions)
-    _prime_rope(rope_b, positions)
 
     aqa, _ = rope_a.forward_oot(positions, qa.to("spyre"))
     aqb, _ = rope_b.forward_oot(positions, qb.to("spyre"))
@@ -286,22 +262,12 @@ def test_gather_rotation_returns_spyre_slice(default_vllm_config, head_size):
 @pytest.mark.rotary
 def test_gather_rotation_mrope_positions_returns_none(default_vllm_config):
     """Multi-dim (mrope/xdrope) positions have no Spyre rotation path: gather_rotation
-    returns None so _prime_rope_rotation leaves the module unprimed."""
+    returns None."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     rope = get_rope(128, 2048, is_neox_style=True, dtype=torch.float16)
     positions = torch.randint(0, 2048, (3, 8), dtype=torch.long)  # 2D -> mrope-style
     assert rope.gather_rotation(positions, torch.device("cpu")) is None
-
-
-@pytest.mark.rotary
-def test_rope_rot_op_unprimed_raises(default_vllm_config):
-    """The spyre_rope_rot op body raises when a module's slice was never primed into
-    the forward context (rather than silently returning stale/empty data)."""
-    from spyre_inference.custom_ops.rotary_embedding import _rope_rot_op_func
-
-    with pytest.raises(RuntimeError, match="not primed"):
-        _rope_rot_op_func(torch.zeros(4, dtype=torch.long), "spyre_rope_never_primed", 128)
 
 
 @pytest.mark.rotary
@@ -445,7 +411,6 @@ def test_yarn_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flatte
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, flatten)
 
-    _prime_rope(rope, positions)
     actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
     expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
         rope, positions.cpu(), query.cpu(), key.cpu()
