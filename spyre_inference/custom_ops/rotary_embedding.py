@@ -23,10 +23,17 @@ the opaque ``spyre_rope_gather`` op, then applies the rotation through the opaqu
 torch-spyre's compiled lowering of the 2x2 rotation corrupts when fused into the
 full-model graph.
 
+``spyre_rope_gather`` takes the module's ``cache_key`` (a string), not the cache tensor:
+the op body looks the cache up from ``_ROPE_MODULE_REGISTRY`` at execution time. Passing
+the device-resident cache as a tensor argument would lift it into the torch.compile
+fullgraph as an input, and the compiled kernel then segfaults indexing it via libsenlib
+during warmup. Keying by string keeps the cache out of the graph entirely.
+
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
 """
 
+import itertools
 from functools import lru_cache
 
 import torch
@@ -54,6 +61,11 @@ logger = init_logger(__name__)
 # rotary_dim // 2; when that is not a stick multiple the split-half view has a
 # sub-stick stride the inductor rejects, so it is padded up on-device.
 _SPYRE_STICK = 64
+
+# Maps each RoPE module's cache key to the module so the opaque spyre_rope_gather op can
+# reach its device-resident rotation cache without receiving it as a tensor argument
+# (which would lift the cache into the torch.compile graph and crash the compiled kernel).
+_ROPE_MODULE_REGISTRY: dict[str, "_SpyreRotaryMixin"] = {}
 
 
 @lru_cache
@@ -106,6 +118,8 @@ class _SpyreRotaryMixin:
     the base ``cos_sin_cache`` (inheriting all rope-scaling variants) and kept on CPU.
     """
 
+    _key_counter = itertools.count()
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Only neox full rotary has a Spyre kernel; gptj/interleaved and partial
@@ -119,6 +133,9 @@ class _SpyreRotaryMixin:
         self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        # Registered so the opaque gather op can reach this module's device cache by key.
+        self._cache_key = f"spyre_rope_{next(_SpyreRotaryMixin._key_counter)}"
+        _ROPE_MODULE_REGISTRY[self._cache_key] = self
 
     def _apply(self, fn, recurse=True):
         # cos_sin_cache has no Spyre kernel; keep cos_sin_cache on CPU.
@@ -172,11 +189,13 @@ class _SpyreRotaryMixin:
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Gather this pass's per-token rotation slice on-device via the opaque op
-        # (index_select runs eagerly on Spyre, not fused into the compile graph).
+        # Gather this pass's per-token rotation slice on-device via the opaque op. The
+        # op is keyed by cache_key (a string) so the device cache stays out of the
+        # compile graph; the gather runs eagerly on Spyre inside the op body.
         rot = torch.ops.vllm.spyre_rope_gather(
             positions,  # ty: ignore[invalid-argument-type]
-            self._get_device_rotation_cache(query.device),  # ty: ignore[invalid-argument-type]
+            self._cache_key,  # ty: ignore[invalid-argument-type]
+            self.head_size,
         )
         # Apply the rotation through the opaque spyre_rope_rotate op so the 2x2
         # rotation runs eagerly on Spyre.
@@ -218,16 +237,20 @@ class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedd
     pass
 
 
-def _rope_gather_op_func(positions: torch.Tensor, device_cache: torch.Tensor) -> torch.Tensor:
-    """Opaque-op body: gather this pass's per-token 2x2 rotation slice from the
-    device-resident cache with an on-device ``index_select``."""
-    return device_cache.index_select(0, positions.flatten())
+def _rope_gather_op_func(positions: torch.Tensor, cache_key: str, head_size: int) -> torch.Tensor:
+    """Opaque-op body: gather this pass's per-token 2x2 rotation slice from the calling
+    module's device-resident cache with an on-device ``index_select``. The cache is
+    looked up from ``_ROPE_MODULE_REGISTRY`` by ``cache_key`` rather than passed as a
+    tensor argument, so it never becomes a torch.compile graph input. Runs eagerly,
+    building the device cache lazily on first execution."""
+    cache = _ROPE_MODULE_REGISTRY[cache_key]._get_device_rotation_cache(positions.device)
+    return cache.index_select(0, positions.flatten())
 
 
-def _rope_gather_op_fake(positions: torch.Tensor, device_cache: torch.Tensor) -> torch.Tensor:
+def _rope_gather_op_fake(positions: torch.Tensor, cache_key: str, head_size: int) -> torch.Tensor:
     return torch.empty(
-        (positions.shape[0], *device_cache.shape[1:]),
-        dtype=device_cache.dtype,
+        (positions.shape[0], 2, 2, round_up(head_size // 2, _SPYRE_STICK)),
+        dtype=torch.float16,
         device=positions.device,
     )
 
