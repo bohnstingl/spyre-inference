@@ -19,6 +19,8 @@ weight physically transposed as `Wᵀ` (shape `[in, out]`, contiguous) in
 `process_weights_after_loading`, which is more efficient on Spyre.
 """
 
+from typing import cast
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -60,7 +62,8 @@ class SpyreUnquantizedLinearMethod(UnquantizedLinearMethod):
 
         # Store the transposed layout (`[in, out]`, contiguous) so the forward
         # GEMM is the Spyre-fast `x @ A`.
-        layer.weight = Parameter(layer.weight.data.t().contiguous(), requires_grad=False)
+        weight = cast(torch.Tensor, layer.weight)
+        layer.weight = Parameter(weight.data.t().contiguous(), requires_grad=False)
 
     def apply(
         self,
@@ -68,7 +71,7 @@ class SpyreUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return spyre_linear_t(x, layer.weight, bias)
+        return spyre_linear_t(x, cast(torch.Tensor, layer.weight), bias)
 
 
 class _SpyreTransposedLinearMixin:
