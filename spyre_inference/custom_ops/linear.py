@@ -14,22 +14,9 @@
 
 """Spyre OOT linear layers and the transposed-weight fast path.
 
-`F.linear(x, W)` computes `x @ Wᵀ` regardless of how `W` is laid out, and on
-Spyre the transposed matmul is ~3.5x slower than a plain `x @ A`
-(torch-spyre issue #3512). `SpyreUnquantizedLinearMethod` stores each 2-D linear
+`SpyreUnquantizedLinearMethod` stores each 2-D linear
 weight physically transposed as `Wᵀ` (shape `[in, out]`, contiguous) in
-`process_weights_after_loading` and swaps the GEMM to `x @ Wᵀ`, which is the fast
-path. It is the pure-PyTorch equivalent of torch-spyre's `[1,0]` weight layout,
-which only fires for `nn.Linear` and so misses every vLLM parallel-linear.
-
-The method is installed via `_SpyreTransposedLinearMixin`, which each OOT linear
-subclass below inherits. vLLM's `LinearBase.forward` already routes through
-`self.quant_method.apply(...)`, so no layer `forward` is overridden and the fused
-QKV output stays whole — the model splits it downstream with the unmodified
-`qkv.split(...)` idiom, which now runs correctly on-device (the torch-spyre
-storage-offset fix removed the need for the old CPU-side unfusing pass). The LM
-head reuses `spyre_linear_t` from `parallel_lm_head.py` so the fast path is
-defined once.
+`process_weights_after_loading`, which is more efficient on Spyre.
 """
 
 import torch
