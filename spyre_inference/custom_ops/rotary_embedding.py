@@ -166,23 +166,6 @@ class _SpyreRotaryMixin:
             )
         return self._device_rotation_cache
 
-    def gather_rotation(
-        self, positions: torch.Tensor, target_device: torch.device
-    ) -> torch.Tensor | None:
-        """Index the device-resident cache to get this pass's per-token 2x2 rotation
-        slice; ``positions`` may arrive on the host or on Spyre. Returns ``None`` for
-        multi-dim (mrope/xdrope) positions."""
-        if positions.dim() > 1:
-            return None
-        idx = positions.flatten()
-        if target_device.type != "spyre":
-            # CPU-reference path (dev laptops, rotation-math test): host index_select,
-            # no Spyre-dispatched op.
-            return self._get_rotation_cache().index_select(0, idx.to(torch.int64)).to(self.dtype)
-        return self._get_device_rotation_cache(target_device).index_select(
-            0, convert(idx, device=target_device)
-        )
-
     def forward_oot(
         self,
         positions: torch.Tensor,

@@ -74,7 +74,7 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
-    """CPU-only: gather_rotation + _rotate_neox_2x2 match forward_native without a
+    """CPU-only: host gather + _rotate_neox_2x2 match forward_native without a
     Spyre device, so the core rotation formula is validated on dev laptops where the
     forward_oot tests skip. Stick-aligned inner dims (128->64, 256->128) exercise the
     pure-view path; head_size=64 (inner dim 32) exercises the pad-to-stick expand-matrix
@@ -91,8 +91,8 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
     key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
 
-    rot = rope.gather_rotation(positions, torch.device("cpu"))
-    assert rot is not None and rot.device.type == "cpu"
+    rot = rope._get_rotation_cache().index_select(0, positions).to(torch.float16)
+    assert rot.device.type == "cpu"
     actual_query = _rotate_neox_2x2(query, rot, head_size)
     actual_key = _rotate_neox_2x2(key, rot, head_size)
 
@@ -242,9 +242,9 @@ def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size)
 
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-def test_gather_rotation_returns_spyre_slice(default_vllm_config, head_size):
-    """gather_rotation returns the per-token [T, 2, 2, round_up(rotary_dim//2)] slice
-    on Spyre for a supported config."""
+def test_rope_gather_op_returns_spyre_slice(default_vllm_config, head_size):
+    """The spyre_rope_gather op returns the per-token [T, 2, 2, round_up(rotary_dim//2)]
+    slice on Spyre for a supported config."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.utils.math_utils import round_up
     from spyre_inference.custom_ops.rotary_embedding import _SPYRE_STICK
@@ -252,22 +252,10 @@ def test_gather_rotation_returns_spyre_slice(default_vllm_config, head_size):
     max_position, num_tokens = 2048, 32
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
 
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
-    rot = rope.gather_rotation(positions, torch.device("spyre"))
-    assert rot is not None
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
+    rot = torch.ops.vllm.spyre_rope_gather(positions, rope._cache_key, rope.head_size)
     assert rot.device.type == "spyre"
     assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2, _SPYRE_STICK))
-
-
-@pytest.mark.rotary
-def test_gather_rotation_mrope_positions_returns_none(default_vllm_config):
-    """Multi-dim (mrope/xdrope) positions have no Spyre rotation path: gather_rotation
-    returns None."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
-
-    rope = get_rope(128, 2048, is_neox_style=True, dtype=torch.float16)
-    positions = torch.randint(0, 2048, (3, 8), dtype=torch.long)  # 2D -> mrope-style
-    assert rope.gather_rotation(positions, torch.device("cpu")) is None
 
 
 @pytest.mark.rotary
@@ -350,7 +338,7 @@ def test_yarn_rotary_oot_registration(default_vllm_config):
 )
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_params, head_size):
-    """CPU-only: gather_rotation + _rotate_neox_2x2 match forward_native for YaRN,
+    """CPU-only: host gather + _rotate_neox_2x2 match forward_native for YaRN,
     validating that the scaled cos/sin cache produced by YaRN is correctly transformed
     into the 2x2 rotation matrix format across different scaling factors and parameters."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -374,8 +362,8 @@ def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_para
     query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
     key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
 
-    rot = rope.gather_rotation(positions, torch.device("cpu"))
-    assert rot is not None and rot.device.type == "cpu"
+    rot = rope._get_rotation_cache().index_select(0, positions).to(torch.float16)
+    assert rot.device.type == "cpu"
     actual_query = _rotate_neox_2x2(query, rot, head_size)
     actual_key = _rotate_neox_2x2(key, rot, head_size)
 
