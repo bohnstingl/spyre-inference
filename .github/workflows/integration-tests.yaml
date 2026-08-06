@@ -1,4 +1,9 @@
 name: integration-tests
+run-name: integration-tests (${{ inputs.test_type || 'full' }})
+# NOTE: run-name intentionally shows the RAW, user-facing input (before
+# _test_matrix.yaml's gate step resolves unit/integration/regression to
+# core/smoke/full) -- this is also what push-to-clickhouse.yaml's trigger_type
+# ends up recording, so ClickHouse sees the tier name callers actually asked for.
 
 # ---------------------------------------------------------------------------
 # Triggered by commits in upstream dependant repos (deeptools, flex, torch-spyre
@@ -79,7 +84,9 @@ on:
         description: >-
           Suite subset to run. Default: full (every config). Selects which matrix
           configs run (see _test_matrix.yaml); same knob and vocabulary as the
-          sibling repos.
+          sibling repos. Also accepts the user-facing tier aliases unit (= core),
+          integration (= smoke), regression (= full) -- e.g. via the API/gh CLI,
+          since this dropdown only lists the underlying suite names.
         required: false
         type: choice
         options:
