@@ -88,7 +88,13 @@ override-dependencies = [
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
 # The `CMAKE_ARGS="--fresh"` ensures that cmake doesn't cache binary paths from ephemeral build environments
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
+[tool.uv.extra-build-variables.vllm]
+VLLM_TARGET_DEVICE = "empty"
+CMAKE_ARGS = "--fresh"
+
+# Disable the torch-spyre build-time profiler. This is a temporary perf fix
+[tool.uv.extra-build-variables.torch-spyre]
+USE_SPYRE_PROFILER = "0"
 
 
 # vLLM and torch-spyre must be pulled from github to be built from source

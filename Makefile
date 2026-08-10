@@ -14,11 +14,18 @@ SHELL := /bin/bash
 TEST_TYPE ?= regression
 
 # Resolve the user-facing tier aliases to this Makefile's own vocabulary once,
-# up front, via the shared script (same source of truth as _test_matrix.yaml's
-# gate step), so the marker mapping below only has to handle smoke|core|full.
-# override is required: TEST_TYPE is commonly set on the `make` command line,
-# which a plain := reassignment cannot override.
-override TEST_TYPE := $(shell scripts/resolve_test_type.sh "$(TEST_TYPE)")
+# up front, via the shared script -- the single source of truth for BOTH the
+# alias map AND the valid set (shared with _test_matrix.yaml). The script also
+# validates: on an unknown type it prints the full "Valid: ..." message to
+# stderr (which reaches the terminal) and exits 1, printing nothing to stdout.
+# $(shell ...) hides the exit code (and .SHELLSTATUS needs GNU make >= 4.2, not
+# guaranteed everywhere), so we detect failure by the empty stdout capture and
+# stop the build. The valid-set list stays only in the script; the marker
+# mapping below is the Makefile's only per-type knowledge.
+override TEST_TYPE := $(strip $(shell scripts/resolve_test_type.sh "$(TEST_TYPE)"))
+ifeq ($(TEST_TYPE),)
+$(error resolve_test_type.sh rejected TEST_TYPE (see the 'Valid: ...' error above))
+endif
 
 # Flags passed verbatim to pytest. Mirrors the CI invocation so `make test`
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
@@ -38,18 +45,29 @@ endif
 # expression finer than the 3 coarse tiers (e.g. CI splitting the "full"-only
 # upstream suites into separate parallel jobs) -- set MARK_OVERRIDE and the
 # TEST_TYPE mapping below is skipped.
+# perf is NOT a pytest marker subset: it is a benchmark mode of `make tests`
+# that shells out to the vLLM benchmark suite (perf-tests target) instead of
+# pytest, so it has no MARK_EXPR. It is accepted here (not rejected) and the
+# `tests` target routes it to perf-tests. This keeps perf on the SAME
+# `make tests TEST_TYPE=...` entry point as the sibling repos (torch-spyre,
+# hf-adapters), so CI drives every suite through one knob.
 ifneq ($(MARK_OVERRIDE),)
 MARK_EXPR := -m "$(MARK_OVERRIDE)"
 else ifeq ($(TEST_TYPE),full)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),trunk)
 MARK_EXPR :=
+else ifeq ($(TEST_TYPE),perf)
+MARK_EXPR :=
 else ifeq ($(TEST_TYPE),smoke)
 MARK_EXPR := -m "not (distributed or upstream or attention)"
 else ifeq ($(TEST_TYPE),core)
 MARK_EXPR := -m "not upstream"
 else
-$(error Invalid TEST_TYPE '$(TEST_TYPE)'. Valid values: smoke | core | full | trunk)
+# resolve_test_type.sh already rejected any type outside its valid set, so a
+# value that reaches here IS valid but has no marker mapping above -- i.e. a
+# new type was added to the script without a case here. Point at the fix.
+$(error TEST_TYPE '$(TEST_TYPE)' has no pytest marker mapping in this Makefile; add a case above)
 endif
 
 # Root all-suite JUnit output under one directory so a caller can glob it in
@@ -126,8 +144,10 @@ test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 # unfiltered run -- mirror that here so `make test TEST_TYPE=full` is
 # GHA-parity, one flat JUnit file per combo in RESULTS_DIR, same convention
 # hf-adapters' Makefile uses.
-tests: ## Run tests. TEST_TYPE=smoke|core|full|trunk|unit|integration|regression (default regression) or set MARK_OVERRIDE directly.
-	if [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "full" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
+tests: ## Run tests. TEST_TYPE=smoke|core|full|trunk|perf|unit|integration|regression (default regression) or set MARK_OVERRIDE directly.
+	if [ "$(TEST_TYPE)" = "perf" ]; then \
+	  $(MAKE) perf-tests RESULTS_DIR="$(RESULTS_DIR)"; \
+	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "full" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \
@@ -143,9 +163,25 @@ tests: ## Run tests. TEST_TYPE=smoke|core|full|trunk|unit|integration|regression
 
 test: tests  ## Alias for `tests`, matching torch-spyre's Makefile target name.
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
+# On some arches (notably s390x) `uv run` refuses to reuse the prebaked image
+# venv: it re-resolves the project, cannot find an s390x torch/vllm wheel
+# (torch==2.11.0 publishes no s390x wheel), and builds a fresh workspace .venv
+# WITHOUT torch, so every benchmark then dies with "No module named 'torch'".
+# No combination of --active/--no-sync/--frozen/--inexact/--no-project avoids
+# this. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv entirely and invoke the
+# already-activated venv's python3 directly (the setup sourced above exports
+# $VIRTUAL_ENV, so plain python3 is the baked interpreter). Empty/unset keeps
+# the uv path, correct on arches with a resolvable lockfile (amd64, ppc64le).
+SKIP_UV_FOR_BENCHMARKING ?=
+ifeq ($(strip $(SKIP_UV_FOR_BENCHMARKING)),)
+BENCH_PY := uv run --active --no-sync python3
+else
+BENCH_PY := python3
+endif
+
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
 	mkdir -p "$(RESULTS_DIR)"
 	$(AIU_SETUP_CMD); \
-	uv run --active --no-sync python3 .github/scripts/run_vllm_benchmarks.py \
+	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir vllm-benchmarks/benchmarks/spyre \
 		--results-dir "$(RESULTS_DIR)"
