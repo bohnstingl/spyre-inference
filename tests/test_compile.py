@@ -26,9 +26,9 @@ import pytest
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
             "\n\nA list of Identified Benefits under Debt Management – Count",
         ),
-        pytest.param(
-            ("google/gemma-3-1b-it", "\n\nIBM's main"),
-            marks=pytest.mark.skip(reason="Gemma3 currently doesn't work with torch.compile"),
+        (
+            "google/gemma-3-1b-it",
+            "\n\nIBM's main businesses are:\n\n*   **Consulting:** Helping",
         ),
     ],
 )
