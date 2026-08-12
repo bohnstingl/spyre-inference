@@ -85,14 +85,18 @@ on:
           Suite subset to run. Default: full (every config). Selects which matrix
           configs run (see _test_matrix.yaml); same knob and vocabulary as the
           sibling repos. Also accepts the user-facing tier aliases unit (= core),
-          integration (= smoke), regression (= full) -- e.g. via the API/gh CLI,
-          since this dropdown only lists the underlying suite names.
+          integration (= smoke), regression (= full), trunk (= full) -- GitHub
+          validates `choice` options against the REST API dispatch too, not just
+          the web UI dropdown, so every alias a caller (e.g. spyre-frameworks
+          config.yaml) actually sends must be listed here explicitly.
         required: false
         type: choice
         options:
           - smoke
           - core
           - full
+          - perf
+          - trunk
         default: full
 
 concurrency:
