@@ -18,9 +18,11 @@ Applies rotary position embeddings on the Spyre device via a complex-free 2x2
 rotation-matrix formulation (ported from foundation-model-stack). The 2x2 rotation
 cache is held device-resident; ``forward_oot`` gathers this pass's per-token slice on
 Spyre with ``index_select`` (torch-spyre#3418 gave single-row gather a kernel) through
-the opaque ``spyre_rope_gather`` op, then applies the rotation through the opaque
-``spyre_rope_rotate`` op. Both stay opaque so their bodies run eagerly on Spyre:
-torch-spyre's compiled lowering of the 2x2 rotation corrupts when fused into the
+the opaque ``spyre_rope_gather`` op, then applies the rotation with ``_rotate_neox_2x2``
+directly in the compile graph. The gather stays opaque so its body runs eagerly on Spyre
+(see ``cache_key`` note below); the rotation no longer needs an opaque wrapper now that
+torch-spyre's layout-fix (``_normalize_result_layout``) rebuilds fallback outputs to the
+canonical device tiling, which previously corrupted the 2x2 rotation when fused into the
 full-model graph.
 
 ``spyre_rope_gather`` takes the module's ``cache_key`` (a string), not the cache tensor:
@@ -180,15 +182,16 @@ class _SpyreRotaryMixin:
             self._cache_key,  # ty: ignore[invalid-argument-type]
             self.head_size,
         )
-        # Apply the rotation through the opaque spyre_rope_rotate op so the 2x2
-        # rotation runs eagerly on Spyre.
-        out_query = torch.ops.vllm.spyre_rope_rotate(
+        # Apply the 2x2 rotation directly: torch-spyre's layout-fix (bohnstingl/layout_fix,
+        # _normalize_result_layout) makes the compiled lowering of this rotation safe to fuse
+        # into the full-model graph, so the opaque spyre_rope_rotate wrapper is no longer needed.
+        out_query = _rotate_neox_2x2(
             query,  # ty: ignore[invalid-argument-type]
             rot,
             self.head_size,
         )
         out_key = (
-            torch.ops.vllm.spyre_rope_rotate(
+            _rotate_neox_2x2(
                 key,  # ty: ignore[invalid-argument-type]
                 rot,
                 self.head_size,
@@ -238,18 +241,9 @@ def _rope_gather_op_fake(positions: torch.Tensor, cache_key: str, head_size: int
     )
 
 
-def _rope_rotate_op_func(x: torch.Tensor, rot: torch.Tensor, head_size: int) -> torch.Tensor:
-    """Opaque-op body: apply the 2x2 rotation eagerly on-device."""
-    return _rotate_neox_2x2(x, rot, head_size)
-
-
-def _rope_rotate_op_fake(x: torch.Tensor, rot: torch.Tensor, head_size: int) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
 @lru_cache(maxsize=1)
 def register():
-    """Register the spyre_rope custom ops. OOT class replacement happens at import
+    """Register the spyre_rope_gather custom op. OOT class replacement happens at import
     time via ``@RotaryEmbeddingBase.register_oot()``."""
     direct_register_custom_op(
         op_name="spyre_rope_gather",
@@ -257,10 +251,4 @@ def register():
         fake_impl=_rope_gather_op_fake,
         dispatch_key=current_platform.dispatch_key,
     )
-    direct_register_custom_op(
-        op_name="spyre_rope_rotate",
-        op_func=_rope_rotate_op_func,
-        fake_impl=_rope_rotate_op_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-    logger.debug_once("Registered custom ops: spyre_rope_gather, spyre_rope_rotate")
+    logger.debug_once("Registered custom op: spyre_rope_gather")

@@ -226,11 +226,6 @@ class _SpyreModelWrapper:
         The lm_head matmul runs on Spyre via SpyreParallelLMHead,
         which handles H2D/D2H for the sample_hidden_states subset.
 
-    RoPE priming (per forward pass):
-        Gather each RoPE module's per-token rotation slice on the host (no D2H)
-        and stash it in the forward context; forward_oot reads it back, shared
-        across all attention layers.
-
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
     (which calls self.model(...) directly).
@@ -240,13 +235,11 @@ class _SpyreModelWrapper:
         self,
         model: nn.Module,
         spyre_device: torch.device,
-        rope_modules: list[_SpyreRotaryMixin] | None = None,
         keep_outputs_on_device: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
-        object.__setattr__(self, "_rope_modules", rope_modules or [])
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
 
     def __call__(self, *args, **kwargs):
@@ -423,7 +416,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = _SpyreModelWrapper(
             self.model,
             self._spyre_device,
-            rope_modules,
             keep_outputs_on_device=self._pooling_on_spyre,
         )
 
