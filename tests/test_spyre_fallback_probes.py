@@ -109,10 +109,11 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     reason=(
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
         "an indexed scatter write (torch-spyre#3508). Historically this forced "
-        "SpyreQKVParallelLinear to D2H before return; we side-step that by "
-        "un-fusing QKV after load. The same gap keeps encoder-only attention "
-        "Q/K/V pack/unpack on CPU (spyre_encoder_attn.py). Once this probe "
-        "passes, move encoder ragged→dense packing back onto Spyre."
+        "SpyreQKVParallelLinear to D2H before return, and later to un-fuse QKV "
+        "after load; the attention backend now brings k/v to CPU instead. The "
+        "same gap keeps encoder-only attention Q/K/V pack/unpack on CPU "
+        "(spyre_encoder_attn.py). Once this probe passes, move encoder "
+        "ragged→dense packing back onto Spyre."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):
