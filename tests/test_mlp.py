@@ -191,20 +191,72 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
 
 
 @pytest.mark.mlp
+@pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
+@pytest.mark.parametrize("input_size,output_size", [(128, 1), (256, 8), (1024, 512)])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_replicated_matches_reference(tp_group, num_tokens, input_size, output_size, use_bias):
+    """ReplicatedLinear output on Spyre matches upstream CPU F.linear.
+
+    Reaches Spyre as the `score` head of a sequence-classification model
+    (`as_seq_cls_model` in vLLM's model adapters), which is why the tiny
+    `output_size=1` case is covered: a single-column weight still has to survive
+    the `[out, in]` → `[in, out]` transpose.
+    """
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+    from spyre_inference.custom_ops.linear import SpyreReplicatedLinear
+
+    dtype = torch.float16
+    torch.manual_seed(0)
+    layer = ReplicatedLinear(
+        input_size=input_size,
+        output_size=output_size,
+        bias=use_bias,
+        params_dtype=dtype,
+        quant_config=None,
+        prefix="score",
+    )
+    assert isinstance(layer, SpyreReplicatedLinear)
+
+    # torch.empty() leaves memory uninitialised (may contain NaN in float16);
+    # fill with small random values so the comparison is meaningful.
+    layer.weight.data.normal_(std=0.02)
+    if layer.bias is not None:
+        layer.bias.data.zero_()
+
+    torch.manual_seed(1)
+    x = torch.randn(num_tokens, input_size, dtype=dtype)
+    expected = F.linear(x, layer.weight, layer.bias)
+
+    # Store the transposed weight, as the loader would, before moving to device.
+    layer.quant_method.process_weights_after_loading(layer)
+
+    layer = layer.to("spyre")
+    actual, _ = layer(x.to("spyre"))
+
+    assert actual.shape == (num_tokens, output_size)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.mlp
 def test_linear_oot_registration(tp_group):
     """Each unquantized parallel-linear class is swapped for its Spyre OOT
     subclass, all sharing the transposed-weight method. QKV additionally
     asserts the gather_output=False invariant.
     """
     from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear,
         MergedColumnParallelLinear,
         QKVParallelLinear,
+        ReplicatedLinear,
         RowParallelLinear,
     )
     from spyre_inference.custom_ops.linear import (
+        SpyreColumnParallelLinear,
         SpyreMergedColumnParallelLinear,
         SpyreQKVParallelLinear,
+        SpyreReplicatedLinear,
         SpyreRowParallelLinear,
+        SpyreUnquantizedLinearMethod,
     )
 
     qkv = QKVParallelLinear(
@@ -241,3 +293,28 @@ def test_linear_oot_registration(tp_group):
         prefix="down_proj",
     )
     assert isinstance(down, SpyreRowParallelLinear)
+
+    col = ColumnParallelLinear(
+        input_size=64,
+        output_size=128,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=None,
+        disable_tp=True,
+        prefix="col",
+    )
+    assert isinstance(col, SpyreColumnParallelLinear)
+
+    # ReplicatedLinear takes no disable_tp (it is replicated by definition).
+    score = ReplicatedLinear(
+        input_size=64,
+        output_size=2,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=None,
+        prefix="score",
+    )
+    assert isinstance(score, SpyreReplicatedLinear)
+
+    for layer in (qkv, gate_up, down, col, score):
+        assert isinstance(layer.quant_method, SpyreUnquantizedLinearMethod)

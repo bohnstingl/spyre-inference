@@ -20,11 +20,11 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "model_ref_prefix",
+    "model_ref_output",
     [
         (
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            "\n\nIBMs main businesses are",
+            "\n\nIBMs main businesses are the companies that provide the services",
         ),
         pytest.param(
             ("google/gemma-3-1b-it", "\n\nIBM's main"),
@@ -32,13 +32,13 @@ import pytest
         ),
     ],
 )
-def test_basic_llm_inference(model_ref_prefix, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
     from vllm import LLM, SamplingParams
 
     prompt = "What are IBMs main businesses?"
 
-    model, ref_prefix = model_ref_prefix
+    model, ref_output = model_ref_output
 
     engine = LLM(
         model=model,
@@ -55,6 +55,4 @@ def test_basic_llm_inference(model_ref_prefix, monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert prompt == output[0].prompt, "Model output contained wrong prompt!"
-    assert output[0].outputs[0].text.startswith(ref_prefix), (
-        f"Model produced wrong output: {output[0].outputs[0].text!r}"
-    )
+    assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"
