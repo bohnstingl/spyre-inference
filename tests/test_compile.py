@@ -24,7 +24,7 @@ import pytest
     [
         (
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            "\n\nIBMs main businesses are the companies that provide the services",
+            "\n\nIBMs main businesses are the companies that provide the services of the",
         ),
         pytest.param(
             ("google/gemma-3-1b-it", "\n\nIBM's main"),
