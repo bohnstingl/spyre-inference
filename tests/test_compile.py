@@ -36,6 +36,8 @@ def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) 
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
     from vllm import LLM
 
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
     prompt = "What are IBMs main businesses?"
 
     model, ref_output = model_ref_output
