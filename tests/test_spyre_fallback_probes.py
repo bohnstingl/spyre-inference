@@ -80,6 +80,11 @@ def test_spyre_last_dim_slice(spyre_device, mode):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
+# ---------------------------------------------------------------------------
+# 2. Matmul output-dimension limitations
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -128,7 +133,7 @@ def test_spyre_matmul_output_dim_1(spyre_device, mode):
 
 
 # ---------------------------------------------------------------------------
-# 2. Scatter / index_select / embedding
+# 3. Scatter / index_select / embedding
 # ---------------------------------------------------------------------------
 
 
@@ -273,7 +278,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 3. Indirect tensor access in matmul (attention page gathering)
+# 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------
 
 
@@ -330,7 +335,7 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 4. Symbolic-offset in-place write
+# 5. Symbolic-offset in-place write
 # ---------------------------------------------------------------------------
 
 
@@ -392,7 +397,7 @@ def test_spyre_narrow_copy_row_write(spyre_device, mode):
 
 
 # ---------------------------------------------------------------------------
-# 5. In-place mul on non-contiguous tensor (LogitsProcessor)
+# 6. In-place mul on non-contiguous tensor (LogitsProcessor)
 # ---------------------------------------------------------------------------
 
 
@@ -414,7 +419,7 @@ def test_spyre_inplace_mul_noncontiguous(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 5. Attention-result reshape + on-device scatter into output (issue #400)
+# 7. Attention-result reshape + on-device scatter into output (issue #400)
 # ---------------------------------------------------------------------------
 #
 # These two probes guard the on-device path in
