@@ -99,6 +99,7 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     torch.testing.assert_close(logits.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
+@pytest.mark.parametrize("mode", ["eager", "compile"])
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -106,16 +107,22 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
         "`x[T, in] @ w[in, 1]` fails to lower with 'cannot restickify any input "
         "layout of x to carry x_var=d1' (out=1 case; out>=2 works, so this is "
         "distinct from the 64*(k*32) work-division limit in torch-spyre#1918). "
-        "Fails in both eager and compile."
+        "Fails in both eager and compile. "
         "When supported, please adapt tests/test_mlp.py::test_replicated_matches_reference"
     ),
 )
-def test_spyre_matmul_output_dim_1(spyre_device):
-    """Mirrors spyre_linear_t: out = matmul(x[T, in], weight_t[in, out]) with out=1.
-    """
+def test_spyre_matmul_output_dim_1(spyre_device, mode):
+    """Mirrors spyre_linear_t: out = matmul(x[T, in], weight_t[in, out]) with out=1."""
     x = torch.randn(7, 128, dtype=torch.float16, device=spyre_device)
     weight_t = torch.randn(128, 1, dtype=torch.float16, device=spyre_device)
-    out = torch.matmul(x, weight_t)
+
+    def fn(a, b):
+        return torch.matmul(a, b)
+
+    if mode == "compile":
+        fn = torch.compile(fn, dynamic=False, backend="inductor")
+
+    out = fn(x, weight_t)
     expected = torch.matmul(x.cpu().float(), weight_t.cpu().float())
     torch.testing.assert_close(out.cpu().float(), expected, atol=1e-2, rtol=1e-2)
 
