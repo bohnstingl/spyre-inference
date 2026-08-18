@@ -41,6 +41,9 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
     RotaryEmbeddingBase,
 )
+from vllm.model_executor.layers.rotary_embedding.gemma4_rope import (
+    Gemma4RotaryEmbedding,
+)
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
@@ -233,6 +236,21 @@ class SpyreLlama3RotaryEmbedding(_SpyreRotaryMixin, Llama3RotaryEmbedding):
 @RotaryEmbeddingBase.register_oot(name="YaRNScalingRotaryEmbedding")
 class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedding):
     """OOT YaRNScalingRotaryEmbedding that applies the rotation on Spyre."""
+
+    pass
+
+
+@RotaryEmbeddingBase.register_oot(name="Gemma4RotaryEmbedding")
+class SpyreGemma4RotaryEmbedding(_SpyreRotaryMixin, Gemma4RotaryEmbedding):
+    """OOT Gemma4RotaryEmbedding (proportional RoPE) that applies the rotation on Spyre.
+
+    Gemma-4's global (full-attention) layers use "proportional" RoPE with
+    ``partial_rotary_factor < 1``. ``Gemma4RotaryEmbedding`` sets ``rotary_dim ==
+    head_size`` and zero-pads the non-rotated frequencies to identity (cos=1, sin=0)
+    inside ``cos_sin_cache``, so the neox full-rotary Spyre path applies unchanged --
+    the 2x2 rotation cache derived from ``cos_sin_cache`` already carries the identity
+    padding. The mixin's ``rotary_dim == head_size`` guard is therefore satisfied.
+    """
 
     pass
 
