@@ -38,6 +38,16 @@ pointwise op, so there is no 0-d input buffer). This is numerically identical to
 the original fp16 tensor multiply — ``float(normalizer)`` widens the same
 fp16-rounded value that the tensor path used.
 
+**The conversion must happen before compilation, not lazily in ``forward``.**
+``Gemma4SelfDecoderLayers.forward`` is wrapped by ``@support_torch_compile``, so
+under ``STOCK_TORCH_COMPILE`` the *first* forward call is the Dynamo trace. If
+``float(self.normalizer)`` runs there, Dynamo lifts the 0-d CPU tensor it reads
+into the graph as an input (``arg0_1``) — reintroducing the exact untileable
+buffer we set out to avoid, so the failure returns in compile mode even though
+eager works. We therefore precompute the scalar in ``__init__`` (eager, long
+before any trace) and have ``embed_input_ids`` read only that Python float, so
+the traced graph never touches the tensor.
+
 Gemma 1/2/3 register ``normalizer`` on the *same* class that performs the
 multiply, so ``.to()`` moves it consistently and they do not need this patch.
 
@@ -64,19 +74,27 @@ def _patch_gemma4_embed_scale() -> None:
     if getattr(Gemma4SelfDecoderLayers.embed_input_ids, "_spyre_scalar_patch", False):
         return
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # Cache the scalar so an on-device normalizer isn't re-synced per step.
-        scale = self.__dict__.get("_spyre_normalizer_scale")
-        if scale is None:
-            scale = float(self.normalizer)
-            self.__dict__["_spyre_normalizer_scale"] = scale
-        return self.embed_tokens(input_ids) * scale
+    orig_init = Gemma4SelfDecoderLayers.__init__
 
+    def __init__(self, *args, **kwargs) -> None:
+        orig_init(self, *args, **kwargs)
+        # Precompute the embedding scale as a Python float here, in eager
+        # construction — NOT lazily in forward. forward is @support_torch_compile,
+        # so a first-call float(self.normalizer) would run during the Dynamo trace
+        # and lift the 0-d CPU tensor into the graph as an untileable input.
+        self._spyre_normalizer_scale = float(self.normalizer)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids) * self._spyre_normalizer_scale
+
+    __init__._spyre_scalar_patch = True
     embed_input_ids._spyre_scalar_patch = True
+    Gemma4SelfDecoderLayers.__init__ = __init__
     Gemma4SelfDecoderLayers.embed_input_ids = embed_input_ids
     logger.info(
-        "Patched Gemma4SelfDecoderLayers.embed_input_ids to scale embeddings by a "
-        "Python float (avoids a stale 0-d CPU normalizer tensor on Spyre)."
+        "Patched Gemma4SelfDecoderLayers to scale embeddings by a precomputed "
+        "Python float (avoids a stale 0-d CPU normalizer tensor on Spyre, in both "
+        "eager and torch.compile modes)."
     )
 
 
