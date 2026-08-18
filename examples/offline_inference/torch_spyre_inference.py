@@ -137,6 +137,16 @@ def main():
 
     # Set STOCK_TORCH_COMPILE as the compile mode for Spyre if not running eager.
     compilation_config = None if args.enforce_eager else {"mode": "STOCK_TORCH_COMPILE"}
+    # gemma-4 checkpoints ship as multimodal (Gemma4ForConditionalGeneration).
+    # Auto-load the text-only backbone by overriding the architecture.
+    hf_overrides = None
+    if "gemma-4" in args.model.lower():
+        hf_overrides = {"architectures": ["Gemma4ForCausalLM"]}
+        print(
+            "Detected gemma-4 model; auto-setting "
+            "hf_overrides={'architectures': ['Gemma4ForCausalLM']} to load the "
+            "text-only backbone (skips the vision tower)."
+        )
 
     llm = LLM(
         model=args.model,
@@ -149,6 +159,7 @@ def main():
         enforce_eager=args.enforce_eager,
         compilation_config=compilation_config,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
+        hf_overrides=hf_overrides,
     )
 
     # When compiling (whole-model or attention kernel), run an untimed warmup

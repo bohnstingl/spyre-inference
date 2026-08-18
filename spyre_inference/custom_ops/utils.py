@@ -105,6 +105,26 @@ def convert(tensor, device=None, dtype=None):
     )
 
 
+# torch-spyre rejects any single tensor whose per-core "span" exceeds this at
+# work-division time (spyre.inductor.work_division).
+SPYRE_TENSOR_SPAN_LIMIT_BYTES = 256 * 1024 * 1024
+
+
+def embedding_gather_exceeds_span(weight: torch.Tensor) -> bool:
+    """True if an on-device embedding gather over `weight` would exceed the
+    Spyre per-core tensor-span limit.
+
+    A gather must random-access any vocab row, so on a single card torch-spyre
+    can only split the vocab (row) dimension by x2; the resulting per-core span
+    is ceil(rows / 2) * hidden * itemsize. Above the 256 MiB limit the gather
+    (and its weight) must stay on CPU instead. `rows` is the per-rank partition
+    size, so vocab-parallel TP shrinks it and can bring a model back on-device.
+    """
+    rows, dim = weight.shape[0], weight.shape[1]
+    per_core_rows = (rows + 1) // 2
+    return per_core_rows * dim * weight.element_size() > SPYRE_TENSOR_SPAN_LIMIT_BYTES
+
+
 @lru_cache(maxsize=1)
 def register():
     """Register the spyre_convert custom op with vLLM."""

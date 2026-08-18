@@ -27,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
+from .utils import convert, embedding_gather_exceeds_span
 
 logger = init_logger(__name__)
 
@@ -44,12 +44,32 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
+        # A large vocabulary cannot be gathered on-device: the per-core tensor
+        # span exceeds the Spyre hardware limit (see embedding_gather_exceeds_span).
+        # Pin the weight to CPU and gather there; only the small result crosses.
+        self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
+        if self._keep_weight_on_cpu:
+            logger.warning_once(
+                "%s: vocab weight %s exceeds the Spyre per-core span limit; "
+                "keeping it on CPU and running the embedding gather on CPU.",
+                self.__class__.__name__,
+                tuple(self.weight.shape),
+            )
+
+    def _apply(self, fn, recurse=True):
+        # When pinned, return self so torch's recursive .to(device) leaves the
+        # weight (and, with tie_word_embeddings, the shared lm_head weight) on
+        # CPU. F.embedding on a large vocab has no viable Spyre work division.
+        if self._keep_weight_on_cpu:
+            return self
+        return super()._apply(fn, recurse=recurse)
+
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        device = input_.device
         if self.tp_size > 1:
             # The per-rank mask still runs on CPU: upstream get_masked_input_and_mask
             # does `input_ >= start` under torch.compile, which Spyre's inductor backend
             # rejects for int64 constants (see test_int64_compiled_compare_against_python_int).
-            # The embedding gather itself runs on-device below.
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
                 convert(input_, device="cpu"),
                 self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
@@ -59,18 +79,23 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
             )
-            masked_input = convert(masked_input, device=input_.device)
-            keep = convert(keep, device=input_.device)
         else:
             masked_input = input_
             keep = None
 
+        # Gather where the weight lives: CPU for a pinned large vocab (only the
+        # [num_tokens, hidden] result crosses back), on-device otherwise.
+        gather_device = "cpu" if self._keep_weight_on_cpu else device
+        masked_input = convert(masked_input, device=gather_device)
         output = self.quant_method.embedding(self, masked_input.long())
 
         if keep is not None:
+            keep = convert(keep, device=gather_device)
             output = output * keep
+            output = convert(output, device=device)
             output = tensor_model_parallel_all_reduce(output)
-        return output
+            return output
+        return convert(output, device=device)
 
 
 def _vocab_mask_op_func(

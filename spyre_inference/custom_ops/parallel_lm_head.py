@@ -32,6 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from .linear import spyre_linear_t
+from .utils import embedding_gather_exceeds_span
 
 
 logger = init_logger(__name__)
@@ -94,6 +95,23 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
+
+        # With tie_word_embeddings, `weight` IS embed_tokens.weight. For a large
+        # vocab that weight is pinned to CPU (SpyreVocabParallelEmbedding gathers
+        # there). Keep it on CPU here too so the tie holds; the logits GEMM uses
+        # `padded_weight_t`, an independent copy that still moves to the device.
+        # `weight` is unused at runtime, so this is safe for untied heads as well.
+        self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
+
+    def _apply(self, fn, recurse=True):
+        if not self._keep_weight_on_cpu:
+            return super()._apply(fn, recurse=recurse)
+        weight = self._parameters.pop("weight", None)
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            if weight is not None:
+                self._parameters["weight"] = weight
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """OOT forward pass.
