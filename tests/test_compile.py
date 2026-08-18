@@ -28,7 +28,7 @@ import pytest
         ),
         (
             "google/gemma-3-1b-it",
-            "\n\nIBM's main businesses are:\n\n*   **Consulting:** Helping",
+            "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
         ),
     ],
 )
