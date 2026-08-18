@@ -680,37 +680,49 @@ class TorchSpyreModelRunner(GPUModelRunner):
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # All layers in `shared_by` use the same spec by construction.
-            spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
-            num_blocks = kv_cache_tensor.size // spec.page_size_bytes
+            # `num_blocks` (the physical block count) is spec-independent: every
+            # layer in `shared_by` has the same `page_size_bytes` by construction
+            # (that is exactly why vLLM pooled them into one tensor).
+            ref_spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
+            num_blocks = kv_cache_tensor.size // ref_spec.page_size_bytes
 
-            # Default stickification splits head_size into 64-element sticks.
-            # Alternative: stickify block_size or num_kv_heads for different
-            # access patterns (would require explicit SpyreTensorLayout).
-            k_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
-            v_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
-
-            page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+            # For hybrid models (e.g. Gemma-4 dense: sliding head_size 256 /
+            # block 256 vs full head_size 512 / block 128), vLLM pools layers
+            # from different KV-cache groups into ONE tensor and expects them to
+            # share it via per-layer views (see upstream `_reshape_kv_cache_
+            # tensors`). Spyre CANNOT do that: the on-device stickified layout is
+            # shape-specific, so one physical buffer cannot be viewed as two
+            # different (num_kv_heads, block_size, head_size) shapes for the
+            # attention kernel ("Unexpected stick expression"). Instead we give
+            # each pooled layer its OWN natively-shaped, correctly-stickified
+            # pages. This is layout-correct and safe for the block manager (each
+            # layer can independently address all `num_blocks` blocks); the cost
+            # is `len(shared_by)`x the pooled memory budget, which the synthetic
+            # tolerates but the full model will need revisited (see docs/TODO).
             for layer_name in kv_cache_tensor.shared_by:
-                kv_caches[layer_name] = page_cache
+                spec = spec_by_layer[layer_name]
+                # Default stickification splits head_size into 64-element sticks.
+                k_pages: list[torch.Tensor] = [
+                    torch.zeros(
+                        spec.num_kv_heads,
+                        spec.block_size,
+                        spec.head_size,
+                        dtype=torch.float16,
+                        device=self._spyre_device,
+                    )
+                    for _ in range(num_blocks)
+                ]
+                v_pages: list[torch.Tensor] = [
+                    torch.zeros(
+                        spec.num_kv_heads,
+                        spec.block_size,
+                        spec.head_size,
+                        dtype=torch.float16,
+                        device=self._spyre_device,
+                    )
+                    for _ in range(num_blocks)
+                ]
+                kv_caches[layer_name] = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]
