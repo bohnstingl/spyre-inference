@@ -14,24 +14,16 @@
 
 """Spyre OOT replacement for RotaryEmbedding.
 
-Applies rotary position embeddings on the Spyre device via a complex-free 2x2
-rotation-matrix formulation (ported from foundation-model-stack). The 2x2 rotation
-cache is held device-resident; ``forward_oot`` gathers this pass's per-token slice on
-Spyre with ``index_select`` (torch-spyre#3418 gave single-row gather a kernel), then
-applies the rotation with ``_rotate_neox_2x2``. Both run directly in the full-model
-compile graph — no opaque op wraps them.
+Applies neox RoPE on Spyre via a 2x2 rotation-matrix formulation (ported from
+foundation-model-stack). The rotation cache is device-resident; ``forward_oot`` gathers
+this pass's per-token slice with ``index_select`` and applies it with ``_rotate_neox_2x2``,
+both directly in the full-model compile graph.
 
-The one requirement for the in-graph gather: the device-resident cache must be
-**built before compile**, not lazily inside the traced forward. Building the host
-rotation cache (chunk/stack/view over ``cos_sin_cache``) and moving it to Spyre for
-the first time *inside* the traced graph segfaults libsenlib during warmup; a cache
-that is already materialized on-device before tracing indexes cleanly. ``_apply``
-therefore primes the device cache when the module is moved to Spyre (which happens
-before ``torch.compile`` wraps the model), so ``forward_oot`` only traces the
-``index_select`` over an existing device tensor.
+The cache must be materialized on-device *before* compile: building it inside the traced
+forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
+``_apply`` primes it when the module moves to Spyre, ahead of ``torch.compile``.
 
-Only neox-style full rotary is supported; other configs raise
-``NotImplementedError`` at construction instead of silently falling back to CPU.
+Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """
 
 import torch
@@ -95,20 +87,11 @@ class _SpyreRotaryMixin:
         self._device_rotation_cache: torch.Tensor | None = None
 
     def _apply(self, fn, recurse=True):
-        # cos_sin_cache has no Spyre kernel, so it is deliberately kept on CPU (we skip
-        # super()._apply, which would move it to the device). But a move to Spyre must
-        # PRIME the device-resident rotation cache here: forward_oot indexes it inside
-        # the compiled full-model graph, and building it lazily during that first traced
-        # forward (host chunk/stack/view -> device transfer) segfaults libsenlib. A cache
-        # already materialized on-device before torch.compile traces indexes cleanly.
-        # Intentionally skips super()._apply and ignores `recurse`: this module has no
-        # movable params/buffers we want relocated (only the CPU-pinned cos_sin_cache and
-        # the param-less ApplyRotaryEmb child), so there is nothing to recurse into.
-        # _apply hands us only `fn` (the .to()/.cuda()/... convert closure), not a target
-        # device, and — because we keep no movable tensor — there is nothing on the module
-        # to read the destination off of. So push a throwaway tensor through `fn` and read
-        # where it landed. This also naturally no-ops for dtype-only casts (.half()/.float()),
-        # where `fn` returns a CPU tensor and the guard below skips priming.
+        # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
+        # holds no other movable tensor, so there is nothing to relocate. We instead prime
+        # the device rotation cache here (before torch.compile traces forward_oot). _apply
+        # passes only `fn`, not a device, and we have no moved tensor to read it off, so
+        # probe `fn`; dtype-only casts (.half()/.float()) stay on CPU and skip priming.
         device = fn(torch.empty(0)).device
         if device.type != "cpu":
             self._get_device_rotation_cache(device)
@@ -150,10 +133,7 @@ class _SpyreRotaryMixin:
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Gather this pass's per-token 2x2 rotation slice on-device with index_select,
-        # then apply the rotation — both directly in the full-model compile graph, no
-        # opaque op. The device cache was primed in _apply before compile (see module
-        # docstring), so only the index_select over an existing device tensor is traced.
+        # Cache was primed in _apply before compile, so only the index_select is traced.
         cache = self._get_device_rotation_cache(query.device)
         rot = cache.index_select(0, positions.flatten())
         out_query = _rotate_neox_2x2(
