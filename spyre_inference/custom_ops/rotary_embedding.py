@@ -52,6 +52,7 @@ from .utils import convert
 
 logger = init_logger(__name__)
 
+
 def _rotate_neox_2x2(
     x: torch.Tensor,
     rot: torch.Tensor,
