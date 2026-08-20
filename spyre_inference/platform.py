@@ -204,24 +204,12 @@ class TorchSpyrePlatform(CpuPlatform):
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
 
-        # When enforce_eager is set, vLLM has already reset the mode to NONE;
-        # preserve that so eager stays eager.
-        # NOTE: If vllm_config.compilation_config.mode is None and
-        # vllm_config.model_config.enforce_eager == False,
-        # no particular compilation mode has been selected. Continue in eager for the moment.
-        # vLLM re-runs this hook after mode has already been resolved (e.g. in the
-        # EngineCore subprocess), so we must treat CompilationMode.NONE the same as
-        # an unset (Python None) mode — otherwise a prior eager decision (NONE == 0,
-        # which is not `None`) falls through to the else branch and gets flipped to
-        # STOCK_TORCH_COMPILE, re-enabling torch.compile that our CPU-fallback ops
-        # can't survive.
-        if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode in (
-            None,
-            CompilationMode.NONE,
-        ):
+        # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
+        # mode between repeated invocations of this hook (e.g. in the EngineCore
+        # subprocess), while enforce_eager persists, so it's the only stable signal.
+        if vllm_config.model_config.enforce_eager:
             vllm_config.compilation_config.mode = CompilationMode.NONE
         else:
-            # Warn the user if a different compile mode has been selected explicitly
             if vllm_config.compilation_config.mode in (
                 CompilationMode.DYNAMO_TRACE_ONCE,
                 CompilationMode.VLLM_COMPILE,
@@ -231,8 +219,6 @@ class TorchSpyrePlatform(CpuPlatform):
                     + f", but {vllm_config.compilation_config.mode} selected!"
                 )
 
-            # Only if enforce_eager=False and a particular CompilationMode is selected,
-            # continue in compile mode
             vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
 
             # Keep vLLM's CustomOp dispatch for the OOT path.

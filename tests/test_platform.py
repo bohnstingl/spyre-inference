@@ -396,3 +396,62 @@ def test_pad_head_dim_aligned_model_with_rope_dim_not_rejected():
 
     assert hf.head_dim == 128
     assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def _defaults_config(enforce_eager: bool, mode) -> VllmConfig:
+    """Minimal VllmConfig for exercising apply_config_platform_defaults."""
+    from vllm.config.compilation import CompilationMode
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+        enforce_eager=enforce_eager,
+    )
+    compilation_config = CompilationConfig()
+    if mode is not None:
+        compilation_config.mode = getattr(CompilationMode, mode)
+
+    return VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(),
+        compilation_config=compilation_config,
+    )
+
+
+def test_compile_default_is_stock_when_not_eager():
+    """--enforce-eager off ⇒ default to STOCK_TORCH_COMPILE, keeping CustomOp dispatch."""
+    from vllm.config.compilation import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+    assert "all" in vllm_config.compilation_config.custom_ops
+
+
+def test_enforce_eager_forces_none():
+    """--enforce-eager on ⇒ CompilationMode.NONE (everything eager)."""
+    from vllm.config.compilation import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.NONE
+
+
+def test_enforce_eager_is_the_only_eager_switch():
+    """An explicit mode=NONE without --enforce-eager is still overridden to STOCK."""
+    from vllm.config.compilation import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode="NONE")
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE

@@ -23,7 +23,6 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
@@ -47,13 +46,6 @@ def configure_device(request, monkeypatch):
     if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
-
-
-@pytest.fixture()
-def force_compile_attn(request, monkeypatch):
-    """Flip the SPYRE_FORCE_COMPILE_ATTN gate; the env var is only read at import."""
-    monkeypatch.setattr(spyre_attn, "_FORCE_COMPILE_ATTN", request.param)
-    return request.param
 
 
 @pytest.fixture()
@@ -354,10 +346,12 @@ def _run_spyre_attn_test(
     head_size: int = 128,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
-    # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
-    # "missing device_tensor_layout on graph input arg0_1"
-    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
-        pytest.skip("STOCK + device_spyre, currently fails.")
+    # The compiled attention kernel targets the Spyre device. On CPU it routes
+    # through Inductor's C++ backend, whose codegen for the kernel's indirect
+    # index_select + transpose pattern is broken ("use of undeclared identifier
+    # tmpN"). CPU is only the eager reference here, so skip the compiled+CPU combo.
+    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "cpu":
+        pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
 
     num_blocks = 256
     dtype = torch.float16
@@ -445,9 +439,11 @@ def _run_spyre_attn_test(
     output = torch.empty_like(query).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
+    # The impl expects q/k/v already on device, as in production (QKV runs
+    # on-device); the CPU `query` still feeds the reference below.
     attn_impl.forward(
         layer=None,
-        query=query,
+        query=convert(query, cache_device),
         key=key_src,
         value=value_src,
         kv_cache=kv_cache,
@@ -548,10 +544,9 @@ def test_spyre_attn_core(
 )
 @pytest.mark.parametrize(
     "configure_compilation",
-    [pytest.param("NONE", id="compilation_NONE")],
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
     indirect=True,
 )
-@pytest.mark.parametrize("force_compile_attn", [True], indirect=True)
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -560,17 +555,16 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
     ],
 )
-def test_spyre_attn_force_compile_attn_multi_seq(
+def test_spyre_attn_compiled_multi_seq(
     default_vllm_config,
-    force_compile_attn: bool,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """SPYRE_FORCE_COMPILE_ATTN=1 over a multi-sequence batch.
+    """Compiled attention (STOCK_TORCH_COMPILE) over a multi-sequence batch on device.
 
     Sequences past batch slot 0 silently gathered slot 0's KV pages
-    (torch-spyre#3770); only a real batch on device catches it.
+    (torch-spyre#3770); only a real compiled batch on device catches it.
     """
     _run_spyre_attn_test(
         seq_lens=seq_lens,
@@ -607,12 +601,7 @@ def test_spyre_attn_decode_head_size(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Single-sequence decode across head sizes (regression for #284).
-
-    head_size=64 is not representable by the on-device query overwrite and must
-    fall back to the CPU path; head_size=128 stays on device. Both must produce
-    correct output.
-    """
+    """Single-sequence decode across head sizes (regression for #284)."""
     _run_spyre_attn_test(
         seq_lens=[(1, 256)],
         block_size=128,
