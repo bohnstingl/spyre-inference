@@ -7,12 +7,13 @@ name: Test matrix (reusable)
 #
 #   test_each_commit.yaml (push/PR/merge_group): skip_if_no_changes=true, so the
 #     build/test only runs when source files changed. Installs the locked
-#     baseline RPMs (spyre-rpm-install) and runs on the standing image.
+#     baseline RPMs (spyre-rpm-install) on the standing image, so every PR
+#     builds against the pinned spyre-rpms.lock set.
 #
 #   integration-tests.yaml (upstream-dependency dispatch): skip_if_no_changes=
 #     false (always run). May pass runner_label to pick a per-PR image, rpm_*
-#     to layer override RPMs, and torch_spyre_ref to build a specific
-#     torch-spyre from source.
+#     to layer override RPMs, torch_spyre_ref to build a specific torch-spyre
+#     from source, and use_prebaked_image=true to skip the baseline RPM install.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -28,6 +29,13 @@ on:
         required: false
         type: boolean
         default: true
+      use_prebaked_image:
+        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
+        # action). It does not change the override step or any other step.
+        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -171,7 +179,7 @@ jobs:
       matrix:
         include:
           - cfg: Non-distributed spyre tests
-            # Fast per-op unit tests: the smoke set.
+            # Fast per-op unit tests: the smoke set (compile split out below).
             test_types: unit integration regression trunk
             runs_on:
               - x86_64
@@ -180,7 +188,21 @@ jobs:
             image_label: image_torch_spyre
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
+          - cfg: Spyre compile tests
+            # Split out of smoke (it was ~20 min of a ~28 min job). MUST keep
+            # `integration` in this set: the multi-repo integration hook runs
+            # only the integration-tagged configs, so dropping it here would
+            # silently lose the torch.compile end-to-end check that guards
+            # against upstream-runtime regressions.
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-compile
           - cfg: Spyre attention tests
+            # Decoder attention only; the encoder split runs below.
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -188,6 +210,14 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention
+          - cfg: Encoder attention tests
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-encoder-attention
           - cfg: Distributed spyre tests
             test_types: unit regression trunk
             runs_on:
@@ -309,9 +339,12 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
         id: spyre-rpms
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
@@ -395,6 +428,13 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         # Marker expression and coverage wiring both live in the Makefile
         # test_target. COVERAGE=1 drops .coverage.* data files for the fan-in.
+        #
+        # Bounded so a wedged card acquisition cannot hang silently: a blocking
+        # open() on a contended /dev/vfio device emits no output, so the runner
+        # stops heartbeating and the job is reaped server-side with an
+        # unfinalized log (no conclusion, no diagnosis). Failing here instead
+        # keeps the step's own log and lets the post steps publish JUnit.
+        timeout-minutes: 90
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
           make ${{ matrix.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ matrix.test_target }}.xml
@@ -533,7 +573,11 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
+        if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
