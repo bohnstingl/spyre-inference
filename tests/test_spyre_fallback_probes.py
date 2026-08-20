@@ -263,10 +263,11 @@ def test_spyre_fancy_index_tensor(spyre_device):
     reason=(
         "Spyre rejects the sub-stick [.., 2, inner] split-half view when inner is "
         "not a stick multiple (inner=32 for head_size=64): 'Unexpected stick "
-        "expression 32*d3 + d4'. This is why _rotate_neox_2x2 zero-pads each half to "
-        "a stick via the _get_expand_matrix matmul rather than viewing/slicing the "
-        "halves directly. When this flips to XPASS, _get_expand_matrix can be removed "
-        "and the pure-view path used for all head sizes (torch-spyre#436)."
+        "expression 32*d3 + d4'. spyre-inference sidesteps this by padding head_dim to "
+        "a 128-multiple before RoPE is built (head_pad.py), so _rotate_neox_2x2 only "
+        "ever sees a stick-aligned inner and uses the pure-view path; a sub-stick inner "
+        "is rejected at construction. This probe documents the torch-spyre#436 gap: if "
+        "it flips to XPASS, the head_dim padding is no longer required for RoPE."
     ),
 )
 def test_spyre_substick_pair_view_rotation(spyre_device):

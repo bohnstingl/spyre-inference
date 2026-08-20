@@ -37,9 +37,11 @@ YARN_ROPE_PARAMS = {
     "beta_slow": 1,
 }
 
-# head_size values spanning both Spyre RoPE regimes: the 2x2 inner dim
-# head_size//2 is stick-aligned (128->64, 256->128) or padded up to a stick (64->32).
-HEAD_SIZES = [64, 128, 256]
+# head_size values with a stick-aligned 2x2 inner dim (128->64, 256->128). Sub-stick
+# head sizes (e.g. 64->32) are rejected at construction and covered by
+# test_rotary_substick_inner_raises; on the native path the platform pads head_dim to a
+# 128-multiple before RoPE is built, so SpyreRoPE only ever sees stick-aligned inners.
+HEAD_SIZES = [128, 256]
 
 
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
@@ -77,8 +79,7 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     """CPU-only: host gather + _rotate_neox_2x2 match forward_native without a
     Spyre device, so the core rotation formula is validated on dev laptops where the
     forward_oot tests skip. Stick-aligned inner dims (128->64, 256->128) exercise the
-    pure-view path; head_size=64 (inner dim 32) exercises the pad-to-stick expand-matrix
-    path."""
+    pure-view rotation path."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
     from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
@@ -113,7 +114,7 @@ def test_rotary_forward_oot_on_spyre(
     flatten,
 ):
     """forward_oot runs the 2x2 rotation on Spyre and matches forward_native across
-    head_size (aligned 128/256, pad-to-stick 64), GQA, and 2D/3D layouts."""
+    head_size (stick-aligned 128/256), GQA, and 2D/3D layouts."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -244,10 +245,8 @@ def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_size):
     """forward_oot's in-graph gather (index_select over the device-resident rotation
-    cache) returns the per-token [T, 2, 2, round_up(rotary_dim//2)] slice on Spyre."""
+    cache) returns the per-token [T, 2, 2, rotary_dim//2] slice on Spyre."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
-    from vllm.utils.math_utils import round_up
-    from spyre_inference.custom_ops.rotary_embedding import _SPYRE_STICK
 
     max_position, num_tokens = 2048, 32
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
@@ -256,7 +255,7 @@ def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_
     cache = rope._get_device_rotation_cache(positions.device)
     rot = cache.index_select(0, positions.flatten())
     assert rot.device.type == "spyre"
-    assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2, _SPYRE_STICK))
+    assert tuple(rot.shape) == (num_tokens, 2, 2, rope.rotary_dim // 2)
 
 
 @pytest.mark.rotary
@@ -293,6 +292,24 @@ def test_rotary_non_neox_config_raises(default_vllm_config):
             head_size=128,
             max_position=2048,
             is_neox_style=False,
+            dtype=torch.float16,
+        )
+
+
+@pytest.mark.rotary
+def test_rotary_substick_inner_raises(default_vllm_config):
+    """A sub-stick 2x2 inner dim (head_size=64 -> inner 32) is rejected at construction.
+
+    The platform pads head_dim to a 128-multiple before RoPE is built, so SpyreRoPE only
+    ever sees stick-aligned inners; reaching it with head_size=64 means head padding did
+    not run, and it must raise rather than silently fall back to CPU."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    with pytest.raises(NotImplementedError, match="stick"):
+        get_rope(
+            head_size=64,
+            max_position=2048,
+            is_neox_style=True,
             dtype=torch.float16,
         )
 

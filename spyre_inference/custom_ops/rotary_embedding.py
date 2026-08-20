@@ -34,8 +34,6 @@ Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
 """
 
-from functools import lru_cache
-
 import torch
 
 from vllm.logger import init_logger
@@ -49,31 +47,16 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
-from vllm.utils.math_utils import round_up
 
 from .utils import convert
 
 logger = init_logger(__name__)
 
-# Spyre stick size = 64 float16 elements. The 2x2 layout's inner dim is
-# rotary_dim // 2; when that is not a stick multiple the split-half view has a
-# sub-stick stride the inductor rejects, so it is padded up on-device.
+# Spyre stick size = 64 float16 elements. The 2x2 layout's inner dim is rotary_dim // 2
+# and must be a stick multiple, otherwise the split-half view has a sub-stick stride the
+# inductor rejects. The platform pads head_dim to a 128-multiple before RoPE is built
+# (see head_pad.py), which guarantees this; a sub-stick inner is rejected at construction.
 _SPYRE_STICK = 64
-
-
-@lru_cache
-def _get_expand_matrix(
-    inner: int, padded: int, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    """Constant ``{0, 1}`` matrix ``E`` [2*inner, 2*padded] that zero-pads each neox
-    half up to the stick-aligned ``padded`` on-device via ``x @ E`` (so the sub-stick
-    ``[.,2,inner]`` view is never materialized). Cached per ``(inner, padded, device, dtype)``.
-    """
-    e = torch.zeros(2 * inner, 2 * padded, dtype=dtype)
-    idx = torch.arange(inner)
-    e[idx, idx] = 1
-    e[inner + idx, padded + idx] = 1
-    return convert(e, device=device, dtype=dtype)
 
 
 def _rotate_neox_2x2(
@@ -83,23 +66,15 @@ def _rotate_neox_2x2(
 ) -> torch.Tensor:
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
 
-    ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, padded]
-    with ``padded >= head_size // 2``. When the inner dim head_size//2 is stick-aligned
-    the split-half pairing is a pure view; otherwise each half is zero-padded to
-    ``padded`` on-device with a constant matmul so the pairing-axis stride is aligned.
+    ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, head_size // 2].
+    The inner dim head_size // 2 is stick-aligned (the platform pads head_dim to a
+    128-multiple before RoPE is built), so the split-half pairing is a pure view.
     Returns the rotated tensor with ``x``'s shape.
     """
     num_tokens = x.shape[0]
     inner = head_size // 2
-    padded = rot.shape[-1]
-    if padded != inner:
-        e = _get_expand_matrix(inner, padded, x.device, x.dtype)
-        x_pairs = (x.view(num_tokens, -1, head_size) @ e).view(num_tokens, -1, 2, padded)
-    else:
-        x_pairs = x.view(num_tokens, -1, 2, inner)
+    x_pairs = x.view(num_tokens, -1, 2, inner)
     out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)
-    if padded != inner:
-        out = out[..., :inner].contiguous()  # non-contiguous slice; copy before reshape
     return out.flatten(-2).view(x.shape)
 
 
@@ -121,7 +96,20 @@ class _SpyreRotaryMixin:
                 f"head_size); got is_neox_style={self.is_neox_style}, "
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
-        self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
+        # The 2x2 rotation's inner dim (rotary_dim // 2) must be stick-aligned so the
+        # split-half pairing is a pure view. The platform pads head_dim to a 128-multiple
+        # before RoPE is built (see head_pad.py), which guarantees this; a sub-stick inner
+        # here (e.g. head_size=64) means head padding did not run, so reject rather than
+        # silently fall back to CPU.
+        if (self.rotary_dim // 2) % _SPYRE_STICK != 0:
+            raise NotImplementedError(
+                f"SpyreRoPE needs the 2x2 rotation inner dim rotary_dim // 2 = "
+                f"{self.rotary_dim // 2} to be a multiple of the {_SPYRE_STICK}-element "
+                f"stick; got rotary_dim={self.rotary_dim}. The platform pads head_dim to a "
+                "128-multiple before RoPE is built, so this indicates head padding did not "
+                "run for this model."
+            )
+        self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
 
@@ -139,9 +127,9 @@ class _SpyreRotaryMixin:
         return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
-        """Lazily build the CPU 2x2 rotation cache [max_pos, 2, 2, padded_inner] from
-        cos_sin_cache ([[cos, -sin], [sin, cos]]), zero-padding the inner dim to the
-        next stick multiple."""
+        """Lazily build the CPU 2x2 rotation cache [max_pos, 2, 2, _padded_inner] from
+        cos_sin_cache ([[cos, -sin], [sin, cos]]), zero-padding the inner dim up to
+        _padded_inner when a padded head injected a narrower original-frequency cache."""
         if self._rotation_cache is None:
             # Derive inner from the cache actually present, not rotary_dim: when a
             # head is padded (head_size=64 -> 128), fix_padded_rope injects the
