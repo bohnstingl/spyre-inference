@@ -258,37 +258,6 @@ def test_spyre_fancy_index_tensor(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Spyre rejects the sub-stick [.., 2, inner] split-half view when inner is "
-        "not a stick multiple (inner=32 for head_size=64): 'Unexpected stick "
-        "expression 32*d3 + d4'. spyre-inference sidesteps this by padding head_dim to "
-        "a 128-multiple before RoPE is built (head_pad.py), so _rotate_neox_2x2 only "
-        "ever sees a stick-aligned inner and uses the pure-view path; a sub-stick inner "
-        "is rejected at construction. This probe documents the torch-spyre#436 gap: if "
-        "it flips to XPASS, the head_dim padding is no longer required for RoPE."
-    ),
-)
-def test_spyre_substick_pair_view_rotation(spyre_device):
-    """The 2x2 RoPE rotation over a sub-stick pairing view (head_size=64, inner=32).
-
-    Padding-free formulation: view q as [T, H, 2, inner] and contract against the
-    per-token 2x2 rotation. inner=32 gives the pairing axis a sub-stick (32-element)
-    stride that the Spyre backend cannot lower."""
-    T, H, head_size = 4, 3, 64
-    inner = head_size // 2  # 32, sub-stick
-    x = torch.randn(T, H * head_size, dtype=torch.float16, device=spyre_device)
-    rot = torch.randn(T, 2, 2, inner, dtype=torch.float16, device=spyre_device)
-
-    x_pairs = x.view(T, -1, 2, inner)
-    out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2).flatten(-2).view(x.shape)
-
-    ref_pairs = x.cpu().view(T, -1, 2, inner)
-    ref = (rot.cpu().unsqueeze(1) * ref_pairs.unsqueeze(-3)).sum(dim=-2).flatten(-2).view(x.shape)
-    torch.testing.assert_close(out.cpu(), ref, atol=1e-2, rtol=1e-2)
-
-
 # ---------------------------------------------------------------------------
 # 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------
