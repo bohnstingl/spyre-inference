@@ -101,8 +101,15 @@ class _SpyreRotaryMixin:
         # the compiled full-model graph, and building it lazily during that first traced
         # forward (host chunk/stack/view -> device transfer) segfaults libsenlib. A cache
         # already materialized on-device before torch.compile traces indexes cleanly.
-        # fn is the .to()/.cuda()/... convert closure; probe it to learn the target device.
-        device = fn(torch.zeros(1, dtype=self.dtype)).device
+        # Intentionally skips super()._apply and ignores `recurse`: this module has no
+        # movable params/buffers we want relocated (only the CPU-pinned cos_sin_cache and
+        # the param-less ApplyRotaryEmb child), so there is nothing to recurse into.
+        # _apply hands us only `fn` (the .to()/.cuda()/... convert closure), not a target
+        # device, and — because we keep no movable tensor — there is nothing on the module
+        # to read the destination off of. So push a throwaway tensor through `fn` and read
+        # where it landed. This also naturally no-ops for dtype-only casts (.half()/.float()),
+        # where `fn` returns a CPU tensor and the guard below skips priming.
+        device = fn(torch.empty(0)).device
         if device.type != "cpu":
             self._get_device_rotation_cache(device)
         return self
