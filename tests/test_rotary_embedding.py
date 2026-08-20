@@ -242,9 +242,9 @@ def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size)
 
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-def test_rope_gather_op_returns_spyre_slice(default_vllm_config, head_size):
-    """The spyre_rope_gather op returns the per-token [T, 2, 2, round_up(rotary_dim//2)]
-    slice on Spyre for a supported config."""
+def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_size):
+    """forward_oot's in-graph gather (index_select over the device-resident rotation
+    cache) returns the per-token [T, 2, 2, round_up(rotary_dim//2)] slice on Spyre."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.utils.math_utils import round_up
     from spyre_inference.custom_ops.rotary_embedding import _SPYRE_STICK
@@ -253,7 +253,8 @@ def test_rope_gather_op_returns_spyre_slice(default_vllm_config, head_size):
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
-    rot = torch.ops.vllm.spyre_rope_gather(positions, rope._cache_key, rope.head_size)
+    cache = rope._get_device_rotation_cache(positions.device)
+    rot = cache.index_select(0, positions.flatten())
     assert rot.device.type == "spyre"
     assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2, _SPYRE_STICK))
 

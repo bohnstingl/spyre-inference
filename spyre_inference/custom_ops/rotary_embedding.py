@@ -17,25 +17,23 @@
 Applies rotary position embeddings on the Spyre device via a complex-free 2x2
 rotation-matrix formulation (ported from foundation-model-stack). The 2x2 rotation
 cache is held device-resident; ``forward_oot`` gathers this pass's per-token slice on
-Spyre with ``index_select`` (torch-spyre#3418 gave single-row gather a kernel) through
-the opaque ``spyre_rope_gather`` op, then applies the rotation with ``_rotate_neox_2x2``
-directly in the compile graph. The gather stays opaque so its body runs eagerly on Spyre
-(see ``cache_key`` note below); the rotation no longer needs an opaque wrapper now that
-torch-spyre's layout-fix (``_normalize_result_layout``) rebuilds fallback outputs to the
-canonical device tiling, which previously corrupted the 2x2 rotation when fused into the
-full-model graph.
+Spyre with ``index_select`` (torch-spyre#3418 gave single-row gather a kernel), then
+applies the rotation with ``_rotate_neox_2x2``. Both run directly in the full-model
+compile graph — no opaque op wraps them.
 
-``spyre_rope_gather`` takes the module's ``cache_key`` (a string), not the cache tensor:
-the op body looks the cache up from ``_ROPE_MODULE_REGISTRY`` at execution time. Passing
-the device-resident cache as a tensor argument would lift it into the torch.compile
-fullgraph as an input, and the compiled kernel then segfaults indexing it via libsenlib
-during warmup. Keying by string keeps the cache out of the graph entirely.
+The one requirement for the in-graph gather: the device-resident cache must be
+**built before compile**, not lazily inside the traced forward. Building the host
+rotation cache (chunk/stack/view over ``cos_sin_cache``) and moving it to Spyre for
+the first time *inside* the traced graph segfaults libsenlib during warmup; a cache
+that is already materialized on-device before tracing indexes cleanly. ``_apply``
+therefore primes the device cache when the module is moved to Spyre (which happens
+before ``torch.compile`` wraps the model), so ``forward_oot`` only traces the
+``index_select`` over an existing device tensor.
 
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
 """
 
-import itertools
 from functools import lru_cache
 
 import torch
@@ -51,9 +49,7 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
-from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .utils import convert
 
@@ -63,11 +59,6 @@ logger = init_logger(__name__)
 # rotary_dim // 2; when that is not a stick multiple the split-half view has a
 # sub-stick stride the inductor rejects, so it is padded up on-device.
 _SPYRE_STICK = 64
-
-# Maps each RoPE module's cache key to the module so the opaque spyre_rope_gather op can
-# reach its device-resident rotation cache without receiving it as a tensor argument
-# (which would lift the cache into the torch.compile graph and crash the compiled kernel).
-_ROPE_MODULE_REGISTRY: dict[str, "_SpyreRotaryMixin"] = {}
 
 
 @lru_cache
@@ -120,8 +111,6 @@ class _SpyreRotaryMixin:
     the base ``cos_sin_cache`` (inheriting all rope-scaling variants) and kept on CPU.
     """
 
-    _key_counter = itertools.count()
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Only neox full rotary has a Spyre kernel; gptj/interleaved and partial
@@ -135,12 +124,18 @@ class _SpyreRotaryMixin:
         self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
-        # Registered so the opaque gather op can reach this module's device cache by key.
-        self._cache_key = f"spyre_rope_{next(_SpyreRotaryMixin._key_counter)}"
-        _ROPE_MODULE_REGISTRY[self._cache_key] = self
 
     def _apply(self, fn, recurse=True):
-        # cos_sin_cache has no Spyre kernel; keep cos_sin_cache on CPU.
+        # cos_sin_cache has no Spyre kernel, so it is deliberately kept on CPU (we skip
+        # super()._apply, which would move it to the device). But a move to Spyre must
+        # PRIME the device-resident rotation cache here: forward_oot indexes it inside
+        # the compiled full-model graph, and building it lazily during that first traced
+        # forward (host chunk/stack/view -> device transfer) segfaults libsenlib. A cache
+        # already materialized on-device before torch.compile traces indexes cleanly.
+        # fn is the .to()/.cuda()/... convert closure; probe it to learn the target device.
+        device = fn(torch.zeros(1, dtype=self.dtype)).device
+        if device.type != "cpu":
+            self._get_device_rotation_cache(device)
         return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
@@ -179,17 +174,12 @@ class _SpyreRotaryMixin:
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Gather this pass's per-token rotation slice on-device via the opaque op. The
-        # op is keyed by cache_key (a string) so the device cache stays out of the
-        # compile graph; the gather runs eagerly on Spyre inside the op body.
-        rot = torch.ops.vllm.spyre_rope_gather(
-            positions,  # ty: ignore[invalid-argument-type]
-            self._cache_key,  # ty: ignore[invalid-argument-type]
-            self.head_size,
-        )
-        # Apply the 2x2 rotation directly: torch-spyre's layout-fix (bohnstingl/layout_fix,
-        # _normalize_result_layout) makes the compiled lowering of this rotation safe to fuse
-        # into the full-model graph, so the opaque spyre_rope_rotate wrapper is no longer needed.
+        # Gather this pass's per-token 2x2 rotation slice on-device with index_select,
+        # then apply the rotation — both directly in the full-model compile graph, no
+        # opaque op. The device cache was primed in _apply before compile (see module
+        # docstring), so only the index_select over an existing device tensor is traced.
+        cache = self._get_device_rotation_cache(query.device)
+        rot = cache.index_select(0, positions.flatten())
         out_query = _rotate_neox_2x2(
             query,  # ty: ignore[invalid-argument-type]
             rot,
@@ -226,34 +216,3 @@ class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedd
     """OOT YaRNScalingRotaryEmbedding that applies the rotation on Spyre."""
 
     pass
-
-
-def _rope_gather_op_func(positions: torch.Tensor, cache_key: str, head_size: int) -> torch.Tensor:
-    """Opaque-op body: gather this pass's per-token 2x2 rotation slice from the calling
-    module's device-resident cache with an on-device ``index_select``. The cache is
-    looked up from ``_ROPE_MODULE_REGISTRY`` by ``cache_key`` rather than passed as a
-    tensor argument, so it never becomes a torch.compile graph input. Runs eagerly,
-    building the device cache lazily on first execution."""
-    cache = _ROPE_MODULE_REGISTRY[cache_key]._get_device_rotation_cache(positions.device)
-    return cache.index_select(0, positions.flatten())
-
-
-def _rope_gather_op_fake(positions: torch.Tensor, cache_key: str, head_size: int) -> torch.Tensor:
-    return torch.empty(
-        (positions.shape[0], 2, 2, round_up(head_size // 2, _SPYRE_STICK)),
-        dtype=torch.float16,
-        device=positions.device,
-    )
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register the spyre_rope_gather custom op. OOT class replacement happens at import
-    time via ``@RotaryEmbeddingBase.register_oot()``."""
-    direct_register_custom_op(
-        op_name="spyre_rope_gather",
-        op_func=_rope_gather_op_func,
-        fake_impl=_rope_gather_op_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-    logger.debug_once("Registered custom op: spyre_rope_gather")
