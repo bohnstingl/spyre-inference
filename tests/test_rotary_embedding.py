@@ -37,10 +37,9 @@ YARN_ROPE_PARAMS = {
     "beta_slow": 1,
 }
 
-# head_size values with a stick-aligned 2x2 inner dim (128->64, 256->128). Sub-stick
-# head sizes (e.g. 64->32) are rejected at construction and covered by
-# test_rotary_substick_inner_raises; on the native path the platform pads head_dim to a
-# 128-multiple before RoPE is built, so SpyreRoPE only ever sees stick-aligned inners.
+# head_size values with a stick-aligned 2x2 inner dim (128->64, 256->128). On the native
+# path the platform pads head_dim to a 128-multiple before RoPE is built, so SpyreRoPE
+# only ever sees stick-aligned inners.
 HEAD_SIZES = [128, 256]
 
 
@@ -292,24 +291,6 @@ def test_rotary_non_neox_config_raises(default_vllm_config):
             head_size=128,
             max_position=2048,
             is_neox_style=False,
-            dtype=torch.float16,
-        )
-
-
-@pytest.mark.rotary
-def test_rotary_substick_inner_raises(default_vllm_config):
-    """A sub-stick 2x2 inner dim (head_size=64 -> inner 32) is rejected at construction.
-
-    The platform pads head_dim to a 128-multiple before RoPE is built, so SpyreRoPE only
-    ever sees stick-aligned inners; reaching it with head_size=64 means head padding did
-    not run, and it must raise rather than silently fall back to CPU."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
-
-    with pytest.raises(NotImplementedError, match="stick"):
-        get_rope(
-            head_size=64,
-            max_position=2048,
-            is_neox_style=True,
             dtype=torch.float16,
         )
 

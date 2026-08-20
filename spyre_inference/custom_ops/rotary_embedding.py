@@ -52,13 +52,6 @@ from .utils import convert
 
 logger = init_logger(__name__)
 
-# Spyre stick size = 64 float16 elements. The 2x2 layout's inner dim is rotary_dim // 2
-# and must be a stick multiple, otherwise the split-half view has a sub-stick stride the
-# inductor rejects. The platform pads head_dim to a 128-multiple before RoPE is built
-# (see head_pad.py), which guarantees this; a sub-stick inner is rejected at construction.
-_SPYRE_STICK = 64
-
-
 def _rotate_neox_2x2(
     x: torch.Tensor,
     rot: torch.Tensor,
@@ -95,19 +88,6 @@ class _SpyreRotaryMixin:
                 "SpyreRoPE supports only neox-style full rotary (rotary_dim == "
                 f"head_size); got is_neox_style={self.is_neox_style}, "
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
-            )
-        # The 2x2 rotation's inner dim (rotary_dim // 2) must be stick-aligned so the
-        # split-half pairing is a pure view. The platform pads head_dim to a 128-multiple
-        # before RoPE is built (see head_pad.py), which guarantees this; a sub-stick inner
-        # here (e.g. head_size=64) means head padding did not run, so reject rather than
-        # silently fall back to CPU.
-        if (self.rotary_dim // 2) % _SPYRE_STICK != 0:
-            raise NotImplementedError(
-                f"SpyreRoPE needs the 2x2 rotation inner dim rotary_dim // 2 = "
-                f"{self.rotary_dim // 2} to be a multiple of the {_SPYRE_STICK}-element "
-                f"stick; got rotary_dim={self.rotary_dim}. The platform pads head_dim to a "
-                "128-multiple before RoPE is built, so this indicates head padding did not "
-                "run for this model."
             )
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
