@@ -92,7 +92,7 @@ class _SpyreRotaryMixin:
         # the device rotation cache here (before torch.compile traces forward_oot). _apply
         # passes only `fn`, not a device, and we have no moved tensor to read it off, so
         # probe `fn`; dtype-only casts (.half()/.float()) stay on CPU and skip priming.
-        device = fn(torch.empty(0)).device
+        device = fn(torch.zeros(1, dtype=self.dtype)).device
         if device.type != "cpu":
             self._get_device_rotation_cache(device)
         return self
