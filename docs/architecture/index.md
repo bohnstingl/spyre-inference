@@ -181,7 +181,7 @@ rejects), then `convert`s `masked_input`/`keep` back to Spyre before the on-devi
 and `all_reduce`.
 
 Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (q/k/v slicing, the per-sequence
+operations that Spyre doesn't yet support natively (the per-sequence
 attention varlen loop, logits indexing). RoPE's rotation-cache gather and the embedding
 gather both run on-device now, so neither is among them.
 
