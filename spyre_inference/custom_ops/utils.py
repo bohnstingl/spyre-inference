@@ -121,6 +121,42 @@ def embedding_gather_exceeds_span(weight: torch.Tensor) -> bool:
     return per_core_rows * dim * weight.element_size() > SPYRE_TENSOR_SPAN_LIMIT_BYTES
 
 
+class CpuPinnedWeightMixin:
+    """Shared CPU-pinning for large-vocab embedding weights.
+
+    A vocab weight whose on-device gather would exceed the Spyre per-core span
+    limit must stay on CPU (the gather runs there; only the result crosses).
+    Mix this in *before* the vLLM base class and call `_pin_weight_if_oversized()`
+    from __init__. The `_apply` override then holds `weight` on CPU across torch's
+    recursive `.to(device)` / `.to(dtype)`, while still relocating every other
+    parameter and buffer (e.g. the tied lm-head's device-side `padded_weight_t`).
+    """
+
+    _keep_weight_on_cpu = False
+
+    def _pin_weight_if_oversized(self, warn: bool = False) -> None:
+        self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
+        if self._keep_weight_on_cpu and warn:
+            logger.warning_once(
+                "%s: vocab weight %s exceeds the Spyre per-core span limit; "
+                "keeping it on CPU and running the embedding gather on CPU.",
+                self.__class__.__name__,
+                tuple(self.weight.shape),
+            )
+
+    def _apply(self, fn, recurse=True):
+        if not self._keep_weight_on_cpu:
+            return super()._apply(fn, recurse=recurse)
+        # Detach `weight` for the recursion so the device/dtype move skips it,
+        # then restore it in place. Every other param/buffer is still moved.
+        weight = self._parameters.pop("weight", None)
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            if weight is not None:
+                self._parameters["weight"] = weight
+
+
 @lru_cache(maxsize=1)
 def register():
     """Register the spyre_convert custom op with vLLM."""

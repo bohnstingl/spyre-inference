@@ -28,7 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from .linear import SpyreTransposedWeightMethod
-from .utils import embedding_gather_exceeds_span
+from .utils import CpuPinnedWeightMixin
 
 
 logger = init_logger(__name__)
@@ -42,7 +42,7 @@ class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbed
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
-class SpyreParallelLMHead(ParallelLMHead):
+class SpyreParallelLMHead(CpuPinnedWeightMixin, ParallelLMHead):
     """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device.
 
     The projection lives in `SpyreUnquantizedLMHeadMethod.apply`, reached via
@@ -69,14 +69,4 @@ class SpyreParallelLMHead(ParallelLMHead):
         # on CPU here too so the tie holds. The logits GEMM uses `padded_weight_t` (an
         # independent device copy), and `weight` is unused at runtime, so this is safe
         # for untied heads as well.
-        self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
-
-    def _apply(self, fn, recurse=True):
-        if not self._keep_weight_on_cpu:
-            return super()._apply(fn, recurse=recurse)
-        weight = self._parameters.pop("weight", None)
-        try:
-            return super()._apply(fn, recurse=recurse)
-        finally:
-            if weight is not None:
-                self._parameters["weight"] = weight
+        self._pin_weight_if_oversized()

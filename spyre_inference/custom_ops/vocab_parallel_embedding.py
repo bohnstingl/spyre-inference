@@ -27,13 +27,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert, embedding_gather_exceeds_span
+from .utils import CpuPinnedWeightMixin, convert
 
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
-class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
+class SpyreVocabParallelEmbedding(CpuPinnedWeightMixin, VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
@@ -46,21 +46,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
 
         # A large vocab can't be gathered on-device (per-core span exceeds the Spyre
         # limit); pin the weight to CPU and gather there, so only the result crosses.
-        self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
-        if self._keep_weight_on_cpu:
-            logger.warning_once(
-                "%s: vocab weight %s exceeds the Spyre per-core span limit; "
-                "keeping it on CPU and running the embedding gather on CPU.",
-                self.__class__.__name__,
-                tuple(self.weight.shape),
-            )
-
-    def _apply(self, fn, recurse=True):
-        # When pinned, return self so torch's recursive .to(device) leaves the weight
-        # (and, with tie_word_embeddings, the shared lm_head weight) on CPU.
-        if self._keep_weight_on_cpu:
-            return self
-        return super()._apply(fn, recurse=recurse)
+        self._pin_weight_if_oversized(warn=True)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         device = input_.device
