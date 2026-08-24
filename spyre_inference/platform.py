@@ -134,18 +134,36 @@ class TorchSpyrePlatform(CpuPlatform):
         from vllm.engine.arg_utils import EngineArgs
 
         original = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
-        if getattr(original, "_spyre_patched", False):
-            return
+        if not getattr(original, "_spyre_patched", False):
 
-        @functools.wraps(original)
-        def _spyre_patched(self, usage_context, model_config, parallel_config):
-            user_supplied = self.max_num_seqs is not None
-            original(self, usage_context, model_config, parallel_config)
-            if not user_supplied and self.max_num_seqs is not None:
-                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+            @functools.wraps(original)
+            def _spyre_patched(self, usage_context, model_config, parallel_config):
+                user_supplied = self.max_num_seqs is not None
+                original(self, usage_context, model_config, parallel_config)
+                if not user_supplied and self.max_num_seqs is not None:
+                    self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
 
-        _spyre_patched._spyre_patched = True
-        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+            _spyre_patched._spyre_patched = True
+            EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+
+        # `create_model_config` builds ModelConfig from `self.hf_overrides`, which
+        # selects the architecture — it runs before the model loads. gemma-4 ships
+        # multimodal; load the text-only backbone unless the user set architectures.
+        original_cmc = EngineArgs.create_model_config
+        if not getattr(original_cmc, "_spyre_patched", False):
+
+            @functools.wraps(original_cmc)
+            def _spyre_create_model_config(self):
+                ov = self.hf_overrides
+                user_arch = callable(ov) or (isinstance(ov, dict) and "architectures" in ov)
+                if "gemma-4" in (self.model or "").lower() and not user_arch:
+                    base = ov if isinstance(ov, dict) else {}
+                    self.hf_overrides = {**base, "architectures": ["Gemma4ForCausalLM"]}
+                    logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
+                return original_cmc(self)
+
+            _spyre_create_model_config._spyre_patched = True
+            EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
 
     @classmethod
     def import_kernels(cls) -> None:

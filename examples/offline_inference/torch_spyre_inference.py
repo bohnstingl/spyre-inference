@@ -126,17 +126,7 @@ def main():
     ]
 
     # The platform derives the compile mode from enforce_eager, so no explicit
-    # compilation_config is needed.    # gemma-4 checkpoints ship as multimodal (Gemma4ForConditionalGeneration).
-    # Auto-load the text-only backbone by overriding the architecture.
-    hf_overrides = None
-    if "gemma-4" in args.model.lower():
-        hf_overrides = {"architectures": ["Gemma4ForCausalLM"]}
-        print(
-            "Detected gemma-4 model; auto-setting "
-            "hf_overrides={'architectures': ['Gemma4ForCausalLM']} to load the "
-            "text-only backbone (skips the vision tower)."
-        )
-
+    # compilation_config is needed.
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -147,7 +137,6 @@ def main():
         dtype="float16",
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
-        hf_overrides=hf_overrides,
     )
 
     # When compiling, run an untimed warmup pass first so any lazy per-shape
