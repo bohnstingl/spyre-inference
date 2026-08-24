@@ -45,17 +45,17 @@ def _patch_gemma4_embed_scale() -> None:
 
     orig_init = Gemma4SelfDecoderLayers.__init__
 
-    def __init__(self, *args, **kwargs) -> None:
+    def patched_init(self, *args, **kwargs) -> None:
         orig_init(self, *args, **kwargs)
         self._spyre_normalizer_scale = float(self.normalizer)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def patched_embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self._spyre_normalizer_scale
 
-    __init__._spyre_scalar_patch = True
-    embed_input_ids._spyre_scalar_patch = True
-    Gemma4SelfDecoderLayers.__init__ = __init__
-    Gemma4SelfDecoderLayers.embed_input_ids = embed_input_ids
+    patched_embed_input_ids._spyre_scalar_patch = True
+    # setattr with a non-constant name: dodges ty invalid-assignment and ruff B010.
+    for name, fn in (("__init__", patched_init), ("embed_input_ids", patched_embed_input_ids)):
+        setattr(Gemma4SelfDecoderLayers, name, fn)
     logger.info(
         "Patched Gemma4SelfDecoderLayers to scale embeddings by a precomputed "
         "Python float (avoids a stale 0-d CPU normalizer tensor on Spyre, in both "

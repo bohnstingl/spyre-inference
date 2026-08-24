@@ -132,13 +132,13 @@ class _SpyreRotaryMixin:
         cache = self._get_device_rotation_cache()
         rot = cache.index_select(0, positions.flatten())
         out_query = _rotate_neox_2x2(
-            query,  # ty: ignore[invalid-argument-type]
+            query,
             rot,
             self.head_size,
         )
         out_key = (
             _rotate_neox_2x2(
-                key,  # ty: ignore[invalid-argument-type]
+                key,
                 rot,
                 self.head_size,
             )
