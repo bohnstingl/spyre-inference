@@ -14,47 +14,16 @@
 
 """Spyre compatibility patch for Gemma-4's embedding-scale multiply.
 
-Gemma-4 scales the token embeddings by ``normalizer = sqrt(hidden_size)`` in
-``Gemma4SelfDecoderLayers.embed_input_ids``:
+Gemma-4 scales embeddings by ``normalizer = sqrt(hidden_size)``, held as a buffer on
+``Gemma4Model`` but aliased as a plain attribute on ``Gemma4SelfDecoderLayers``.
+``model.to("spyre")`` moves the parent buffer but leaves the alias on the original 0-d
+CPU tensor; torch-spyre cannot tile that operand (propagate_layouts: "does not have
+FixedTiledLayout"). Scaling by a Python float instead lowers as ``aten.mul.Scalar``
+with no 0-d input buffer, and is numerically identical.
 
-    return self.embed_tokens(input_ids) * self.normalizer
-
-``normalizer`` is registered as a buffer on ``Gemma4Model`` but is *also* stored
-on ``Gemma4SelfDecoderLayers`` as a plain (unregistered) tensor attribute — a
-shared reference. When the Spyre model runner moves the model with
-``model.to("spyre")``, ``nn.Module._apply`` replaces the parent's registered
-buffer with a fresh device tensor but leaves the child's plain-attribute alias
-pointing at the original **CPU** 0-d tensor. The forward multiply then feeds
-torch-spyre a 0-d CPU operand, which becomes an untileable graph ``InputBuffer``
-and trips ``propagate_layouts.py``:
-
-    RuntimeError: TensorBox(StorageBox(InputBuffer(name=..., layout=FixedLayout(
-        'cpu', torch.float16, size=[], stride=[])))) does not have FixedTiledLayout
-
-A 0-d tensor operand that is already on the Spyre device lowers fine; only the
-stale CPU operand fails. We sidestep the broken alias entirely by scaling with a
-Python float, which lowers as ``aten.mul.Scalar`` (the scalar is folded into the
-pointwise op, so there is no 0-d input buffer). This is numerically identical to
-the original fp16 tensor multiply — ``float(normalizer)`` widens the same
-fp16-rounded value that the tensor path used.
-
-**The conversion must happen before compilation, not lazily in ``forward``.**
-``Gemma4SelfDecoderLayers.forward`` is wrapped by ``@support_torch_compile``, so
-under ``STOCK_TORCH_COMPILE`` the *first* forward call is the Dynamo trace. If
-``float(self.normalizer)`` runs there, Dynamo lifts the 0-d CPU tensor it reads
-into the graph as an input (``arg0_1``) — reintroducing the exact untileable
-buffer we set out to avoid, so the failure returns in compile mode even though
-eager works. We therefore precompute the scalar in ``__init__`` (eager, long
-before any trace) and have ``embed_input_ids`` read only that Python float, so
-the traced graph never touches the tensor.
-
-Gemma 1/2/3 register ``normalizer`` on the *same* class that performs the
-multiply, so ``.to()`` moves it consistently and they do not need this patch.
-
-References:
-    - Upstream model: vllm/model_executor/models/gemma4.py (Gemma4SelfDecoderLayers)
-    - Runner device move: spyre_inference/v1/worker/spyre_model_runner.py (load_model)
-    - torch-spyre guard: torch_spyre/_inductor/propagate_layouts.py
+The float must be precomputed in ``__init__``, not in ``forward``: ``forward`` is
+``@support_torch_compile``, so a first-call ``float(self.normalizer)`` would run during
+the Dynamo trace and lift the 0-d CPU tensor back into the graph.
 """
 
 import torch
@@ -78,10 +47,6 @@ def _patch_gemma4_embed_scale() -> None:
 
     def __init__(self, *args, **kwargs) -> None:
         orig_init(self, *args, **kwargs)
-        # Precompute the embedding scale as a Python float here, in eager
-        # construction — NOT lazily in forward. forward is @support_torch_compile,
-        # so a first-call float(self.normalizer) would run during the Dynamo trace
-        # and lift the 0-d CPU tensor into the graph as an untileable input.
         self._spyre_normalizer_scale = float(self.normalizer)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

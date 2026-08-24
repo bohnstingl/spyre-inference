@@ -111,14 +111,10 @@ SPYRE_TENSOR_SPAN_LIMIT_BYTES = 256 * 1024 * 1024
 
 
 def embedding_gather_exceeds_span(weight: torch.Tensor) -> bool:
-    """True if an on-device embedding gather over `weight` would exceed the
-    Spyre per-core tensor-span limit.
-
-    A gather must random-access any vocab row, so on a single card torch-spyre
-    can only split the vocab (row) dimension by x2; the resulting per-core span
-    is ceil(rows / 2) * hidden * itemsize. Above the 256 MiB limit the gather
-    (and its weight) must stay on CPU instead. `rows` is the per-rank partition
-    size, so vocab-parallel TP shrinks it and can bring a model back on-device.
+    """True if an on-device embedding gather over `weight` exceeds the Spyre per-core
+    span limit. A random-access gather can only split the vocab dim by x2, so the
+    per-core span is ceil(rows / 2) * hidden * itemsize; above the limit the weight must
+    stay on CPU. `rows` is the per-rank partition, so vocab-parallel TP shrinks it.
     """
     rows, dim = weight.shape[0], weight.shape[1]
     per_core_rows = (rows + 1) // 2

@@ -65,11 +65,10 @@ class SpyreParallelLMHead(ParallelLMHead):
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-        # With tie_word_embeddings, `weight` IS embed_tokens.weight. For a large
-        # vocab that weight is pinned to CPU (SpyreVocabParallelEmbedding gathers
-        # there). Keep it on CPU here too so the tie holds; the logits GEMM uses
-        # `padded_weight_t`, an independent copy that still moves to the device.
-        # `weight` is unused at runtime, so this is safe for untied heads as well.
+        # With tie_word_embeddings, `weight` is the CPU-pinned embedding weight; keep it
+        # on CPU here too so the tie holds. The logits GEMM uses `padded_weight_t` (an
+        # independent device copy), and `weight` is unused at runtime, so this is safe
+        # for untied heads as well.
         self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
 
     def _apply(self, fn, recurse=True):

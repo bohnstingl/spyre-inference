@@ -44,9 +44,8 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
-        # A large vocabulary cannot be gathered on-device: the per-core tensor
-        # span exceeds the Spyre hardware limit (see embedding_gather_exceeds_span).
-        # Pin the weight to CPU and gather there; only the small result crosses.
+        # A large vocab can't be gathered on-device (per-core span exceeds the Spyre
+        # limit); pin the weight to CPU and gather there, so only the result crosses.
         self._keep_weight_on_cpu = embedding_gather_exceeds_span(self.weight)
         if self._keep_weight_on_cpu:
             logger.warning_once(
@@ -57,9 +56,8 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def _apply(self, fn, recurse=True):
-        # When pinned, return self so torch's recursive .to(device) leaves the
-        # weight (and, with tie_word_embeddings, the shared lm_head weight) on
-        # CPU. F.embedding on a large vocab has no viable Spyre work division.
+        # When pinned, return self so torch's recursive .to(device) leaves the weight
+        # (and, with tie_word_embeddings, the shared lm_head weight) on CPU.
         if self._keep_weight_on_cpu:
             return self
         return super()._apply(fn, recurse=recurse)

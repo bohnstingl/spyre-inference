@@ -734,22 +734,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # `num_blocks` (the physical block count) is spec-independent: every
-            # layer in `shared_by` has the same `page_size_bytes` by construction
-            # (that is exactly why vLLM pooled them into one tensor).
+            # num_blocks is spec-independent: every layer in `shared_by` has the same
+            # page_size_bytes by construction (that is why vLLM pooled them).
             ref_spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // ref_spec.page_size_bytes
 
-            # For hybrid models (Gemma-4 dense: sliding num_kv_heads 16 / block 64
-            # / head_size 256 vs full num_kv_heads 4 / block 128 / head_size 512),
-            # vLLM pools layers from different KV-cache groups into ONE tensor and
-            # expects each layer to take a differently-shaped view of the shared
-            # bytes. Spyre CANNOT do that: the stickified device layout is
-            # shape-specific, so one buffer can't be viewed as two (num_kv_heads,
-            # block_size, head_size) shapes for the attention kernel ("Unexpected
-            # stick expression"). Give each pooled layer its OWN natively-shaped,
-            # slot-major pages sized from that layer's spec. Cost: len(shared_by)x
-            # the pooled budget — see gemma4-31b-kv-memory-handoff.md.
+            # Hybrid models (e.g. Gemma-4 dense) pool layers from different KV-cache
+            # groups into ONE tensor, expecting each to take a differently-shaped view of
+            # the shared bytes. Spyre's stickified layout is shape-specific and can't be
+            # re-viewed ("Unexpected stick expression"), so give each pooled layer its own
+            # natively-shaped, slot-major pages from its spec. Cost: len(shared_by)x budget.
             for layer_name in kv_cache_tensor.shared_by:
                 spec = spec_by_layer[layer_name]
                 # Host-allocated then transferred: only .to() takes a device_layout.

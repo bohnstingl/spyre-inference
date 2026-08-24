@@ -146,9 +146,8 @@ class TorchSpyrePlatform(CpuPlatform):
             _spyre_patched._spyre_patched = True
             EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
 
-        # `create_model_config` builds ModelConfig from `self.hf_overrides`, which
-        # selects the architecture — it runs before the model loads. gemma-4 ships
-        # multimodal; load the text-only backbone unless the user set architectures.
+        # gemma-4 ships multimodal; force the text-only backbone (unless the user set
+        # architectures) via hf_overrides, which create_model_config reads before load.
         original_cmc = EngineArgs.create_model_config
         if not getattr(original_cmc, "_spyre_patched", False):
 
