@@ -105,40 +105,6 @@ def convert(tensor, device=None, dtype=None):
     )
 
 
-class SpyreGatherEmbeddingMixin:
-    """DMA a large-vocab embedding `weight` to Spyre with the gather-optimal layout.
-
-    `VocabParallelEmbedding` is a plain `nn.Module`, so torch-spyre's optimal-layout
-    loader never gives its `weight` the indirect-access layout a gather needs, and a
-    default-layout gather over a big vocab (e.g. Gemma-4's 262k rows) overflows the
-    per-core span limit. This intercepts `.to(spyre)` and DMAs `weight` via
-    `_dma_to_spyre_indirect_access` instead. Mix in before the vLLM base class.
-    """
-
-    def _apply(self, fn, recurse=True):
-        weight = self._parameters.get("weight")
-        if weight is None or weight.ndim != 2 or weight.device.type == "spyre":
-            return super()._apply(fn, recurse=recurse)
-        # `_apply` hides the destination device; probe `fn` on a scalar to detect Spyre.
-        probe = fn(torch.zeros(1, dtype=weight.dtype))
-        if probe.device.type != "spyre":
-            return super()._apply(fn, recurse=recurse)
-
-        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
-
-        # Hold `weight` out of the recursion (super() would give it the overflowing
-        # default layout), move everything else, then DMA it with the indirect layout.
-        weight = self._parameters.pop("weight")
-        super()._apply(fn, recurse=recurse)
-        dev = _dma_to_spyre_indirect_access(weight.data, target_dtype=probe.dtype)
-        assert dev is not None, (
-            f"{self.__class__.__name__}: hidden dim {weight.shape[1]} does not tile into "
-            "Spyre sticks (D % elems_per_stick != 0); indirect-access layout unavailable."
-        )
-        self._parameters["weight"] = torch.nn.Parameter(dev, requires_grad=weight.requires_grad)
-        return self
-
-
 @lru_cache(maxsize=1)
 def register():
     """Register the spyre_convert custom op with vLLM."""

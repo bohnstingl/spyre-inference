@@ -28,13 +28,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import SpyreGatherEmbeddingMixin, place_row_gathered
+from .utils import place_row_gathered
 
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
-class SpyreVocabParallelEmbedding(SpyreGatherEmbeddingMixin, VocabParallelEmbedding):
+class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
