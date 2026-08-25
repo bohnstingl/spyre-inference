@@ -739,11 +739,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             ref_spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // ref_spec.page_size_bytes
 
-            # Hybrid models (e.g. Gemma-4 dense) pool layers from different KV-cache
-            # groups into ONE tensor, expecting each to take a differently-shaped view of
-            # the shared bytes. Spyre's stickified layout is shape-specific and can't be
-            # re-viewed ("Unexpected stick expression"), so give each pooled layer its own
-            # natively-shaped, slot-major pages from its spec. Cost: len(shared_by)x budget.
+            # Hybrid models (e.g. Gemma-4 dense) pool differently-shaped layers into one
+            # tensor. Spyre's stickified layout can't be re-viewed per shape ("Unexpected
+            # stick expression"), so give each pooled layer its own native slot-major
+            # pages. Cost: len(shared_by)x budget.
             for layer_name in kv_cache_tensor.shared_by:
                 spec = spec_by_layer[layer_name]
                 # Host-allocated then transferred: only .to() takes a device_layout.

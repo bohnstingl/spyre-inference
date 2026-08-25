@@ -106,17 +106,13 @@ def convert(tensor, device=None, dtype=None):
 
 
 class SpyreGatherEmbeddingMixin:
-    """Move a large-vocab embedding `weight` to Spyre with the gather-optimal
-    indirect-access layout.
+    """DMA a large-vocab embedding `weight` to Spyre with the gather-optimal layout.
 
-    vLLM's `VocabParallelEmbedding` is a plain `nn.Module`, not an `nn.Embedding`,
-    so torch-spyre's optimal-layout loader never gives its `weight` the
-    indirect-access layout an on-device gather needs; a default-layout gather over
-    a big vocab (e.g. Gemma-4's 262k rows) overflows the Spyre per-core span limit.
-    This mixin intercepts the `.to(spyre)` recursion and DMAs `weight` with the
-    indirect-access layout (vocab outermost, hidden split into 128-byte sticks) via
-    torch-spyre's `_dma_to_spyre_indirect_access`, so the gather fits and the
-    embedding runs fully on-device. Mix in before the vLLM base class.
+    `VocabParallelEmbedding` is a plain `nn.Module`, so torch-spyre's optimal-layout
+    loader never gives its `weight` the indirect-access layout a gather needs, and a
+    default-layout gather over a big vocab (e.g. Gemma-4's 262k rows) overflows the
+    per-core span limit. This intercepts `.to(spyre)` and DMAs `weight` via
+    `_dma_to_spyre_indirect_access` instead. Mix in before the vLLM base class.
     """
 
     def _apply(self, fn, recurse=True):

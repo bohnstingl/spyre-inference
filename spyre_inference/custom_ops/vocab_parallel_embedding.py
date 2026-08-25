@@ -34,12 +34,7 @@ logger = init_logger(__name__)
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(SpyreGatherEmbeddingMixin, VocabParallelEmbedding):
-    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device.
-
-    The vocab table is DMA'd to Spyre with the gather-optimal indirect-access
-    layout (see `SpyreGatherEmbeddingMixin`), so even a large vocab is gathered
-    fully on-device -- no CPU roundtrip.
-    """
+    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

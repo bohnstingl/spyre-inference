@@ -173,9 +173,8 @@ class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedd
 class SpyreGemma4RotaryEmbedding(_SpyreRotaryMixin, Gemma4RotaryEmbedding):
     """OOT Gemma4RotaryEmbedding (proportional RoPE) that applies the rotation on Spyre.
 
-    Proportional RoPE has ``partial_rotary_factor < 1`` but sets ``rotary_dim ==
-    head_size`` and identity-pads the non-rotated frequencies in ``cos_sin_cache``, so
-    the neox full-rotary path (and the mixin's guard) applies unchanged.
+    ``partial_rotary_factor < 1`` but ``rotary_dim == head_size`` with the non-rotated
+    frequencies identity-padded, so the neox full-rotary path applies unchanged.
     """
 
     pass

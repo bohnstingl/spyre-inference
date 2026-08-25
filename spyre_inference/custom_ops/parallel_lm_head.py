@@ -65,11 +65,8 @@ class SpyreParallelLMHead(ParallelLMHead):
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
     def _apply(self, fn, recurse=True):
-        # The logits GEMM runs off `padded_weight_t` (an independent device copy built
-        # in process_weights_after_loading), so the raw `weight` is unused at runtime.
-        # Keep it on CPU rather than burning HBM on an unused copy -- and, when tied, a
-        # second copy of the embedding table that already lives on-device (in the
-        # gather-optimal layout). Every other param/buffer still moves to the device.
+        # `weight` is unused at runtime (the logits GEMM uses `padded_weight_t`); keep it
+        # on CPU to avoid a redundant HBM copy of the (when tied, already on-device) table.
         weight = self._parameters.pop("weight", None)
         try:
             return super()._apply(fn, recurse=recurse)

@@ -12,18 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre compatibility patch for Gemma-4's embedding-scale multiply.
+"""Scale Gemma-4 embeddings by a Python float instead of the 0-d ``normalizer`` buffer.
 
-Gemma-4 scales embeddings by ``normalizer = sqrt(hidden_size)``, held as a buffer on
-``Gemma4Model`` but aliased as a plain attribute on ``Gemma4SelfDecoderLayers``.
-``model.to("spyre")`` moves the parent buffer but leaves the alias on the original 0-d
-CPU tensor; torch-spyre cannot tile that operand (propagate_layouts: "does not have
-FixedTiledLayout"). Scaling by a Python float instead lowers as ``aten.mul.Scalar``
-with no 0-d input buffer, and is numerically identical.
-
-The float must be precomputed in ``__init__``, not in ``forward``: ``forward`` is
-``@support_torch_compile``, so a first-call ``float(self.normalizer)`` would run during
-the Dynamo trace and lift the 0-d CPU tensor back into the graph.
+``model.to("spyre")`` leaves ``Gemma4SelfDecoderLayers``' aliased ``normalizer`` on a
+0-d CPU tensor that torch-spyre cannot tile ("does not have FixedTiledLayout"). A scalar
+multiply lowers to ``aten.mul.Scalar`` with no 0-d operand and is numerically identical.
+Precompute the float in ``__init__``: ``forward`` is ``@support_torch_compile``, so
+computing it there would lift the 0-d tensor back into the traced graph.
 """
 
 import torch
