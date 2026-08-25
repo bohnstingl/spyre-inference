@@ -15,7 +15,7 @@
 """This module contains all custom ops for spyre"""
 
 from functools import lru_cache
-
+from . import activation  # noqa: F401
 from . import gemma4_embed_scale  # noqa: F401
 from . import gemma_rms_norm  # noqa: F401
 from . import logits_processor  # noqa: F401
