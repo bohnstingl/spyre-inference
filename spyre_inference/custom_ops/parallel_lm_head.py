@@ -28,7 +28,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from .linear import SpyreTransposedWeightMethod
-from .utils import CpuPinnedWeightMixin
 
 
 logger = init_logger(__name__)
@@ -42,7 +41,7 @@ class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbed
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
-class SpyreParallelLMHead(CpuPinnedWeightMixin, ParallelLMHead):
+class SpyreParallelLMHead(ParallelLMHead):
     """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device.
 
     The projection lives in `SpyreUnquantizedLMHeadMethod.apply`, reached via
@@ -65,11 +64,15 @@ class SpyreParallelLMHead(CpuPinnedWeightMixin, ParallelLMHead):
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-        # The logits GEMM uses `padded_weight_t` (an independent device copy built in
-        # process_weights_after_loading), so `weight` itself is unused at runtime. When
-        # it would overflow the Spyre per-core span limit, keep it on CPU rather than
-        # burning HBM on an unused copy. With tie_word_embeddings the embedding owns the
-        # on-device (indirect-access) copy of the shared table; the tie is only needed
-        # for weight loading and padded_weight_t, both of which happen before the device
-        # move, so this stays correct for tied and untied heads alike.
-        self._pin_weight_if_oversized()
+    def _apply(self, fn, recurse=True):
+        # The logits GEMM runs off `padded_weight_t` (an independent device copy built
+        # in process_weights_after_loading), so the raw `weight` is unused at runtime.
+        # Keep it on CPU rather than burning HBM on an unused copy -- and, when tied, a
+        # second copy of the embedding table that already lives on-device (in the
+        # gather-optimal layout). Every other param/buffer still moves to the device.
+        weight = self._parameters.pop("weight", None)
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            if weight is not None:
+                self._parameters["weight"] = weight

@@ -50,11 +50,11 @@ class SpyreVocabParallelEmbedding(SpyreGatherEmbeddingMixin, VocabParallelEmbedd
             )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        device = input_.device
         if self.tp_size > 1:
             # The per-rank mask still runs on CPU: upstream get_masked_input_and_mask
             # does `input_ >= start` under torch.compile, which Spyre's inductor backend
             # rejects for int64 constants (see test_int64_compiled_compare_against_python_int).
+            # The embedding gather itself runs on-device below.
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
                 convert(input_, device="cpu"),
                 self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
@@ -64,23 +64,18 @@ class SpyreVocabParallelEmbedding(SpyreGatherEmbeddingMixin, VocabParallelEmbedd
                 self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
             )
+            masked_input = convert(masked_input, device=input_.device)
+            keep = convert(keep, device=input_.device)
         else:
             masked_input = input_
             keep = None
 
-        # Gather where the weight lives: CPU for a pinned large vocab (only the
-        # [num_tokens, hidden] result crosses back), on-device otherwise.
-        gather_device = "cpu" if self._keep_weight_on_cpu else device
-        masked_input = convert(masked_input, device=gather_device)
         output = self.quant_method.embedding(self, masked_input.long())
 
         if keep is not None:
-            keep = convert(keep, device=gather_device)
             output = output * keep
-            output = convert(output, device=device)
             output = tensor_model_parallel_all_reduce(output)
-            return output
-        return convert(output, device=device)
+        return output
 
 
 def _vocab_mask_op_func(
