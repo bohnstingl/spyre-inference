@@ -459,7 +459,7 @@ def test_gemma4_rotary_oot_registration(default_vllm_config, head_size):
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", GEMMA4_HEAD_SIZES)
 def test_gemma4_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
-    """CPU-only: gather_rotation + _rotate_neox_2x2 match forward_native for the
+    """CPU-only: host gather + _rotate_neox_2x2 match forward_native for the
     proportional (partial-rotary, identity-padded) config, so the 2x2 cache carries the
     non-rotated identity frequencies. Runs where the forward_oot test skips."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -480,8 +480,8 @@ def test_gemma4_rotation_math_matches_reference_cpu(default_vllm_config, head_si
     query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
     key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
 
-    rot = rope.gather_rotation(positions, torch.device("cpu"))
-    assert rot is not None and rot.device.type == "cpu"
+    rot = rope._get_rotation_cache().index_select(0, positions).to(torch.float16)
+    assert rot.device.type == "cpu"
     actual_query = _rotate_neox_2x2(query, rot, head_size)
     actual_key = _rotate_neox_2x2(key, rot, head_size)
 
