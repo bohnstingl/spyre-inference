@@ -65,8 +65,11 @@ class SpyreParallelLMHead(CpuPinnedWeightMixin, ParallelLMHead):
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-        # With tie_word_embeddings, `weight` is the CPU-pinned embedding weight; keep it
-        # on CPU here too so the tie holds. The logits GEMM uses `padded_weight_t` (an
-        # independent device copy), and `weight` is unused at runtime, so this is safe
-        # for untied heads as well.
+        # The logits GEMM uses `padded_weight_t` (an independent device copy built in
+        # process_weights_after_loading), so `weight` itself is unused at runtime. When
+        # it would overflow the Spyre per-core span limit, keep it on CPU rather than
+        # burning HBM on an unused copy. With tie_word_embeddings the embedding owns the
+        # on-device (indirect-access) copy of the shared table; the tie is only needed
+        # for weight loading and padded_weight_t, both of which happen before the device
+        # move, so this stays correct for tied and untied heads alike.
         self._pin_weight_if_oversized()

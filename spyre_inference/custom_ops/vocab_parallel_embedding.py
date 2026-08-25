@@ -27,14 +27,19 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import CpuPinnedWeightMixin, convert
+from .utils import SpyreGatherEmbeddingMixin, convert
 
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
-class SpyreVocabParallelEmbedding(CpuPinnedWeightMixin, VocabParallelEmbedding):
-    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
+class SpyreVocabParallelEmbedding(SpyreGatherEmbeddingMixin, VocabParallelEmbedding):
+    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device.
+
+    The vocab table is DMA'd to Spyre with the gather-optimal indirect-access
+    layout (see `SpyreGatherEmbeddingMixin`), so even a large vocab is gathered
+    fully on-device -- no CPU roundtrip.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -43,10 +48,6 @@ class SpyreVocabParallelEmbedding(CpuPinnedWeightMixin, VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
-
-        # A large vocab can't be gathered on-device (per-core span exceeds the Spyre
-        # limit); pin the weight to CPU and gather there, so only the result crosses.
-        self._pin_weight_if_oversized(warn=True)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         device = input_.device

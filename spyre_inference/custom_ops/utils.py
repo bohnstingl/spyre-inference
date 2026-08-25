@@ -121,15 +121,84 @@ def embedding_gather_exceeds_span(weight: torch.Tensor) -> bool:
     return per_core_rows * dim * weight.element_size() > SPYRE_TENSOR_SPAN_LIMIT_BYTES
 
 
-class CpuPinnedWeightMixin:
-    """Shared CPU-pinning for large-vocab embedding weights.
+class SpyreGatherEmbeddingMixin:
+    """Place a large-vocab embedding `weight` on Spyre with the gather-optimal
+    indirect-access layout.
 
-    A vocab weight whose on-device gather would exceed the Spyre per-core span
-    limit must stay on CPU (the gather runs there; only the result crosses).
-    Mix this in *before* the vLLM base class and call `_pin_weight_if_oversized()`
-    from __init__. The `_apply` override then holds `weight` on CPU across torch's
+    vLLM's `VocabParallelEmbedding` is a plain `nn.Module`, *not* an
+    `nn.Embedding`, so torch-spyre's optimal-layout loader never gives its
+    `weight` the indirect-access layout an on-device gather needs. A default
+    layout gather over a big vocab overflows the Spyre per-core span limit --
+    the overflow that previously forced a CPU roundtrip. This mixin intercepts
+    the `.to(spyre)` recursion and DMAs `weight` with the indirect-access layout
+    (vocab outermost, hidden split into sticks, via torch-spyre's
+    `_dma_to_spyre_indirect_access`), so the gather fits and the embedding runs
+    fully on-device. Mix in *before* the vLLM base class.
+
+    `_apply` hides the destination device, so `fn` is probed on a scalar to see
+    whether it targets Spyre. If the hidden dim doesn't tile into sticks
+    (`D % elems_per_stick != 0`), the indirect layout isn't available: the weight
+    then stays on CPU when a default gather would overflow (`_keep_weight_on_cpu`,
+    honored by forward), otherwise it takes the default layout.
+    """
+
+    _keep_weight_on_cpu = False
+
+    def _apply(self, fn, recurse=True):
+        weight = self._parameters.get("weight")
+        if weight is None or weight.ndim != 2 or weight.device.type == "spyre":
+            return super()._apply(fn, recurse=recurse)
+
+        # Probe fn (a scalar is enough) to learn the destination `_apply` hides.
+        probe = fn(torch.zeros(1, dtype=weight.dtype))
+        if probe.device.type != "spyre":
+            return super()._apply(fn, recurse=recurse)
+
+        from torch_spyre.model_utils import _dma_to_spyre_indirect_access
+
+        # Hold `weight` out of the recursion (super() would give it the
+        # overflowing default layout), move every other param/buffer, then DMA
+        # `weight` with the gather-optimal indirect-access layout.
+        target_dtype = probe.dtype
+        weight = self._parameters.pop("weight")
+        try:
+            super()._apply(fn, recurse=recurse)
+        finally:
+            dev = _dma_to_spyre_indirect_access(weight.data, target_dtype=target_dtype)
+            if dev is not None:
+                self._parameters["weight"] = torch.nn.Parameter(
+                    dev, requires_grad=weight.requires_grad
+                )
+            elif embedding_gather_exceeds_span(weight.data):
+                # Hidden dim doesn't tile into sticks and a default gather would
+                # overflow: keep on CPU and gather there (forward honors this).
+                self._keep_weight_on_cpu = True
+                logger.warning_once(
+                    "%s: vocab weight %s can't use the Spyre indirect-access "
+                    "layout and a default gather overflows the per-core span "
+                    "limit; keeping it on CPU.",
+                    self.__class__.__name__,
+                    tuple(weight.shape),
+                )
+                self._parameters["weight"] = weight
+            else:
+                self._parameters["weight"] = torch.nn.Parameter(
+                    fn(weight.data), requires_grad=weight.requires_grad
+                )
+        return self
+
+
+class CpuPinnedWeightMixin:
+    """Shared CPU-pinning for large-vocab lm-head weights.
+
+    An lm-head whose `weight` would overflow the Spyre per-core span limit keeps
+    that `weight` on CPU: the logits GEMM runs off a separate device-side
+    `padded_weight_t` (built in `process_weights_after_loading`), so `weight`
+    itself is unused at runtime and only kept for a tied embedding. Mix this in
+    *before* the vLLM base class and call `_pin_weight_if_oversized()` from
+    __init__. The `_apply` override then holds `weight` on CPU across torch's
     recursive `.to(device)` / `.to(dtype)`, while still relocating every other
-    parameter and buffer (e.g. the tied lm-head's device-side `padded_weight_t`).
+    parameter and buffer (e.g. the device-side `padded_weight_t`).
     """
 
     _keep_weight_on_cpu = False
