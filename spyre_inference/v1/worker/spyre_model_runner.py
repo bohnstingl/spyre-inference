@@ -412,6 +412,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         install_pooling_model_patches()
 
+    @staticmethod
+    def _install_decoder_model_patches() -> None:
+        """Install model-specific decoder adapters (Gemma-4 embed scale, …).
+
+        A no-op unless the matching architecture is built (import-guarded + idempotent).
+        """
+        from spyre_inference.models import install_decoder_model_patches
+
+        install_decoder_model_patches()
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -422,6 +432,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
 
         self._install_pooling_model_patches(self.model_config)
+        self._install_decoder_model_patches()
 
         # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
         # stream in, when the platform overrode head_dim (e.g. head_size=64).
