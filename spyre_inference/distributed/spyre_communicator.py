@@ -118,7 +118,7 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         # the exact per-rank shard layout the caller expects.
         pad_spec = [0, 0] * (input_.dim() - dim - 1) + [0, pad]
         padded = convert(
-            torch.nn.functional.pad(convert(input_, device="cpu"), pad_spec).contiguous(),
+            torch.nn.functional.pad(convert(input_, device="cpu"), pad_spec),
             device=input_.device,
         )
         output_list = [torch.empty_like(padded) for _ in range(self.world_size)]

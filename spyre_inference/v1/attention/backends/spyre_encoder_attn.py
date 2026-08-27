@@ -270,7 +270,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if use_flat_write:
             if result.device.type == "spyre":
                 result = convert(result, "cpu")
-            src = convert(result.reshape(n, -1).contiguous(), target_device.type, output.dtype)
+            src = convert(result.reshape(n, -1), target_device.type, output.dtype)
             output.reshape(n, -1).copy_(src)
         else:
             if result.device.type != output.device.type:
