@@ -10,6 +10,7 @@ gated_models:
   - google/gemma-3-1b-it
   - google/gemma-1.1-2b-it
   - google/gemma-2-2b-it
+  - google/gemma-4-31B
 
 public_models:
   - mistralai/Mistral-7B-Instruct-v0.3
