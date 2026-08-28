@@ -842,10 +842,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
             slot_major_kv_layout,
         )
 
-        # Iterate kv_cache_tensors (one entry per physical buffer)
-        spec_by_layer = {
-            ln: g.kv_cache_spec for g in kv_cache_config.kv_cache_groups for ln in g.layer_names
-        }
+        # One spec per layer. disable_hybrid_kv_cache_manager (set in the
+        # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
+        # group; unwrap it to the real per-layer specs so each layer keeps its own
+        # num_kv_heads/head_size. Non-hybrid groups expose the spec directly.
+        spec_by_layer = {}
+        for group in kv_cache_config.kv_cache_groups:
+            per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            if per_layer is not None:
+                spec_by_layer.update(per_layer)
+            else:
+                spec_by_layer.update({ln: group.kv_cache_spec for ln in group.layer_names})
 
         # vLLM's `bind_kv_cache` types this dict as `dict[str, torch.Tensor]`,
         # but the matching `SpyreAttentionImpl.forward` consumes the
@@ -853,36 +860,33 @@ class TorchSpyreModelRunner(GPUModelRunner):
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # num_blocks is spec-independent: every layer in `shared_by` has the same
-            # page_size_bytes by construction (that is why vLLM pooled them).
-            ref_spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
-            num_blocks = kv_cache_tensor.size // ref_spec.page_size_bytes
+            # All layers in `shared_by` use the same spec by construction.
+            spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
+            num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Hybrid models (e.g. Gemma-4 dense) pool differently-shaped layers into one
-            # tensor. Spyre's stickified layout can't be re-viewed per shape ("Unexpected
-            # stick expression"), so give each pooled layer its own native slot-major
-            # pages. Cost: len(shared_by)x budget.
+            # Host-allocated then transferred: only .to() takes a device_layout.
+            layout = slot_major_kv_layout(
+                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+            )
+
+            k_pages = torch.zeros(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                dtype=torch.float16,
+            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            v_pages = torch.zeros(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                dtype=torch.float16,
+            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+
+            page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:
-                spec = spec_by_layer[layer_name]
-                # Host-allocated then transferred: only .to() takes a device_layout.
-                layout = slot_major_kv_layout(
-                    num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-                )
-                k_pages = torch.zeros(
-                    num_blocks,
-                    spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=torch.float16,
-                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-                v_pages = torch.zeros(
-                    num_blocks,
-                    spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=torch.float16,
-                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-                kv_caches[layer_name] = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+                kv_caches[layer_name] = page_cache
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]

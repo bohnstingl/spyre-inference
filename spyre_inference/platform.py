@@ -134,7 +134,6 @@ class TorchSpyrePlatform(CpuPlatform):
         from vllm.engine.arg_utils import EngineArgs
 
         def cap_max_num_seqs(original):
-            # Cap max_num_seqs to _DEFAULT_MAX_NUM_SEQS when the user didn't pass one.
             @functools.wraps(original)
             def wrapper(self, usage_context, model_config, parallel_config):
                 user_supplied = self.max_num_seqs is not None
@@ -443,6 +442,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
+
+        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
+        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
+        # KV-cache manager gives every layer its own buffer; SWA is still computed
+        # in the model runner. No-op for non-hybrid models.
+        scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
         # math in CpuPlatform.check_and_update_config is meaningless for us.
