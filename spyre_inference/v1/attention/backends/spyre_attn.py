@@ -662,10 +662,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             attend = attend & (kv_pos.unsqueeze(0) <= causal_limit.unsqueeze(1))
 
         # Sliding window: per-query window_start.
-        if self.sliding_window is not None:
-            abs_q_pos = context_len + q_pos  # [aligned_max_query_len]
-            window_start = (abs_q_pos - self.sliding_window + 1).clamp(min=0)
-            attend = attend & (kv_pos.unsqueeze(0) >= window_start.unsqueeze(1))
+        assert self.sliding_window is not None
+        abs_q_pos = context_len + q_pos  # [aligned_max_query_len]
+        window_start = (abs_q_pos - self.sliding_window + 1).clamp(min=0)
+        attend = attend & (kv_pos.unsqueeze(0) >= window_start.unsqueeze(1))
 
         mask_bool = ~attend
         return torch.where(
@@ -673,44 +673,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             torch.tensor(mask_min, dtype=self.model_dtype),
             torch.tensor(0.0, dtype=self.model_dtype),
         )
-
-    def _build_tail_tiles(
-        self,
-        first_block: int,
-        num_blocks: int,
-        kv_len: int,
-        query_len: int,
-        context_len: int,
-        aligned_max_query_len: int,
-        apply_causal_mask: bool,
-    ) -> list[torch.Tensor]:
-        """Additive mask tiles for blocks ``[first_block, num_blocks)`` of one sequence.
-
-        Builds the whole span in one vectorized pass and slices it per block.
-        A decode step's span is one or two blocks, so it costs almost nothing;
-        a full prefill, where every block needs real content, costs the same as
-        the dense whole-batch mask this replaces.
-        """
-        block_size = self.block_size
-        kv_pos = torch.arange(first_block * block_size, num_blocks * block_size)
-        q_pos = torch.arange(aligned_max_query_len)
-
-        attend = (q_pos < query_len).unsqueeze(1) & (kv_pos < kv_len).unsqueeze(0)
-        if apply_causal_mask:
-            attend &= kv_pos.unsqueeze(0) <= (context_len + q_pos).unsqueeze(1)
-        if self.sliding_window is not None:
-            window_start = (context_len + q_pos - self.sliding_window + 1).clamp(min=0)
-            attend &= kv_pos.unsqueeze(0) >= window_start.unsqueeze(1)
-
-        span = torch.where(
-            ~attend,
-            torch.tensor(torch.finfo(self.model_dtype).min, dtype=self.model_dtype),
-            torch.tensor(0.0, dtype=self.model_dtype),
-        )
-        return [
-            span[:, i * block_size : (i + 1) * block_size].contiguous()
-            for i in range(num_blocks - first_block)
-        ]
 
     def _build_active_tiles_with_skip(
         self,
@@ -853,41 +815,30 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         active_block_indices: list[list[int]] | None = None
 
         if self.sliding_window is None:
-            # No sliding window: classify blocks arithmetically instead of
-            # materializing the dense [num_seqs, Q, KV] mask. A block is
-            # all-zero when every query row is valid, every KV column is
-            # within kv_len, and (during prefill) the whole block sits below
-            # the earliest query's causal limit. Those blocks share one tile,
-            # so the per-step device mirror transfers it once.
-            query_lens_list = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
-            seq_lens_list = seq_lens.tolist()
-            zero_tile = self._get_zero_tile(aligned_max_query_len)
+            # No sliding window: build the full additive mask and split it into
+            # per-block tiles (one tile per absolute block index).
+            mask_cpu = self._build_attention_mask(
+                seq_lens,
+                query_start_loc,
+                apply_causal_mask,
+                max_query_len,
+                aligned_max_query_len,
+                aligned_max_seq_len,
+                torch.device("cpu"),
+            )
+            # Pre-tile the mask: split into per-block tiles.
+            # Query dimension is uniform (aligned_max_query_len) for all sequences,
+            # so tiling only follows the KV dimension.
             for s in range(num_seqs):
-                kv_len_s = int(seq_lens_list[s])
-                query_len_s = int(query_lens_list[s])
-                context_len_s = kv_len_s - query_len_s
+                seq_tiles: list[torch.Tensor] = []
+                kv_len_s = int(seq_lens[s].item())
                 num_blocks_s = (kv_len_s + block_size - 1) // block_size
-                # Rows past query_len are fully masked, so a sequence shorter
-                # than the padded query dimension has no all-zero block.
-                kv_ok_upto = kv_len_s // block_size
-                causal_ok_upto = (
-                    (context_len_s + 1) // block_size if apply_causal_mask else num_blocks_s
-                )
-                interior_upto = (
-                    min(kv_ok_upto, causal_ok_upto) if query_len_s >= aligned_max_query_len else 0
-                )
-                attention_mask_tiles.append(
-                    [zero_tile] * interior_upto
-                    + self._build_tail_tiles(
-                        interior_upto,
-                        num_blocks_s,
-                        kv_len_s,
-                        query_len_s,
-                        context_len_s,
-                        aligned_max_query_len,
-                        apply_causal_mask,
-                    )
-                )
+                for b in range(num_blocks_s):
+                    col_start = b * block_size
+                    col_end = col_start + block_size
+                    tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
+                    seq_tiles.append(tile.contiguous())
+                attention_mask_tiles.append(seq_tiles)
             # active_block_indices stays None, so forward iterates all blocks.
         else:
             # Sliding window: arithmetic block-skip. Blocks entirely outside
