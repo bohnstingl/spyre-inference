@@ -102,12 +102,20 @@ fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to t
 `_orig_mod` child and rename every parameter, breaking weight save/reload.
 
 Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entries own an
-`Attention` somewhere, and are not themselves `Attention` layers — so decoder stacks
-(`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
-hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
-`Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack.
-Models whose attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi), vision-tower
-attention — match nothing and fall back to a whole-model graph.
+`AttentionLayerBase` somewhere, and are not themselves attention layers — so decoder
+stacks (`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as
+are hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of
+bare `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack.
+`AttentionLayerBase` rather than `Attention` is the predicate deliberately: it is what
+vLLM keys KV-cache group discovery off, so it covers `EncoderOnlyAttention`,
+`MLAAttention` (DeepSeek, Kimi) and Mamba mixers as well as full attention. Only a model
+with no repeated attention-bearing layer stack at all — an encoder-only vision tower —
+falls back to a whole-model graph; the runner logs a warning naming the model when it
+does.
+
+The Transformers backend needs one extra step to get here, because upstream keeps its
+vLLM `Attention` layers in a plain dict rather than in the module tree — see
+[Transformers backend](#transformers-backend).
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -269,6 +277,50 @@ only has to rebuild the rotation cache at the pre-pad frequencies.
 Because the fusers key on class names, the OOT registry also covers the fused norms
 (`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`); otherwise they fall back to
 `forward_native` and its fp32 promotion.
+
+### Attention instances and per-block compile
+
+Upstream builds its vLLM `Attention` layers into `Base.attention_instances`, a plain
+`dict[int, Attention]` that `nn.Module.__setattr__` never registers, threads that dict
+into the HF forward as a kwarg, and resolves the layer inside its registered attention
+function as `attention_instances[module.layer_idx]`. Both halves of that cost the runner
+its per-block granularity:
+
+- nothing under an HF decoder layer is an attention layer, so
+  [block discovery](#compilation-granularity) finds no stack and falls back to one
+  whole-model graph whose compile cost grows with layer count;
+- `module.layer_idx` is an `int` read inside the traced frame, so Dynamo specializes on
+  it. Even a stack it *did* find would compile once per layer instead of once per layer
+  class — the very sharing the per-block scheme exists for.
+
+`attach_attention_instances`, called from `load_model` after the device move, sets each
+layer as `hf_attention_module.attn` — the attribute name in-tree vLLM models use
+(`LlamaAttention.attn`) — and flips the config's `_attn_implementation` from upstream's
+`"vllm"` to `"vllm_spyre"`. That name resolves to `_spyre_vllm_attention_forward`, which
+is upstream's function with the dict lookup replaced by `getattr(module, "attn")`: the
+same expression in every layer, so the block traces once and the rest reuse it. A layer
+it could not attach keeps no `.attn` and is handed straight back to upstream, dict lookup
+and all.
+
+Sharing one artifact means only the first layer's Python frame ever runs, so anything
+upstream did per forward has to move out of the forward. Upstream copies the HF module's
+softmax scale onto `impl.scale` on every call, because `create_attention_instances`
+builds every layer with the Llama default `head_size ** -0.5`;
+`attach_attention_instances` does that copy once per layer instead. Without the move,
+layers 1..N of a model that does not derive its scale from `head_size` (Gemma 3's
+`query_pre_attn_scalar`, Granite's `attention_multiplier`) would silently keep the
+default.
+
+MLA is deliberately left alone: `vllm_mla_attention_forward` takes
+`(query, kv_c_normed, k_pe)` rather than `(query, key, value)`, and upstream already
+attaches those layers as `_vllm_mla_attn` submodules, so discovery finds them without
+help. Vision-tower attention is skipped too — it dispatches on its own sub-config, which
+is not `"vllm"`.
+
+Attachment runs unconditionally, not only when compiling, so eager and compiled runs take
+the same attention path. It has to run *after* `self.model.to(device)`: an `Attention`
+attached before it would be pulled onto Spyre with its new parent, and the runner
+deliberately keeps its buffers (`_k_scale`, `_v_scale`) on the host.
 
 ## Distributed (TP)
 

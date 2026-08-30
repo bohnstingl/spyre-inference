@@ -15,11 +15,15 @@
 """Spyre adaptation of vLLM's Transformers backend.
 
 Upstream's fusers replace HF's linear/norm/GLU modules with vLLM layers, which the Spyre
-OOT registrations pick up on their own. Two things are left to HF's module code:
+OOT registrations pick up on their own. Three things are left to HF's module code:
 
 * RoPE — there is no RoPE fuser, so HF's ``rotary_emb`` survives and derives cos/sin
   inside the forward from int64 ``position_ids``, a cast torch-spyre cannot lower.
   Replaced here with a precomputed rotation cache and a matmul-only rotation.
+* Attention — upstream keeps the vLLM ``Attention`` layers in a plain dict and indexes it
+  by ``layer_idx`` from inside the HF attention forward. ``attach_attention_instances``
+  turns them into submodules of the layers that use them, which is what lets the runner
+  compile one decoder layer and reuse it (see the module comment there).
 * Models shipping both ``config.json`` and ``params.json`` parse into a bare
   ``PretrainedConfig``, which HF cannot build a model from.
 """
@@ -29,14 +33,19 @@ from __future__ import annotations
 import functools
 import sys
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from vllm.logger import init_logger
-from vllm.model_executor.models.transformers import TransformersForCausalLM
+from vllm.model_executor.models.transformers import (
+    TransformersForCausalLM,
+    vllm_attention_forward,
+)
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
 
@@ -44,6 +53,207 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+# HF's registry name for upstream's attention interface, and for the Spyre one below.
+_VLLM_ATTN_IMPL = "vllm"
+SPYRE_ATTN_IMPL = "vllm_spyre"
+
+# Attribute each layer's vLLM ``Attention`` is attached to. Deliberately the name in-tree
+# vLLM models use (``LlamaAttention.attn``), so both paths present the same module tree to
+# block discovery, to ``named_modules()`` walks and to a state dict.
+VLLM_ATTN_ATTR = "attn"
+
+
+def _spyre_vllm_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    scaling: float | None = None,
+    attention_instances: dict[int, nn.Module] | None = None,
+    **kwargs,
+):
+    """``vllm_attention_forward`` reading the layer off *module* rather than out of a dict.
+
+    Upstream resolves it as ``attention_instances[module.layer_idx]``. Inside a compiled
+    decoder layer that ``int`` becomes a Dynamo guard, so layer 1 fails layer 0's guards
+    and every layer traces to a graph of its own — which is exactly the artifact reuse
+    ``SPYRE_COMPILE_GRANULARITY=block`` exists to get. Reading a submodule is the same
+    expression in every layer, which is why in-tree vLLM models share one artifact.
+
+    The reshaping below mirrors upstream's ``vllm_attention_forward``
+    (``vllm/model_executor/models/transformers/__init__.py``) — keep the two in step on a
+    vLLM bump. Two deliberate differences beyond the lookup: a layer
+    ``attach_attention_instances`` could not reach has no attribute to read and is handed
+    back to upstream, dict lookup and all; and *scaling* is ignored, because
+    ``attach_attention_instances`` has already copied it onto ``impl.scale`` (see
+    ``_copy_attention_scale``).
+    """
+    self_attn = getattr(module, VLLM_ATTN_ATTR, None)
+    if self_attn is None:
+        return vllm_attention_forward(
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            scaling=scaling,
+            attention_instances=attention_instances,
+            **kwargs,
+        )
+
+    hidden = query.shape[-2]
+    head_dim_qk = query.shape[-1]
+    head_dim_v = value.shape[-1]
+    query, key, value = (x.transpose(1, 2) for x in (query, key, value))
+    query, key, value = (x.reshape(hidden, -1) for x in (query, key, value))
+    # Pad `value` up to the query/key head size when it is smaller (expanded MLA). A
+    # larger last dim just means `value` isn't split per head, e.g. packed
+    # grouped/multi-query projections, and needs no padding.
+    pad_value = head_dim_v < head_dim_qk
+    if pad_value:
+        value = F.pad(value.view(-1, head_dim_v), (0, head_dim_qk - head_dim_v))
+        value = value.reshape(hidden, -1)
+    attn_output = self_attn.forward(query, key, value)
+    if pad_value:
+        attn_output = attn_output.view(-1, head_dim_qk)[..., :head_dim_v]
+        attn_output = attn_output.reshape(hidden, -1)
+    return attn_output, None
+
+
+ALL_ATTENTION_FUNCTIONS.register(SPYRE_ATTN_IMPL, _spyre_vllm_attention_forward)
+
+
+def _dispatches_through_vllm(module: nn.Module) -> Any | None:
+    """The config *module* dispatches attention on, when that is upstream's vLLM interface.
+
+    HF reads ``self.config._attn_implementation`` per call, so this is also the switch that
+    routes a layer to the Spyre interface. ``vllm_mla`` is left alone: its interface takes
+    ``(query, kv_c_normed, k_pe)`` rather than ``(query, key, value)``, and upstream
+    already attaches those layers as ``_vllm_mla_attn`` submodules, so block discovery
+    finds them without help from here.
+    """
+    config = getattr(module, "config", None)
+    impl = getattr(config, "_attn_implementation", None)
+    return config if impl in (_VLLM_ATTN_IMPL, SPYRE_ATTN_IMPL) else None
+
+
+def _copy_attention_scale(module: nn.Module, instance: nn.Module) -> None:
+    """Copy the HF module's softmax scale onto the vLLM layer, once, outside the forward.
+
+    ``create_attention_instances`` builds every layer with the Llama default
+    ``head_size ** -0.5`` and lets ``vllm_attention_forward`` correct it from the HF
+    module's own ``scaling`` on every call. That correction cannot survive per-block
+    sharing: with one artifact serving the whole stack, only the first layer's Python
+    frame ever runs, so layers 1..N would keep the default — silently wrong for any model
+    that does not derive its scale from ``head_size`` (Gemma 3's
+    ``query_pre_attn_scalar``, Granite's ``attention_multiplier``). Doing it here instead
+    is per-layer and runs before anything traces.
+
+    ``fix_padded_attention_scale`` already keeps ``module.scaling`` and ``impl.scale`` in
+    step for the head_dim-padded case, for exactly the same reason, so it is safe to run
+    after: the two values it wrote are equal.
+    """
+    scaling = getattr(module, "scaling", None)
+    if scaling is None:
+        scaling = getattr(module, "scale", None)
+    impl = getattr(instance, "impl", None)
+    if impl is not None and isinstance(scaling, (int, float)) and not isinstance(scaling, bool):
+        impl.scale = float(scaling)
+
+
+def attach_attention_instances(model: nn.Module) -> int:
+    """Make the Transformers backend's vLLM ``Attention`` layers submodules of their layer.
+
+    Upstream builds them into ``model.attention_instances``, a plain ``dict`` that
+    ``nn.Module.__setattr__`` never registers, and reaches them from the HF attention
+    forward by ``attention_instances[module.layer_idx]``. Both halves of that cost the
+    runner its per-layer compile granularity:
+
+    * nothing under a decoder layer is a vLLM ``Attention``, so ``_repeated_block_lists``
+      finds no block stack at all and ``_compile_for_spyre`` falls back to one whole-model
+      graph whose compile cost grows with layer count;
+    * the ``layer_idx`` index guards each layer's graph separately, so even a block stack
+      it *did* find would compile once per layer instead of once per layer class.
+
+    Attaching each layer to the HF attention module that uses it fixes both: discovery
+    matches structurally, and ``_spyre_vllm_attention_forward`` reads the submodule
+    instead of indexing. Called once per load, after weight loading and the device move —
+    an ``Attention`` attached earlier would be pulled onto Spyre with its parent, and the
+    runner deliberately keeps its buffers on the host.
+
+    Sharing one artifact also means only the first layer's Python frame ever runs, so
+    everything upstream did per forward has to move out here; ``_copy_attention_scale``
+    is the one such thing.
+
+    Returns the number of layers attached, 0 when *model* carries no
+    ``attention_instances`` (not a Transformers-backend model, nothing to do).
+    """
+    instances = getattr(model, "attention_instances", None)
+    if not instances:
+        return 0
+
+    attached: list[str] = []
+    configs: dict[int, Any] = {}
+    # Materialized: attaching mutates the ``_modules`` dicts this would otherwise walk.
+    for name, module in list(model.named_modules()):
+        index = getattr(module, "layer_idx", None)
+        # HF names the module that dispatches attention ``<Model>Attention`` exactly;
+        # ``endswith`` rather than ``in`` so a wrapper such as Zamba2's
+        # ``Zamba2AttentionDecoderLayer`` -- which also carries a ``layer_idx`` and a
+        # ``config`` -- does not collect a second, redundant ``.attn``. A vision tower's
+        # attention passes this but is dropped by the interface check below, because it
+        # dispatches on its own sub-config.
+        if not type(module).__name__.endswith("Attention") or not isinstance(index, int):
+            continue
+        instance = instances.get(index)
+        config = _dispatches_through_vllm(module)
+        if instance is None or config is None:
+            continue
+
+        existing = getattr(module, VLLM_ATTN_ATTR, None)
+        if existing is not None and existing is not instance:
+            logger.warning(
+                "%s already owns a .%s; leaving it on upstream's dict lookup.",
+                name,
+                VLLM_ATTN_ATTR,
+            )
+            continue
+        if existing is None:
+            setattr(module, VLLM_ATTN_ATTR, instance)
+        _copy_attention_scale(module, instance)
+        configs[id(config)] = config
+        attached.append(name)
+
+    if not attached:
+        logger.warning(
+            "Transformers backend: none of the %d vLLM Attention layers could be matched "
+            "to an HF attention module, so they stay in attention_instances. Per-block "
+            "compile will fall back to a whole-model graph.",
+            len(instances),
+        )
+        return 0
+
+    for config in configs.values():
+        config._attn_implementation = SPYRE_ATTN_IMPL
+
+    if len(attached) != len(instances):
+        logger.warning(
+            "Transformers backend: attached %d of %d vLLM Attention layers; the rest keep "
+            "upstream's per-layer dict lookup and compile a graph each.",
+            len(attached),
+            len(instances),
+        )
+    logger.info(
+        "Transformers backend: attached %d vLLM Attention layers as .%s submodules; "
+        "attention dispatches through %r.",
+        len(attached),
+        VLLM_ATTN_ATTR,
+        SPYRE_ATTN_IMPL,
+    )
+    return len(attached)
 
 
 def _build_rotation_cache(

@@ -240,6 +240,97 @@ def test_patched_apply_rotary_leaves_stock_hf_callers_working():
         modeling_llama.apply_rotary_pos_emb = original
 
 
+def test_attach_finds_the_attention_modules_of_a_real_hf_stack():
+    """``attach_attention_instances`` recognises HF's attention modules by class name,
+    ``layer_idx`` and config — a heuristic only real ``modeling_*.py`` code can confirm.
+
+    The graph-count consequences are covered against a synthetic stack in
+    ``tests/runtime/test_compile_granularity.py``; what this pins down is that the
+    heuristic still matches what HF actually builds.
+    """
+    from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    from spyre_inference.transformers_backend import (
+        SPYRE_ATTN_IMPL,
+        attach_attention_instances,
+    )
+    from spyre_inference.v1.worker.spyre_model_runner import _repeated_block_lists
+
+    def fake_attention() -> Attention:
+        """Skips ``Attention.__init__``, which needs a full model config."""
+        attn = Attention.__new__(Attention)
+        torch.nn.Module.__init__(attn)
+        return attn
+
+    cfg = LlamaConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_hidden_layers=3,
+        intermediate_size=64,
+        vocab_size=100,
+        head_dim=8,
+        max_position_embeddings=64,
+    )
+    # What vLLM's `Base._patch_config` does, and the only reason attach touches a layer.
+    cfg._attn_implementation = "vllm"
+
+    class _Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = LlamaModel(cfg)
+            # A plain dict, exactly as `create_attention_instances` returns it.
+            self.attention_instances = {i: fake_attention() for i in range(cfg.num_hidden_layers)}
+
+    wrapper = _Wrapper()
+    assert _repeated_block_lists(wrapper) == [], "the dict is invisible to the module tree"
+
+    assert attach_attention_instances(wrapper) == cfg.num_hidden_layers
+
+    for i, layer in enumerate(wrapper.model.layers):
+        assert isinstance(layer.self_attn, LlamaAttention)
+        # Registered as a submodule, not just an attribute -- that is what discovery sees.
+        assert layer.self_attn._modules["attn"] is wrapper.attention_instances[i]
+    assert cfg._attn_implementation == SPYRE_ATTN_IMPL
+    assert _repeated_block_lists(wrapper) == [wrapper.model.layers]
+
+
+def test_no_plugin_module_imports_this_backend_at_module_scope():
+    """This module has to stay lazily imported.
+
+    It is only reachable through ``model_impl="transformers"``, it pulls HF's modeling
+    machinery in, and importing it registers a global attention interface with
+    ``ALL_ATTENTION_FUNCTIONS``. ``register_ops`` therefore names it as an import *string*
+    (`spyre_inference/__init__.py`), and the one caller that needs a symbol from it --
+    ``load_model``'s ``attach_attention_instances`` -- imports it inside the function.
+    """
+    import ast
+    from pathlib import Path
+
+    import spyre_inference
+
+    root = Path(spyre_inference.__file__).parent
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        # Module scope only: ast.walk would also reach the deliberate local imports.
+        for node in tree.body:
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            if any("transformers_backend" in name for name in names):
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+
+    assert offenders == [], (
+        "these modules import spyre_inference.transformers_backend at module scope; "
+        f"move the import into the function that needs it: {offenders}"
+    )
+
+
 PROMPTS = [
     "Hello, my name is",
     "The capital of France is",

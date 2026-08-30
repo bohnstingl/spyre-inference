@@ -51,6 +51,7 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
@@ -248,6 +249,17 @@ def _block_sharing_defeated_by() -> str | None:
 
 
 def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
+    """The ``nn.ModuleList``s of repeated layers, found by the attention they own.
+
+    ``AttentionLayerBase`` rather than ``Attention`` is the predicate on purpose: it is
+    what vLLM keys KV-cache group discovery off, so it covers every layer that holds
+    per-layer state — ``Attention``, ``EncoderOnlyAttention``, ``MLAAttention`` (DeepSeek,
+    Kimi) and the Mamba mixers of a hybrid stack — rather than just full attention.
+
+    A Transformers-backend model only reaches here with its layers owning an ``Attention``
+    once ``attach_attention_instances`` has run; upstream keeps them in a plain dict that
+    ``named_modules()`` cannot see.
+    """
     block_lists = []
     for module in model.modules():
         if not isinstance(module, nn.ModuleList):
@@ -257,11 +269,11 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
-        if any(isinstance(b, Attention) for b in blocks):
+        if any(isinstance(b, AttentionLayerBase) for b in blocks):
             continue
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
-        if any(isinstance(m, Attention) for b in blocks for m in b.modules()):
+        if any(isinstance(m, AttentionLayerBase) for b in blocks for m in b.modules()):
             block_lists.append(module)
     return block_lists
 
@@ -481,6 +493,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
+        # Transformers backend only: hang its vLLM Attention layers off the HF attention
+        # modules that use them, so the decoder layers below look like an in-tree model's
+        # to _repeated_block_lists and to Dynamo. Unconditional, so eager and compiled runs
+        # take the same attention path -- and last, because an Attention attached before
+        # the .to() above would follow its new parent onto the device. Imported here, not
+        # at module scope, to keep transformers_backend (and the HF import it pulls in)
+        # off the path of a run that never uses it.
+        from spyre_inference.transformers_backend import attach_attention_instances
+
+        attach_attention_instances(self.model)
+
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
@@ -592,8 +615,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 return
             logger.warning(
                 "Found no attention-bearing block ModuleList in %s; falling back to a "
-                "whole-model graph. Models whose attention is not a vLLM Attention "
-                "(MLA, encoder-only vision towers) take this path.",
+                "whole-model graph, whose compile cost grows with layer count. Models "
+                "with no repeated attention-bearing layer stack (encoder-only vision "
+                "towers), and Transformers-backend models whose Attention layers could "
+                "not be attached, take this path.",
                 model_name,
             )
 
