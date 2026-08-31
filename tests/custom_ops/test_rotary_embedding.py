@@ -69,6 +69,7 @@ def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
 def test_llama3_rotary_oot_registration(default_vllm_config):
     """Verify get_rope(rope_type='llama3') resolves to SpyreLlama3RotaryEmbedding."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
+
     from spyre_inference.custom_ops.rotary_embedding import SpyreLlama3RotaryEmbedding
 
     rope = get_rope(
@@ -93,6 +94,7 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     pure-view rotation path."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
     from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
 
     torch.manual_seed(11)
@@ -320,6 +322,7 @@ def test_rotary_non_neox_config_raises(default_vllm_config):
 def test_yarn_rotary_oot_registration(default_vllm_config):
     """Verify get_rope(rope_type='yarn') resolves to SpyreYaRNScalingRotaryEmbedding."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
+
     from spyre_inference.custom_ops.rotary_embedding import SpyreYaRNScalingRotaryEmbedding
 
     rope = get_rope(
@@ -365,6 +368,7 @@ def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_para
     from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
         YaRNScalingRotaryEmbedding,
     )
+
     from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
 
     torch.manual_seed(77)
