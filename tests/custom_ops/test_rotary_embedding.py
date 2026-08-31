@@ -441,6 +441,7 @@ def test_gemma4_rotary_oot_registration(default_vllm_config, head_size):
     """Verify get_rope(rope_type='proportional') resolves to SpyreGemma4RotaryEmbedding
     and sets rotary_dim==head_size (satisfying the mixin's guard, not raising)."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
+
     from spyre_inference.custom_ops.rotary_embedding import SpyreGemma4RotaryEmbedding
 
     rope = get_rope(
@@ -468,6 +469,7 @@ def test_gemma4_rotation_math_matches_reference_cpu(default_vllm_config, head_si
     non-rotated identity frequencies. Runs where the forward_oot test skips."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
     from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
 
     torch.manual_seed(31)
