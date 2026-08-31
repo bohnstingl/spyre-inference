@@ -332,7 +332,10 @@ class TorchSpyrePlatform(CpuPlatform):
         ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
         ``config.head_dim`` and uses ``out_proj``).
         """
-        from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
+        from spyre_inference.custom_ops.head_pad import (
+            configured_head_dims,
+            reduced_rotary_dim_reason,
+        )
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
@@ -346,9 +349,18 @@ class TorchSpyrePlatform(CpuPlatform):
         if not any(getattr(c, "rope_parameters", None) for c in cfgs):
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
-        if orig % 128 == 0:
-            return
+        head_dims = configured_head_dims(hf_config) or {hidden_size // num_heads}
+        if all(head_dim % 128 == 0 for head_dim in head_dims):
+            return  # nothing to align, whether the widths vary per layer or not
+        if len(head_dims) > 1:
+            # The override below is a single global width, so a model whose layers
+            # disagree would come out padded to one of them everywhere.
+            raise NotImplementedError(
+                f"Spyre must pad attention head_dim to a 128-multiple for stick "
+                f"alignment, but this model sizes heads per layer "
+                f"({sorted(head_dims)}) and padding is global."
+            )
+        orig = head_dims.pop()
 
         padded = ((orig + 127) // 128) * 128
         for cfg in (hf_config, model_config.hf_text_config):

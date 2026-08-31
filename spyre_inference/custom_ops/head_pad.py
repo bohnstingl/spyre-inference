@@ -53,6 +53,22 @@ def head_padding_active(hf_config) -> bool:
     return original_head_dim(hf_config) is not None
 
 
+def configured_head_dims(cfg) -> set[int]:
+    """Every distinct attention head width *cfg* configures.
+
+    transformers 5.x lets a model size attention per layer — Gemma 4 rotates 256 dims
+    per head on its sliding layers and 512 on its global ones — and a config that does
+    rejects a plain ``cfg.head_dim`` read as ambiguous
+    (``AmbiguousGlobalPerLayerAttributeError``) rather than answering with the global
+    value. Ask the per-layer views whenever there are any; empty when the config sizes
+    heads from ``hidden_size`` instead.
+    """
+    if "head_dim" in (getattr(cfg, "per_layer_attributes", None) or ()):
+        return {layer.head_dim for layer in cfg.per_layer_config}
+    head_dim = getattr(cfg, "head_dim", None)
+    return {head_dim} if head_dim else set()
+
+
 def reduced_rotary_dim_reason(cfg) -> str | None:
     """If any custom rope configs exist that would rotate fewer than `head_dim` dims,
     this returns a string with the offending configs.
