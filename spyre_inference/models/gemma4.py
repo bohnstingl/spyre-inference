@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 
@@ -35,9 +35,9 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     """
     ov = engine_args.hf_overrides
     user_arch = callable(ov) or (isinstance(ov, dict) and "architectures" in ov)
-    if "gemma-4" in (engine_args.model or "").lower() and not user_arch:
-        base = ov if isinstance(ov, dict) else {}
-        engine_args.hf_overrides = {**base, "architectures": ["Gemma4ForCausalLM"]}
+    if "gemma-4" in (engine_args.model or "").lower() and not user_arch and isinstance(ov, dict):
+        overrides = cast("dict[str, Any]", ov)
+        overrides["architectures"] = ["Gemma4ForCausalLM"]
         logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
