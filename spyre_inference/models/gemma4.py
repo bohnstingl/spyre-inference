@@ -16,9 +16,29 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm.logger import init_logger
 
+if TYPE_CHECKING:
+    from vllm.engine.arg_utils import EngineArgs
+
 logger = init_logger(__name__)
+
+
+def force_text_backbone(engine_args: EngineArgs) -> None:
+    """Default gemma-4 to its text-only backbone (it ships multimodal).
+
+    Sets ``hf_overrides["architectures"]`` so ``create_model_config`` resolves
+    ``Gemma4ForCausalLM`` instead of the multimodal default. Skipped when the user
+    already pinned an architecture (dict or callable ``hf_overrides``).
+    """
+    ov = engine_args.hf_overrides
+    user_arch = callable(ov) or (isinstance(ov, dict) and "architectures" in ov)
+    if "gemma-4" in (engine_args.model or "").lower() and not user_arch:
+        base = ov if isinstance(ov, dict) else {}
+        engine_args.hf_overrides = {**base, "architectures": ["Gemma4ForCausalLM"]}
+        logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
 def install_spyre_patches() -> None:

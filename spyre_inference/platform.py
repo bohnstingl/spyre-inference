@@ -133,44 +133,32 @@ class TorchSpyrePlatform(CpuPlatform):
         # to CpuPlatform.
         from vllm.engine.arg_utils import EngineArgs
 
-        def cap_max_num_seqs(original):
-            @functools.wraps(original)
-            def wrapper(self, usage_context, model_config, parallel_config):
-                user_supplied = self.max_num_seqs is not None
-                original(self, usage_context, model_config, parallel_config)
-                if not user_supplied and self.max_num_seqs is not None:
-                    self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+        original = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+        if getattr(original, "_spyre_patched", False):
+            return
 
-            return wrapper
+        @functools.wraps(original)
+        def _spyre_patched(self, usage_context, model_config, parallel_config):
+            user_supplied = self.max_num_seqs is not None
+            original(self, usage_context, model_config, parallel_config)
+            if not user_supplied and self.max_num_seqs is not None:
+                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
 
-        def force_gemma4_text_backbone(original):
-            # gemma-4 ships multimodal; force the text-only backbone (unless the user
-            # set architectures) via hf_overrides, read by create_model_config before load.
-            @functools.wraps(original)
-            def wrapper(self):
-                ov = self.hf_overrides
-                user_arch = callable(ov) or (isinstance(ov, dict) and "architectures" in ov)
-                if "gemma-4" in (self.model or "").lower() and not user_arch:
-                    base = ov if isinstance(ov, dict) else {}
-                    self.hf_overrides = {**base, "architectures": ["Gemma4ForCausalLM"]}
-                    logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
-                return original(self)
+        _spyre_patched._spyre_patched = True
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
 
-            return wrapper
+        # Delegate per-model EngineArgs overrides (e.g. text-only backbone
+        # selection) to spyre_inference.models before ModelConfig is built.
+        create_model_config = EngineArgs.create_model_config
 
-        # Idempotent: the marker guards re-patching across engine inits. Both marker and
-        # method are set via setattr with a non-constant name to dodge ty/ruff B010.
-        marker = "_spyre_patched"
-        for name, make_wrapper in (
-            ("_set_default_max_num_seqs_and_batched_tokens_args", cap_max_num_seqs),
-            ("create_model_config", force_gemma4_text_backbone),
-        ):
-            original = getattr(EngineArgs, name)
-            if getattr(original, marker, False):
-                continue
-            wrapper = make_wrapper(original)
-            setattr(wrapper, marker, True)
-            setattr(EngineArgs, name, wrapper)
+        @functools.wraps(create_model_config)
+        def _spyre_create_model_config(self):
+            from spyre_inference.models import apply_prelaunch_overrides
+
+            apply_prelaunch_overrides(self)
+            return create_model_config(self)
+
+        EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
 
     @classmethod
     def import_kernels(cls) -> None:
