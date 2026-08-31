@@ -76,14 +76,14 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
-    """CPU-only: host gather + _rotate_neox_2x2 match forward_native without a
+    """CPU-only: host gather + rotate_neox_2x2 match forward_native without a
     Spyre device, so the core rotation formula is validated on dev laptops where the
     forward_oot tests skip. Stick-aligned inner dims (128->64, 256->128) exercise the
     pure-view rotation path."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
-    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
+    from spyre_inference.custom_ops.rotary_embedding import rotate_neox_2x2
 
     torch.manual_seed(11)
     max_position, num_tokens, num_heads = 2048, 32, 4
@@ -95,8 +95,8 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
 
     rot = rope._get_rotation_cache().index_select(0, positions).to(torch.float16)
     assert rot.device.type == "cpu"
-    actual_query = _rotate_neox_2x2(query, rot, head_size)
-    actual_key = _rotate_neox_2x2(key, rot, head_size)
+    actual_query = rotate_neox_2x2(query, rot, head_size)
+    actual_key = rotate_neox_2x2(key, rot, head_size)
 
     expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
     torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
@@ -349,7 +349,7 @@ def test_yarn_rotary_oot_registration(default_vllm_config):
 )
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_params, head_size):
-    """CPU-only: host gather + _rotate_neox_2x2 match forward_native for YaRN,
+    """CPU-only: host gather + rotate_neox_2x2 match forward_native for YaRN,
     validating that the scaled cos/sin cache produced by YaRN is correctly transformed
     into the 2x2 rotation matrix format across different scaling factors and parameters."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -357,7 +357,7 @@ def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_para
         YaRNScalingRotaryEmbedding,
     )
 
-    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
+    from spyre_inference.custom_ops.rotary_embedding import rotate_neox_2x2
 
     torch.manual_seed(77)
     max_position = int(yarn_params["original_max_position_embeddings"] * yarn_params["factor"])
@@ -376,8 +376,8 @@ def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_para
 
     rot = rope._get_rotation_cache().index_select(0, positions).to(torch.float16)
     assert rot.device.type == "cpu"
-    actual_query = _rotate_neox_2x2(query, rot, head_size)
-    actual_key = _rotate_neox_2x2(key, rot, head_size)
+    actual_query = rotate_neox_2x2(query, rot, head_size)
+    actual_key = rotate_neox_2x2(key, rot, head_size)
 
     expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
         rope, positions, query, key

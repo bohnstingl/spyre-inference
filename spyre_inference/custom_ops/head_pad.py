@@ -24,8 +24,9 @@ and the attention scale.
 
 Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
 rotation cache keeps the original frequencies. The Transformers backend shares the
-weight passes here; it rebuilds its own rotation cache in ``transformers_backend``,
-since HF's rotary module is not the one ``fix_padded_rope`` reaches.
+weight passes here, but not ``fix_padded_rope``: it takes its frequencies from the
+HF rotary module it replaces, which already has them at the pre-pad width, and
+``fix_padded_rope`` skips those instances.
 """
 
 from __future__ import annotations
@@ -342,8 +343,14 @@ def fix_padded_rope(model, hf_config) -> None:
     a reference rope at the original head_dim (reusing vLLM's rope-scaling dispatch
     for correct Llama3/YaRN frequencies) and swap its narrower cos_sin_cache in.
     ``SpyreRotaryEmbedding._get_rotation_cache`` then derives the real rotations
-    from it and zero-pads the trailing dims (harmless — the matching x pair dims
-    are zero from weight padding).
+    from it and identity-pads the trailing dims, so the padded lanes pass through.
+
+    Ropes whose frequencies were injected rather than computed by ``get_rope`` are
+    skipped: the Transformers backend builds them from the HF rotary module's own
+    ``inv_freq``, already at the pre-pad width, and recomputing here would swap HF's
+    frequencies for whatever vLLM's rope-scaling dispatch makes of ``rope_parameters``
+    — which for a model whose ``rope_parameters`` is keyed per layer type is an
+    unscaled default.
     """
     if not head_padding_active(hf_config):
         return
@@ -359,6 +366,8 @@ def fix_padded_rope(model, hf_config) -> None:
         if not hasattr(module, "_rotation_cache") or id(module) in seen:
             continue
         seen.add(id(module))
+        if getattr(module, "_frequencies_injected", False):
+            continue
         ref = get_rope(
             orig,
             max_position=max_position,

@@ -54,7 +54,7 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
 | `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` on Spyre since EA propagation (PR #2927) is correct compiled, but broken eager. |
-| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device, no opaque op. A device-resident 4D rotation cache (`[max_pos, 2, 2, rotary_dim//2]`) is built from `cos_sin_cache` and **primed on-device in `_apply` before `torch.compile`**; `forward_oot` then gathers this pass's per-token slice with `index_select` and applies the 2×2 rotation-matrix formulation (`_rotate_neox_2x2`) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise `NotImplementedError` at construction. The 2×2 inner dim `rotary_dim//2` must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below) |
+| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device, no opaque op. A device-resident 4D rotation cache (`[max_pos, 2, 2, rotary_dim//2]`) is built from `cos_sin_cache` and **primed on-device in `_apply` before `torch.compile`**; `forward_oot` then gathers this pass's per-token slice with `index_select` and applies the 2×2 rotation-matrix formulation (`rotate_neox_2x2`, shared with the [Transformers backend](#transformers-backend)) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise `NotImplementedError` at construction. The 2×2 inner dim `rotary_dim//2` must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre (mask on CPU when TP>1) | The weight moves to Spyre with the model and the embedding gather runs on-device (`aten.embedding` now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP>1, only the shard mask runs on CPU via the `spyre_vocab_mask` op (Spyre inductor rejects the upstream int64-vs-Python-int comparisons); `masked_input`/`keep` are `convert`ed back to Spyre before the gather and `all_reduce` |
 | `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
@@ -262,7 +262,32 @@ HF's `rotary_emb` survives and would derive cos/sin inside the forward from int6
 `position_ids`, a cast torch-spyre cannot lower. It is replaced with a precomputed
 `[max_model_len, 2, 2, head_dim/2]` rotation cache — built on the host and moved to the
 device before compile, leaving only an `index_select` in the graph — plus a matmul-based
-`apply_rotary_pos_emb`. Head padding is shared with the native path: the platform widens
+`apply_rotary_pos_emb`. That rotation is not a second implementation: `_SpyreRotaryEmbedding`
+is a routing wrapper holding one native-path `SpyreRotaryEmbedding` per HF layer type
+(an `nn.ModuleDict`, so `.to("spyre")` primes each device cache before compile), and the
+cache build, its identity padding, the rows-outermost placement and the on-device gather
+all live in `custom_ops/rotary_embedding.py`. What is specific to this path is only the
+adaptation to HF's interface, which splits RoPE across a module boundary — a module
+producing cos/sin, a module-level `apply_rotary_pos_emb` consuming them — where vLLM has
+one fused call.
+
+The frequencies come from the HF rotary module's own `inv_freq` and `attention_scaling`
+buffers rather than from `get_rope` (`rotary_from_inv_freq`). HF has already applied
+whatever scaling `rope_parameters` asked for, so llama3, yarn, longrope and dynamic all
+arrive as plain frequencies; going through `get_rope` would recompute them from a
+`rope_type` string, and the types with no Spyre OOT class registered would resolve to an
+in-tree vLLM class whose `forward_oot` falls through to the `rotate_half` cat that does
+not lower on Spyre. Such an instance is marked `_frequencies_injected`, which is how
+`fix_padded_rope` knows to leave it alone.
+
+Two details follow from multimodal models: the module sweep is scoped to the text
+backbone, since a vision or audio tower's rotary embedding is over its own coordinates
+(2-D over patch positions, say) and no text cache can stand in for it; and the
+`apply_rotary_pos_emb` replacement dispatches on the wrapped function's signature,
+because HF spells it both as one call taking Q and K together and as one call per tensor,
+pre-transpose at `[B, L, H, D]`.
+
+Head padding is shared with the native path: the platform widens
 `head_dim` and the weight passes in `head_pad.py` pad Q/K interleaved, so this backend
 only has to rebuild the rotation cache at the pre-pad frequencies.
 

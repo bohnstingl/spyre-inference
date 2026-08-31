@@ -185,8 +185,112 @@ def test_layer_typed_rope_rotates_each_layer_type_at_its_own_frequencies():
         torch.testing.assert_close(k_rot, k_ref, rtol=1e-5, atol=1e-5)
 
     assert not torch.allclose(
-        spyre_rope._caches["full_attention"], spyre_rope._caches["sliding_attention"]
+        spyre_rope._ropes["full_attention"]._get_rotation_cache(),
+        spyre_rope._ropes["sliding_attention"]._get_rotation_cache(),
     ), "one cache serving both layer types is the bug this guards"
+
+
+def _gemma4_text_config():
+    """A Gemma 4 text config. Its rope is layer-typed like Gemma 3's, but the two types
+    also rotate at *different widths*: full-attention layers use ``global_head_dim``,
+    and their proportional rope zero-pads ``inv_freq`` back out to it."""
+    from transformers import Gemma4TextConfig
+
+    return Gemma4TextConfig(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        num_hidden_layers=4,
+        intermediate_size=64,
+        vocab_size=100,
+        head_dim=8,
+        max_position_embeddings=64,
+    )
+
+
+def test_single_tensor_rope_rotates_q_and_k_one_call_at_a_time():
+    """Some models spell ``apply_rotary_pos_emb`` as one call per tensor, pre-transpose at
+    ``[B, L, H, D]`` — Gemma 4 is the one used here. Binding that call to the Q/K-pair form
+    silently reads the rotation as ``k`` and rotates by ``None``, so the dispatch has to
+    tell the two forms apart.
+    """
+    from transformers.models.gemma4 import modeling_gemma4
+
+    from spyre_inference.transformers_backend import (
+        _rope_dispatch,
+        _rope_frequencies,
+        _SpyreRotaryEmbedding,
+    )
+
+    cfg = _gemma4_text_config()
+    hf_rope = modeling_gemma4.Gemma4TextRotaryEmbedding(cfg)
+    freqs = _rope_frequencies(hf_rope)
+    assert sorted(freqs) == ["full_attention", "sliding_attention"]
+
+    patched = _rope_dispatch(modeling_gemma4.apply_rotary_pos_emb)
+    spyre_rope = _SpyreRotaryEmbedding(hf_rope, cfg.max_position_embeddings, None, torch.float32)
+
+    torch.manual_seed(0)
+    batch, seq, heads = 2, 5, 4
+    position_ids = torch.arange(seq).expand(batch, seq)
+    x = torch.randn(batch, seq, cfg.hidden_size)
+
+    widths = set()
+    for layer_type in ("full_attention", "sliding_attention"):
+        # The width this layer type rotates at, which is per-type here.
+        head_dim = 2 * freqs[layer_type][0].shape[0]
+        widths.add(head_dim)
+        q = torch.randn(batch, seq, heads, head_dim)
+        k = torch.randn(batch, seq, cfg.num_key_value_heads, head_dim)
+
+        cos, sin = hf_rope(x, position_ids, layer_type)
+        q_ref = modeling_gemma4.apply_rotary_pos_emb(q, cos, sin, unsqueeze_dim=2)
+        k_ref = modeling_gemma4.apply_rotary_pos_emb(k, cos, sin, unsqueeze_dim=2)
+
+        rotation, second = spyre_rope(x, position_ids, layer_type)
+        assert second is None
+        # Exactly how Gemma4TextAttention.forward calls it, `sin` positional.
+        q_rot = patched(q, rotation, second, unsqueeze_dim=2)
+        k_rot = patched(k, rotation, second, unsqueeze_dim=2)
+
+        torch.testing.assert_close(q_rot, q_ref, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(k_rot, k_ref, rtol=1e-5, atol=1e-5)
+
+    assert len(widths) == 2, "the point of this config is that the types differ in width"
+
+    # A heads axis anywhere else would rotate across heads instead of within them, so it
+    # has to fail loudly rather than return a plausible-looking tensor.
+    rotation, _ = spyre_rope(x, position_ids, "sliding_attention")
+    with pytest.raises(NotImplementedError, match="heads axis"):
+        patched(torch.randn(batch, seq, heads, 8), rotation, None, unsqueeze_dim=1)
+
+
+def test_a_multidimensional_rope_caller_still_gets_hfs_rotation():
+    """A multimodal model's towers reach the same patched module-level function through
+    ``apply_multidimensional_rope``, with all arguments passed by keyword. Those calls
+    carry a real ``sin`` and must fall through untouched."""
+    from transformers.models.gemma4 import modeling_gemma4
+
+    from spyre_inference.transformers_backend import _rope_dispatch
+
+    torch.manual_seed(0)
+    batch, seq, heads, head_dim = 1, 4, 2, 16
+    x = torch.randn(batch, seq, heads, head_dim)
+    # 2-D positions: patch coordinates, which is what makes the rope multidimensional.
+    position_ids = torch.stack([torch.arange(seq), torch.arange(seq)], dim=-1).unsqueeze(0)
+    cos = torch.randn(batch, seq, head_dim)
+    sin = torch.randn(batch, seq, head_dim)
+
+    original = modeling_gemma4.apply_rotary_pos_emb
+    reference = modeling_gemma4.apply_multidimensional_rope(x, cos, sin, position_ids)
+
+    modeling_gemma4.apply_rotary_pos_emb = _rope_dispatch(original)
+    try:
+        after = modeling_gemma4.apply_multidimensional_rope(x, cos, sin, position_ids)
+    finally:
+        modeling_gemma4.apply_rotary_pos_emb = original
+
+    torch.testing.assert_close(after, reference, rtol=0, atol=0)
 
 
 def test_patched_apply_rotary_leaves_stock_hf_callers_working():
@@ -399,3 +503,101 @@ def test_fix_generic_config_leaves_an_hf_format_repo_alone(tmp_path):
 
     assert vllm_config.model_config.hf_config is before
     assert vllm_config.load_config.load_format == "auto"
+
+
+def test_patch_rope_leaves_a_vision_towers_own_rotary_embedding_alone():
+    """A tower rotates over its own coordinates — Gemma 4's vision rope is 2-D over patch
+    positions — so the text rotation cache cannot stand in for it and the sweep that
+    installs that cache has to stop at the text backbone."""
+    from transformers import Gemma4VisionConfig
+    from transformers.models.gemma4 import modeling_gemma4
+
+    from spyre_inference.transformers_backend import (
+        SpyreTransformersForCausalLM,
+        _SpyreRotaryEmbedding,
+    )
+
+    text_cfg = _gemma4_text_config()
+    vision_cfg = Gemma4VisionConfig(
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=32,
+        image_size=16,
+        patch_size=8,
+    )
+
+    class _TextBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = text_cfg
+            self.rotary_emb = modeling_gemma4.Gemma4TextRotaryEmbedding(text_cfg)
+            self.embed_tokens = torch.nn.Embedding(8, text_cfg.hidden_size)
+
+    class _VisionTower(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = modeling_gemma4.Gemma4VisionRotaryEmbedding(vision_cfg)
+
+    class _Nested(torch.nn.Module):
+        """Stands in for Gemma4Model, whose towers sit beside the text backbone."""
+
+        def __init__(self):
+            super().__init__()
+            self.language_model = _TextBackbone()
+            self.vision_tower = _VisionTower()
+
+    class _Outer(torch.nn.Module):
+        """Stands in for Gemma4ForConditionalGeneration, the extra level of nesting."""
+
+        def __init__(self):
+            super().__init__()
+            self.model = _Nested()
+            self.config = text_cfg
+
+    class _Backend:
+        """Only what _patch_rope reads off the backend instance."""
+
+        def __init__(self, model):
+            self.model = model
+            self._max_position = text_cfg.max_position_embeddings
+
+    outer = _Outer()
+    text_rope = outer.model.language_model.rotary_emb
+    vision_rope = outer.model.vision_tower.rotary_emb
+
+    SpyreTransformersForCausalLM._patch_rope(_Backend(outer))
+
+    assert isinstance(outer.model.language_model.rotary_emb, _SpyreRotaryEmbedding)
+    assert outer.model.language_model.rotary_emb is not text_rope
+    assert outer.model.vision_tower.rotary_emb is vision_rope
+
+
+def test_patch_rope_is_a_no_op_for_a_backbone_that_does_not_rotate():
+    """BERT-family encoders position with learned embeddings and register no rotary_emb.
+    The pooling backend classes reach them, so this has to be skipped, not crashed on."""
+    from transformers import BertConfig
+    from transformers.models.bert.modeling_bert import BertModel
+
+    from spyre_inference.transformers_backend import SpyreTransformersForCausalLM
+
+    class _Backend:
+        def __init__(self, model):
+            self.model = model
+            self._max_position = 64
+
+    model = BertModel(
+        BertConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=32,
+            max_position_embeddings=64,
+        )
+    )
+    assert not any("Rotary" in type(m).__name__ for m in model.modules())
+
+    SpyreTransformersForCausalLM._patch_rope(_Backend(model))
+
+    assert not hasattr(model, "rotary_emb"), "nothing may be installed where nothing rotates"

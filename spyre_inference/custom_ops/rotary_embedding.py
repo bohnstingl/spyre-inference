@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for RotaryEmbedding.
+"""Spyre RoPE: the OOT replacement for RotaryEmbedding, and the rotation both paths share.
 
 Applies neox RoPE on Spyre via a 2x2 rotation-matrix formulation (ported from
 foundation-model-stack). The rotation cache is device-resident; ``forward_oot`` gathers
-this pass's per-token slice with ``index_select`` and applies it with ``_rotate_neox_2x2``,
+this pass's per-token slice with ``index_select`` and applies it with ``rotate_neox_2x2``,
 both directly in the full-model compile graph.
 
 The cache must be materialized on-device *before* compile: building it inside the traced
@@ -26,6 +26,14 @@ forward (host chunk/stack/view then device transfer) segfaults libsenlib during 
 The cache is flattened to 2D and placed rows-outermost (see ``place_row_gathered``).
 
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
+
+This module owns the rotation for *both* backends. On the native path vLLM builds the
+frequencies and ``get_rope`` hands back one of the OOT classes below. The Transformers
+backend cannot go through ``get_rope`` -- HF's rope types do not all have a Spyre OOT
+class, and a model may key ``rope_parameters`` and ``head_dim`` per layer type -- so it
+reads HF's own ``inv_freq`` and builds an instance through ``rotary_from_inv_freq``.
+Everything after that (cache derivation, identity padding, device placement, gather) is
+the shared code here.
 """
 
 import torch
@@ -46,12 +54,15 @@ from .utils import place_row_gathered
 logger = init_logger(__name__)
 
 
-def _rotate_neox_2x2(
+def rotate_neox_2x2(
     x: torch.Tensor,
     rot: torch.Tensor,
     head_size: int,
 ) -> torch.Tensor:
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
+
+    Shared with the Transformers backend, which folds its batch axis into ``T`` to reuse
+    this (see ``_rope_matmul_tokens_major`` in ``spyre_inference.transformers_backend``).
 
     ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, head_size // 2].
     The inner dim head_size // 2 is stick-aligned (the platform pads head_dim to a
@@ -66,7 +77,7 @@ def _rotate_neox_2x2(
 
 
 class _SpyreRotaryMixin:
-    """Spyre RoPE wiring shared by the base and llama3 OOT classes.
+    """Spyre RoPE wiring shared by the OOT classes and by the Transformers backend.
 
     Runs the 2x2 rotation on Spyre for supported configs; unsupported configs raise
     ``NotImplementedError`` at construction. The rotation cache is derived lazily from
@@ -86,6 +97,9 @@ class _SpyreRotaryMixin:
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        # Set by ``rotary_from_inv_freq``: this instance's cos_sin_cache was supplied by
+        # the caller, so nothing may recompute it from a rope_type (see fix_padded_rope).
+        self._frequencies_injected = False
 
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
@@ -98,22 +112,28 @@ class _SpyreRotaryMixin:
 
     def _get_rotation_cache(self) -> torch.Tensor:
         """Lazily build the CPU 2x2 rotation cache [max_pos, 2, 2, _padded_inner] from
-        cos_sin_cache ([[cos, -sin], [sin, cos]]), zero-padding the inner dim up to
-        _padded_inner when a padded head injected a narrower original-frequency cache."""
+        cos_sin_cache ([[cos, -sin], [sin, cos]]), identity-padding the inner dim up to
+        _padded_inner when the cache present covers a narrower original head width."""
         if self._rotation_cache is None:
-            # Derive inner from the cache actually present, not rotary_dim: when a
-            # head is padded (head_size=64 -> 128), fix_padded_rope injects the
-            # original narrower cos_sin_cache so the real frequencies survive; the
-            # trailing dims are then zero-padded to _padded_inner (harmless because
-            # the matching x pair dims are zero from weight padding).
+            # Derive inner from the cache actually present, not rotary_dim: when a head
+            # is padded (head_size=64 -> 128) the narrower original-frequency cache is
+            # what carries the real frequencies -- fix_padded_rope injects it on the
+            # native path, rotary_from_inv_freq builds it on the Transformers one.
             inner = self.cos_sin_cache.shape[-1] // 2
             cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
             cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
                 self.cos_sin_cache.shape[0], 2, 2, inner
             )
             if self._padded_inner != inner:
-                cache = torch.nn.functional.pad(cache, (0, self._padded_inner - inner))
-            self._rotation_cache = cache
+                # Identity rather than zero blocks, so the padded lanes pass through.
+                # Weight padding already zeroes them, which makes the two equivalent
+                # today; identity is correct without relying on that.
+                pad = self._padded_inner - inner
+                identity = cache.new_zeros(cache.shape[0], 2, 2, pad)
+                identity[:, 0, 0, :] = 1.0
+                identity[:, 1, 1, :] = 1.0
+                cache = torch.cat([cache, identity], dim=-1)
+            self._rotation_cache = cache.contiguous()
         return self._rotation_cache
 
     def _get_device_rotation_cache(self) -> torch.Tensor:
@@ -124,17 +144,26 @@ class _SpyreRotaryMixin:
             self._device_rotation_cache = self._get_rotation_cache().flatten(1).contiguous()
         return self._device_rotation_cache
 
+    def gather_rotation(self, positions: torch.Tensor) -> torch.Tensor:
+        """This pass's rotation matrices, ``[positions.numel(), 2, 2, head_size // 2]``.
+
+        The only part of the rotation that is traced: the cache itself was primed on
+        device in ``_apply``, before ``torch.compile``. Also the Transformers backend's
+        entry point -- HF splits RoPE into a module that produces cos/sin and a function
+        that consumes them, so it needs the gather without the rotation.
+        """
+        cache = self._get_device_rotation_cache()
+        return cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
+
     def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Cache was primed in _apply before compile, so only the index_select is traced.
-        cache = self._get_device_rotation_cache()
-        rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
-        out_query = _rotate_neox_2x2(query, rot, self.head_size)
-        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
+        rot = self.gather_rotation(positions)
+        out_query = rotate_neox_2x2(query, rot, self.head_size)
+        out_key = rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
         return out_query, out_key
 
 
@@ -157,3 +186,46 @@ class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedd
     """OOT YaRNScalingRotaryEmbedding that applies the rotation on Spyre."""
 
     pass
+
+
+def rotary_from_inv_freq(
+    inv_freq: torch.Tensor,
+    attention_scaling: float,
+    head_size: int,
+    max_position: int,
+    dtype: torch.dtype,
+) -> SpyreRotaryEmbedding:
+    """A ``SpyreRotaryEmbedding`` whose frequencies are given, not recomputed.
+
+    This is the Transformers backend's entrypoint.
+    It reads ``inv_freq`` and ``attention_scaling`` straight off the HF rotary module 
+    it replaces.
+
+    *head_size* is the width Q/K actually arrive at, which is what the rotation has to
+    cover. ``inv_freq`` may be narrower (the platform padded head_dim for stick
+    alignment, or a layer type rotates fewer dims than it is wide); the difference is
+    identity-padded by ``_get_rotation_cache``.
+    """
+    inv_freq = inv_freq.to("cpu", torch.float32)
+    inner = inv_freq.shape[0]
+    if 2 * inner > head_size:
+        raise ValueError(
+            f"RoPE has {inner} frequencies, enough for a head of {2 * inner}, but Q/K "
+            f"arrive at head_size={head_size}."
+        )
+
+    rope = SpyreRotaryEmbedding(
+        head_size=head_size,
+        rotary_dim=head_size,
+        max_position_embeddings=max_position,
+        # Unused: `base` only feeds _compute_inv_freq, which init_cache=False skips.
+        base=0.0,
+        is_neox_style=True,
+        dtype=dtype,
+        init_cache=False,
+    )
+    freqs = torch.outer(torch.arange(max_position, dtype=torch.float32), inv_freq)
+    cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1) * attention_scaling
+    rope.register_buffer("cos_sin_cache", cache.to(dtype), persistent=False)
+    rope._frequencies_injected = True
+    return rope

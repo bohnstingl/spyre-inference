@@ -19,7 +19,9 @@ OOT registrations pick up on their own. Two things are left to HF's module code:
 
 * RoPE — there is no RoPE fuser, so HF's ``rotary_emb`` survives and derives cos/sin
   inside the forward from int64 ``position_ids``, a cast torch-spyre cannot lower.
-  Replaced here with a precomputed rotation cache and a matmul-only rotation.
+  Replaced here with the native path, ``SpyreRotaryEmbedding``,
+  which is built based on the HF's frequencies. This file contains the required
+  interface between the native path and the HF path.
 * Models shipping both ``config.json`` and ``params.json`` parse into a bare
   ``PretrainedConfig``, which HF cannot build a model from.
 """
@@ -27,6 +29,7 @@ OOT registrations pick up on their own. Two things are left to HF's module code:
 from __future__ import annotations
 
 import functools
+import inspect
 import sys
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, cast
@@ -39,6 +42,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import TransformersForCausalLM
 
 from spyre_inference.custom_ops.head_pad import original_head_dim
+from spyre_inference.custom_ops.rotary_embedding import (
+    SpyreRotaryEmbedding,
+    rotary_from_inv_freq,
+    rotate_neox_2x2,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -46,43 +54,40 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _build_rotation_cache(
-    inv_freq: torch.Tensor,
-    scaling: float,
-    max_position: int,
-    padded_head_dim: int | None,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """``[max_position, 2, 2, head_dim // 2]`` rotation matrices ``[[cos, -sin], [sin, cos]]``.
+def _rope_matmul_tokens_major(x: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
+    """Rotate ``x`` ``[*tokens, H, D]`` by ``rot`` ``[*tokens, 2, 2, D // 2]``, shape kept.
 
-    Working from ``inv_freq``/``attention_scaling`` inherits whatever rope scaling the
-    module being replaced had baked into them. *padded_head_dim* extends the cache with
-    identity blocks, so a Q/K padded up to it passes its trailing dimensions through.
+    Multiply-and-reduce rather than HF's ``rotate_half`` cat: Spyre cannot restickify the
+    halves that slicing a stick-aligned head_dim produces. This is the same rotation the
+    native path's RoPE custom op runs, so it delegates to that kernel; the kernel takes a
+    single flat token axis, hence the fold and unfold around it.
     """
-    rope_half = inv_freq.shape[0]
-    freqs = torch.outer(torch.arange(max_position, dtype=torch.float32), inv_freq)
-    cos, sin = torch.cos(freqs) * scaling, torch.sin(freqs) * scaling
-    rot = torch.stack([cos, -sin, sin, cos], dim=1).view(max_position, 2, 2, rope_half)
-
-    if padded_head_dim is not None and padded_head_dim // 2 > rope_half:
-        identity = torch.zeros(max_position, 2, 2, padded_head_dim // 2 - rope_half)
-        identity[:, 0, 0, :] = 1.0
-        identity[:, 1, 1, :] = 1.0
-        rot = torch.cat([rot, identity], dim=-1)
-
-    return rot.contiguous().to(dtype)
+    *tokens, heads, head_dim = x.shape
+    if 2 * rot.shape[-1] != head_dim:
+        # A model that rotates only part of each head (Phi-3) lays the rotated dims out
+        # contiguously, not split in halves, so the 2x2 formulation cannot stand in for it.
+        # ``_maybe_pad_head_dim`` already rejects these whenever padding is needed; this
+        # names the mismatch for the cases it does not reach, in place of the shape error
+        # the kernel would raise two frames down.
+        raise NotImplementedError(
+            f"Spyre RoPE rotates every dim of a head, but this rotation covers "
+            f"{2 * rot.shape[-1]} of {head_dim}; partial rotary is unsupported."
+        )
+    rotated = rotate_neox_2x2(
+        x.reshape(-1, heads, head_dim),
+        rot.reshape(-1, 2, 2, rot.shape[-1]),
+        head_dim,
+    )
+    return rotated.view(*tokens, heads, head_dim)
 
 
 def _apply_rope_matmul(x: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
     """Rotate ``x`` ``[B, H, L, D]`` by ``rot`` ``[B, L, 2, 2, D // 2]``.
 
-    Multiply-and-reduce rather than HF's ``rotate_half`` cat: Spyre cannot restickify the
-    halves that slicing a stick-aligned head_dim produces.
+    The heads-major layout most HF attention modules rotate in; the models that rotate
+    pre-transpose go straight to ``_rope_matmul_tokens_major``.
     """
-    b, h, seq, head_dim = x.shape
-    pairs = x.transpose(1, 2).reshape(b, seq, h, 2, head_dim // 2)
-    out = rot.unsqueeze(2).mul(pairs.unsqueeze(-3)).sum(4, keepdim=True).flatten(3)
-    return out.transpose(1, 2)
+    return _rope_matmul_tokens_major(x.transpose(1, 2), rot).transpose(1, 2)
 
 
 def _rope_frequencies(original: nn.Module) -> dict[str | None, tuple[torch.Tensor, float]]:
@@ -109,13 +114,16 @@ def _rope_frequencies(original: nn.Module) -> dict[str | None, tuple[torch.Tenso
     return freqs
 
 
-class _SpyreRotaryEmbedding(nn.Module):
-    """Drop-in for an HF rotary embedding, returning ``(rot, None)`` in place of
-    ``(cos, sin)``; the patched ``apply_rotary_pos_emb`` ignores the second element.
+# ModuleDict keys must be strings, so the single-rope case needs a stand-in for the
+# ``layer_type=None`` default. Not a name any HF layer_type uses.
+_DEFAULT_LAYER_TYPE = "__default__"
 
-    The cache covers ``max_position`` up front rather than growing on demand: sizing it
-    from the batch's positions needs an ``.item()``, so a host sync per step and a
-    data-dependent guard ``torch.compile`` cannot trace.
+
+class _SpyreRotaryEmbedding(nn.Module):
+    """Drop-in for an HF rotary embedding. 
+    
+    This routing layer to the native-path ``SpyreRotaryEmbedding``, so both backends
+    run the same RoPE implementation.
     """
 
     def __init__(
@@ -126,30 +134,28 @@ class _SpyreRotaryEmbedding(nn.Module):
         dtype: torch.dtype,
     ):
         super().__init__()
-        self._cpu_caches = {
-            layer_type: _build_rotation_cache(
-                inv_freq.to("cpu", torch.float32),
-                scaling,
-                max_position,
-                padded_head_dim,
-                dtype,
-            )
-            for layer_type, (inv_freq, scaling) in _rope_frequencies(original).items()
-        }
-        self._caches = self._cpu_caches
-
-    def _apply(self, fn, recurse=True):
-        # Prime the device caches when the model moves to Spyre, i.e. before compile, so only
-        # the index_select is traced. They are not buffers (they are built after weight
-        # loading) and there are no children, so super() has nothing to do.
-        self._caches = {k: fn(v) for k, v in self._cpu_caches.items()}
-        return self
+        self._ropes = nn.ModuleDict(
+            {
+                (layer_type or _DEFAULT_LAYER_TYPE): rotary_from_inv_freq(
+                    inv_freq,
+                    scaling,
+                    # The width Q/K actually arrive at: the padded head_dim when the
+                    # platform widened it, else whatever this layer type rotates -- which
+                    # can be per-type, where full-attention layers are one width and
+                    # sliding ones another.
+                    padded_head_dim if padded_head_dim is not None else 2 * inv_freq.shape[0],
+                    max_position,
+                    dtype,
+                )
+                for layer_type, (inv_freq, scaling) in _rope_frequencies(original).items()
+            }
+        )
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor, layer_type: str | None = None):
-        cache = self._caches[layer_type]
-        rot = cache.index_select(0, position_ids.flatten())
-        return rot.view(*position_ids.shape, *cache.shape[1:]), None
+        rope = cast(SpyreRotaryEmbedding, self._ropes[layer_type or _DEFAULT_LAYER_TYPE])
+        rot = rope.gather_rotation(position_ids)
+        return rot.view(*position_ids.shape, *rot.shape[1:]), None
 
 
 def _spyre_apply_rotary(q, k, rot, *args, **kwargs):
@@ -163,13 +169,37 @@ def _rope_dispatch(original: Callable) -> Callable:
     The patch lands on a modeling module in ``sys.modules`` and is never removed, so an HF
     model built later in the process has to keep working. Spyre's calls are the ones whose
     ``sin`` is the ``None`` standing in for ``_SpyreRotaryEmbedding``'s second return.
-    """
 
-    @functools.wraps(original)
-    def apply_rotary_pos_emb(q, k, cos, sin=None, *args, **kwargs):
-        if sin is None:
-            return _spyre_apply_rotary(q, k, cos)
-        return original(q, k, cos, sin, *args, **kwargs)
+    HF spells this function two ways, and which one is in front of us is decided once, off
+    the signature:
+
+    * the common one takes the Q/K pair at ``[B, H, L, D]`` and returns both rotated;
+    * some models take one tensor at a time at ``[B, L, H, D]``, before attention
+      transposes it, and return just that tensor. Their ``unsqueeze_dim`` says where the
+      head axis is, so it also tells us the layout is the one we can rotate.
+    """
+    params = inspect.signature(original).parameters
+
+    if "k" in params or "key" in params:
+
+        @functools.wraps(original)
+        def apply_rotary_pos_emb(q, k, cos, sin=None, *args, **kwargs):
+            if sin is None:
+                return _spyre_apply_rotary(q, k, cos)
+            return original(q, k, cos, sin, *args, **kwargs)
+
+    else:
+
+        @functools.wraps(original)
+        def apply_rotary_pos_emb(x, cos, sin=None, unsqueeze_dim=1, **kwargs):
+            if sin is None:
+                if unsqueeze_dim != x.ndim - 2:
+                    raise NotImplementedError(
+                        f"Spyre RoPE expects the heads axis at {x.ndim - 2} for a "
+                        f"{x.ndim}D tensor, got unsqueeze_dim={unsqueeze_dim}."
+                    )
+                return _rope_matmul_tokens_major(x, cos)
+            return original(x, cos, sin, unsqueeze_dim=unsqueeze_dim, **kwargs)
 
     apply_rotary_pos_emb._spyre_patched = True
     return apply_rotary_pos_emb
@@ -242,8 +272,9 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         """Swap HF's rotary embedding and ``apply_rotary_pos_emb`` for the Spyre ones.
 
         Partial rotary dimensions (e.g. Phi-3) are unsupported — the cache would cover
-        only the rotated dims — but reach a shape mismatch here rather than a check:
-        ``_maybe_pad_head_dim`` already rejects them whenever padding is needed.
+        only the rotated dims. ``_maybe_pad_head_dim`` rejects them whenever padding is
+        needed; for the rest, ``_rope_matmul_tokens_major`` raises on the width mismatch
+        at the first rotation.
         """
         # The text backbone holding rotary_emb; multimodal models nest it one level
         # deeper, at model.model.language_model, and carry the rope config on its own
@@ -252,10 +283,17 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         backbone = cast(nn.Module, getattr(inner, "language_model", inner))
         cfg = getattr(backbone, "config", self.model.config)
 
+        # Not every backbone rotates: BERT-family encoders position with learned
+        # embeddings and register no rotary_emb.
+        try:
+            rope_source = backbone.get_submodule("rotary_emb")
+        except AttributeError:
+            logger.debug("%s has no rotary_emb, leaving rope alone", type(backbone).__name__)
+            return
+
         # head_dim is already stick-aligned (the platform pads it, and the weight pass
         # pads Q/K interleaved to match), so the rotation only needs the pre-pad
         # frequencies identity-padded back out to the widened width.
-        rope_source = backbone.get_submodule("rotary_emb")
         orig_head_dim = original_head_dim(cfg)
         padded_head_dim = None
         if orig_head_dim is not None:
@@ -271,16 +309,26 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         backbone.rotary_emb = spyre_rope
 
         patched_mods: set[int] = set()
-        for name, module in self.model.named_modules():
-            if module is spyre_rope:
+        repointed = 1  # backbone.rotary_emb, above
+        # spyre_rope's own children are SpyreRotaryEmbedding instances, so they match the
+        # "*RotaryEmbedding" test below; repointing one at its own parent would nest the
+        # wrapper inside itself.
+        own = {id(module) for module in spyre_rope.modules()}
+        # Scoped to the text backbone: a multimodal model's vision and audio towers carry
+        # their own rotary embeddings over their own coordinates (2-D over patch positions,
+        # say), which a text rotation cache cannot stand in for.
+        # Materialised because attaching spyre_rope below adds submodules as we walk.
+        for name, module in list(backbone.named_modules()):
+            if id(module) in own:
                 continue
 
             cls_name = module.__class__.__name__
 
             if cls_name.endswith("RotaryEmbedding"):
                 parent_name, _, attr = name.rpartition(".")
-                parent = self.model.get_submodule(parent_name) if parent_name else self.model
+                parent = backbone.get_submodule(parent_name) if parent_name else backbone
                 setattr(parent, attr, spyre_rope)
+                repointed += 1
                 continue
 
             if "Attention" not in cls_name:
@@ -288,6 +336,7 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
 
             if not hasattr(module, "rotary_emb"):
                 module.rotary_emb = spyre_rope
+                repointed += 1
 
             # apply_rotary_pos_emb is a module-level function in HF modeling files, so it
             # is patched once per modeling module rather than per layer.
@@ -299,6 +348,17 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
                 continue
             mod.apply_rotary_pos_emb = _rope_dispatch(existing)
             patched_mods.add(id(mod))
+
+        # Logged because the swap is invisible in the module dump the backend prints, and
+        # its absence is the failure mode: HF's rope stays in the graph and the model
+        # aborts deep in the compiler on an fp32 outer product instead of here.
+        logger.info(
+            "Spyre RoPE installed on %s: %d rotary reference(s) repointed, "
+            "apply_rotary_pos_emb patched in %d modeling module(s)",
+            type(backbone).__name__,
+            repointed,
+            len(patched_mods),
+        )
 
 
 # using_transformers_backend() compares _ModelInfo.architecture, which is model_cls.__name__,
