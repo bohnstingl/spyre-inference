@@ -42,6 +42,9 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
     RotaryEmbeddingBase,
 )
+from vllm.model_executor.layers.rotary_embedding.gemma4_rope import (
+    Gemma4RotaryEmbedding,
+)
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
@@ -229,3 +232,12 @@ def rotary_from_inv_freq(
     rope.register_buffer("cos_sin_cache", cache.to(dtype), persistent=False)
     rope._frequencies_injected = True
     return rope
+@RotaryEmbeddingBase.register_oot(name="Gemma4RotaryEmbedding")
+class SpyreGemma4RotaryEmbedding(_SpyreRotaryMixin, Gemma4RotaryEmbedding):
+    """OOT Gemma4RotaryEmbedding (proportional RoPE) that applies the rotation on Spyre.
+
+    ``partial_rotary_factor < 1`` but ``rotary_dim == head_size`` with the non-rotated
+    frequencies identity-padded, so the neox full-rotary path applies unchanged.
+    """
+
+    pass

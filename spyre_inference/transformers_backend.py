@@ -31,7 +31,8 @@ from __future__ import annotations
 import functools
 import inspect
 import sys
-from collections.abc import Callable, Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -120,8 +121,8 @@ _DEFAULT_LAYER_TYPE = "__default__"
 
 
 class _SpyreRotaryEmbedding(nn.Module):
-    """Drop-in for an HF rotary embedding. 
-    
+    """Drop-in for an HF rotary embedding.
+
     This routing layer to the native-path ``SpyreRotaryEmbedding``, so both backends
     run the same RoPE implementation.
     """
@@ -219,6 +220,34 @@ def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> nn.M
         cfg.head_dim = padded
 
 
+def _rebase_onto_text_backbone(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    prefix: str,
+    dropped: Counter[str],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Re-address a multimodal checkpoint onto its text backbone, dropping the towers.
+
+    ``force_text_backbone`` hands the backend the text config, so the module tree is the
+    text stack alone while the checkpoint still nests it under *prefix*
+    (``model.language_model.``). Rebasing here — ahead of ``TransformersBase``'s derived
+    ``hf_to_vllm_mapper``, whose catch-all ``^(model\\.)((?!<children>).+)`` rule would
+    otherwise strip ``model.`` off every nested name and report the lot as unexpected —
+    is what vLLM's native ``Gemma4ForCausalLM`` does with an ``orig_to_new_prefix`` entry.
+
+    Anything else under the prefix's root (vision/audio towers and their projectors) has
+    no home in a text-only tree and is counted into *dropped*; names outside that root
+    (``lm_head`` and friends) pass through untouched.
+    """
+    root = prefix.partition(".")[0] + "."
+    for name, weight in weights:
+        if name.startswith(prefix):
+            yield root + name[len(prefix) :], weight
+        elif name.startswith(root):
+            dropped[name[len(root) :].partition(".")[0]] += 1
+        else:
+            yield name, weight
+
+
 class SpyreTransformersForCausalLM(TransformersForCausalLM):
     """Transformers backend with the Spyre RoPE replacement wired in."""
 
@@ -229,7 +258,21 @@ class SpyreTransformersForCausalLM(TransformersForCausalLM):
         logger.debug("SpyreTransformersForCausalLM ready: %s", type(self.model).__name__)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        result = super().load_weights(weights)
+        prefix = getattr(self.config, "_spyre_text_backbone_prefix", None)
+        if prefix:
+            dropped: Counter[str] = Counter()
+            weights = _rebase_onto_text_backbone(weights, prefix, dropped)
+            result = super().load_weights(weights)
+            if dropped:
+                logger.info(
+                    "Text-only backbone: rebased checkpoint weights off %r and skipped "
+                    "%d non-text weight(s) (%s).",
+                    prefix,
+                    sum(dropped.values()),
+                    ", ".join(f"{name}: {count}" for name, count in sorted(dropped.items())),
+                )
+        else:
+            result = super().load_weights(weights)
         self._patch_rope()
         return result
 

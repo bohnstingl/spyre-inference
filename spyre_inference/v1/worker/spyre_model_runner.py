@@ -410,6 +410,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         install_pooling_model_patches()
 
+    @staticmethod
+    def _install_decoder_model_patches() -> None:
+        """Install model-specific decoder adapters (Gemma-4 embed scale, …).
+
+        A no-op unless the matching architecture is built (import-guarded + idempotent).
+        """
+        from spyre_inference.models import install_decoder_model_patches
+
+        install_decoder_model_patches()
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -420,6 +430,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
 
         self._install_pooling_model_patches(self.model_config)
+        self._install_decoder_model_patches()
 
         # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
         # stream in, when the platform overrode head_dim (e.g. head_size=64).
@@ -829,10 +840,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
             slot_major_kv_layout,
         )
 
-        # Iterate kv_cache_tensors (one entry per physical buffer)
-        spec_by_layer = {
-            ln: g.kv_cache_spec for g in kv_cache_config.kv_cache_groups for ln in g.layer_names
-        }
+        # One spec per layer. disable_hybrid_kv_cache_manager (set in the
+        # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
+        # group; unwrap it to the real per-layer specs so each layer keeps its own
+        # num_kv_heads/head_size. Non-hybrid groups expose the spec directly.
+        spec_by_layer = {}
+        for group in kv_cache_config.kv_cache_groups:
+            per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            if per_layer is not None:
+                spec_by_layer.update(per_layer)
+            else:
+                spec_by_layer.update({ln: group.kv_cache_spec for ln in group.layer_names})
 
         # vLLM's `bind_kv_cache` types this dict as `dict[str, torch.Tensor]`,
         # but the matching `SpyreAttentionImpl.forward` consumes the

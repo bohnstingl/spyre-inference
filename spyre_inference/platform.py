@@ -149,6 +149,19 @@ class TorchSpyrePlatform(CpuPlatform):
         _spyre_patched._spyre_patched = True
         EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
 
+        # Delegate per-model EngineArgs overrides (e.g. text-only backbone
+        # selection) to spyre_inference.models before ModelConfig is built.
+        create_model_config = EngineArgs.create_model_config
+
+        @functools.wraps(create_model_config)
+        def _spyre_create_model_config(self):
+            from spyre_inference.models import apply_prelaunch_overrides
+
+            apply_prelaunch_overrides(self)
+            return create_model_config(self)
+
+        EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
+
     @classmethod
     def import_kernels(cls) -> None:
         # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
@@ -327,7 +340,10 @@ class TorchSpyrePlatform(CpuPlatform):
         ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
         ``config.head_dim`` and uses ``out_proj``).
         """
-        from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
+        from spyre_inference.custom_ops.head_pad import (
+            configured_head_dims,
+            reduced_rotary_dim_reason,
+        )
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
@@ -341,9 +357,18 @@ class TorchSpyrePlatform(CpuPlatform):
         if not any(getattr(c, "rope_parameters", None) for c in cfgs):
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
-        if orig % 128 == 0:
-            return
+        head_dims = configured_head_dims(hf_config) or {hidden_size // num_heads}
+        if all(head_dim % 128 == 0 for head_dim in head_dims):
+            return  # nothing to align, whether the widths vary per layer or not
+        if len(head_dims) > 1:
+            # The override below is a single global width, so a model whose layers
+            # disagree would come out padded to one of them everywhere.
+            raise NotImplementedError(
+                f"Spyre must pad attention head_dim to a 128-multiple for stick "
+                f"alignment, but this model sizes heads per layer "
+                f"({sorted(head_dims)}) and padding is global."
+            )
+        orig = head_dims.pop()
 
         padded = ((orig + 127) // 128) * 128
         for cfg in (hf_config, model_config.hf_text_config):
@@ -427,6 +452,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
+
+        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
+        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
+        # KV-cache manager gives every layer its own buffer; SWA is still computed
+        # in the model runner. No-op for non-hybrid models.
+        scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
         # math in CpuPlatform.check_and_update_config is meaningless for us.
