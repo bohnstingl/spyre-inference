@@ -17,6 +17,11 @@ dependencies = [
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
+
+    # Pulled in transitively by vllm, but pinned here so the resolved version is
+    # visible in the manifest and cannot drift between environments.
+    # Must match the version in uv.lock.
+    "transformers==5.14.1",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
