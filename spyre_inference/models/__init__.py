@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-specific Spyre adaptations, per architecture."""
+"""Model-specific Spyre adaptations, per architecture.
+
+Each entry in ``SPYRE_MODELS`` replaces a vLLM architecture with a subclass that
+lives in the matching module here. Registration is lazy: nothing is imported
+until vLLM resolves the architecture.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,39 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from vllm.engine.arg_utils import EngineArgs
 
+_BERT = "spyre_inference.models.bert"
+_ROBERTA = "spyre_inference.models.roberta"
+
+SPYRE_MODELS: dict[str, str] = {
+    # Encoders: token_type_ids passed out of band (see models.token_type).
+    "BertModel": f"{_BERT}:SpyreBertEmbeddingModel",
+    "BertSpladeSparseEmbeddingModel": f"{_BERT}:SpyreBertSpladeSparseEmbeddingModel",
+    "BertForSequenceClassification": f"{_BERT}:SpyreBertForSequenceClassification",
+    "BertForTokenClassification": f"{_BERT}:SpyreBertForTokenClassification",
+    "BertForMaskedLM": f"{_BERT}:SpyreBertForMaskedLM",
+    "RobertaModel": f"{_ROBERTA}:SpyreRobertaEmbeddingModel",
+    "RobertaForMaskedLM": f"{_ROBERTA}:SpyreRobertaEmbeddingModel",
+    "XLMRobertaModel": f"{_ROBERTA}:SpyreRobertaEmbeddingModel",
+    "RobertaForSequenceClassification": (f"{_ROBERTA}:SpyreRobertaForSequenceClassification"),
+    "XLMRobertaForSequenceClassification": (f"{_ROBERTA}:SpyreRobertaForSequenceClassification"),
+    "RobertaForTokenClassification": f"{_ROBERTA}:SpyreRobertaForTokenClassification",
+    "XLMRobertaForTokenClassification": (f"{_ROBERTA}:SpyreRobertaForTokenClassification"),
+    # Decoders.
+    "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
+    "TransformersForCausalLM": (
+        "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
+    ),
+}
+
+
+def register_models() -> None:
+    """Point the Spyre-adapted architectures at their Spyre subclasses."""
+    from vllm.model_executor.models import ModelRegistry
+
+    for arch, model_cls in SPYRE_MODELS.items():
+        ModelRegistry.register_model(arch, model_cls)
+
 
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
@@ -28,18 +66,3 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     from spyre_inference.models import gemma4
 
     gemma4.force_text_backbone(engine_args)
-
-
-def install_pooling_model_patches() -> None:
-    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, …)."""
-    from spyre_inference.models import bert, roberta
-
-    bert.install_spyre_patches()
-    roberta.install_spyre_patches()
-
-
-def install_decoder_model_patches() -> None:
-    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
-    from spyre_inference.models import gemma4
-
-    gemma4.install_spyre_patches()

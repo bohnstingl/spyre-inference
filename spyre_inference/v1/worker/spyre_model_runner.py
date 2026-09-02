@@ -404,25 +404,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
-    @staticmethod
-    def _install_pooling_model_patches(model_config) -> None:
-        """Install model-specific pooling adapters (BERT/RoBERTa token_type, …)."""
-        if model_config.runner_type != "pooling":
-            return
-        from spyre_inference.models import install_pooling_model_patches
-
-        install_pooling_model_patches()
-
-    @staticmethod
-    def _install_decoder_model_patches() -> None:
-        """Install model-specific decoder adapters (Gemma-4 embed scale, …).
-
-        A no-op unless the matching architecture is built (import-guarded + idempotent).
-        """
-        from spyre_inference.models import install_decoder_model_patches
-
-        install_decoder_model_patches()
-
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -431,9 +412,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
-
-        self._install_pooling_model_patches(self.model_config)
-        self._install_decoder_model_patches()
 
         # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
         # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
