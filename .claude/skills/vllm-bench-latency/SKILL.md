@@ -14,7 +14,7 @@ Run `vllm bench latency` for a model the user names against **this** `spyre-infe
 - **Single accelerator, sequential only.** Spyre serves one process at a time — never run two Spyre-backed commands concurrently (no backgrounding, no `pytest -n`). In `--compare-main` mode the two runs are strictly sequential.
 - **Profiler-free `torch-spyre` only.** A wheel built with `USE_SPYRE_PROFILER=1` carries the instrumentation into every run and inflates latency substantially. Those numbers are not comparable to a normal build and must not be reported as latency — verify in preflight and stop if the profiler is linked.
 - **`uv run --no-sync`** is mandatory — a plain `uv run` / `uv sync` re-resolves the lockfile and clobbers the editable install.
-- **`OMP_NUM_THREADS=8` on every leg.** Unpinned OpenMP threading makes the host-side work oversubscribe the box and the numbers wander run to run — the measurement is unstable and legs are no longer comparable. Export it for *both* legs of a comparison, never one.
+- **`SPYRE_NUM_CPUS=8` on every leg.** Unpinned threading oversubscribes the box and the numbers wander run to run, so legs are no longer comparable. Use `SPYRE_NUM_CPUS`, not `OMP_NUM_THREADS`: the platform's `configure_threading` overwrites all five threading vars (`OMP_`/`OPENBLAS_`/`MKL_`/`NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`) from the detected core count at startup, and `SPYRE_NUM_CPUS` is the input to that detection — so it is the one knob that lands, and it pins all five. Export it for *both* legs of a comparison, never one.
 - **No unexpected compile inside the measured window.** Graph recording is expensive per shape, and far more so at runtime than at warmup, so a single leaked recompile swamps any real delta. Pre-cover the shapes (step 0b) and verify with the compile-leak gate (step 3) before reporting any mean.
 - **Non-destructive.** The `main` comparison uses a throwaway `git worktree` + a temporary editable-install repoint — never `git checkout` / `git stash` in the working copy, and always restore (step 2).
 - **Always report, never invent.** End every run with numbers from the JSON (step 3); if a run fails, report the failure with the log tail instead of a number.
@@ -41,7 +41,7 @@ if ldd "$SO" | grep -q libaiupti; then
   echo "torch-spyre built with USE_SPYRE_PROFILER=1 — latency inflated, do not benchmark"; exit 1
 fi
 
-export OMP_NUM_THREADS=8   # required on every leg — see Hard constraints
+export SPYRE_NUM_CPUS=8   # required on every leg — see Hard constraints
 ```
 
 ### 0b. Pin the compiled shapes
@@ -83,7 +83,7 @@ MODEL="<model>"; INPUT_LEN=64; OUTPUT_LEN=64; BATCH_SIZE=1
 MAX_LEN=128; ITERS=10; WARMUP=2; EAGER=""   # EAGER="--enforce-eager" only if asked
 TAG=branch
 OUT=.claude/skills/vllm-bench-latency/logs; mkdir -p "$OUT"   # artifacts live here, not the repo root
-export OMP_NUM_THREADS=8
+export SPYRE_NUM_CPUS=8
 
 uv run --no-sync vllm bench latency \
   --model "$MODEL" \
@@ -107,7 +107,7 @@ MAIN_SHA=$(git rev-parse --short main)
 uv pip install --no-deps -e "$WT"            # repoint editable install at main
 
 TAG=main
-export OMP_NUM_THREADS=8
+export SPYRE_NUM_CPUS=8
 uv run --no-sync vllm bench latency \
   --model "$MODEL" \
   --input-len $INPUT_LEN --output-len $OUTPUT_LEN --batch-size $BATCH_SIZE \
