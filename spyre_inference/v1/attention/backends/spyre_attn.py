@@ -174,6 +174,32 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     v_slots.index_copy_(0, slot_mapping, value)
 
 
+def _mirror_mask_tiles(
+    tiles_cpu: list[list[torch.Tensor]], device: torch.device
+) -> list[list[torch.Tensor]]:
+    """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
+
+    `_get_zero_tile` hands the same CPU tensor to every interior block, so
+    keying on `id()` collapses those to a single H2D transfer instead of one
+    per block. `tiles_cpu` keeps strong references for the whole call, so no
+    id can be recycled mid-flight, and sharing one device buffer across blocks
+    is safe because mask tiles are read-only by contract (see
+    `_get_zero_tile`).
+    """
+    mirrored: dict[int, torch.Tensor] = {}
+    tiles_device: list[list[torch.Tensor]] = []
+    for seq_tiles in tiles_cpu:
+        row: list[torch.Tensor] = []
+        for tile in seq_tiles:
+            dev_tile = mirrored.get(id(tile))
+            if dev_tile is None:
+                dev_tile = convert(tile, device=device)
+                mirrored[id(tile)] = dev_tile
+            row.append(dev_tile)
+        tiles_device.append(row)
+    return tiles_device
+
+
 # ---------------------------------------------------------------------------
 # Compilable factory functions
 # ---------------------------------------------------------------------------
@@ -194,6 +220,12 @@ def _build_query_row_tables(
     rows[:, :aligned] = (
         starts.unsqueeze(1) + torch.minimum(q_pos.unsqueeze(0), (lens - 1).unsqueeze(1))
     ).to(torch.int32)
+    # `rows[s]` is a row slice: contiguous but at a nonzero storage offset, which
+    # `.contiguous()` would not have reset anyway (torch-spyre#3770). The
+    # offset-0 buffer comes from the CPU->Spyre `convert` below: it cannot take
+    # `convert`'s same-device/same-dtype short-circuit, so it always allocates.
+    # Do not copy this pattern to a slice that is not followed by a
+    # cross-device transfer.
     return [convert(rows[s], device=device) for s in range(num_seqs)]
 
 
@@ -1220,6 +1252,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata.page_index_tables is None:
             table_cpu = attn_metadata.page_index_table_cpu
             assert table_cpu is not None
+            # `table_cpu[s]` is a row slice: contiguous but at a nonzero storage
+            # offset, which `.contiguous()` would not have reset anyway
+            # (torch-spyre#3770). The offset-0 buffer comes from the CPU->Spyre
+            # `convert` below: it cannot take `convert`'s same-device/same-dtype
+            # short-circuit, so it always allocates. Do not copy this pattern to
+            # a slice that is not followed by a cross-device transfer.
             attn_metadata.page_index_tables = [
                 convert(table_cpu[s], device=_target_device) for s in range(table_cpu.shape[0])
             ]
@@ -1228,20 +1266,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             assert tiles_cpu is not None, (
                 "attention_mask_tiles must be precomputed by the metadata builder"
             )
-            # Interior blocks share one CPU tile by reference (_get_zero_tile),
-            # so mirror by identity: one H2D per distinct tile, not per block.
-            mirrored: dict[int, torch.Tensor] = {}
-
-            def _mirror(t: torch.Tensor) -> torch.Tensor:
-                dev = mirrored.get(id(t))
-                if dev is None:
-                    dev = convert(t, device=_target_device)
-                    mirrored[id(t)] = dev
-                return dev
-
-            attn_metadata.attention_mask_tiles_device = [
-                [_mirror(t) for t in seq_tiles] for seq_tiles in tiles_cpu
-            ]
+            attn_metadata.attention_mask_tiles_device = _mirror_mask_tiles(
+                tiles_cpu, _target_device
+            )
 
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
         # and upstream's own unified_kv_cache_update op covers the rest.
