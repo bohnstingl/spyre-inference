@@ -201,7 +201,7 @@ def rotary_from_inv_freq(
     """A ``SpyreRotaryEmbedding`` whose frequencies are given, not recomputed.
 
     This is the Transformers backend's entrypoint.
-    It reads ``inv_freq`` and ``attention_scaling`` straight off the HF rotary module 
+    It reads ``inv_freq`` and ``attention_scaling`` straight off the HF rotary module
     it replaces.
 
     *head_size* is the width Q/K actually arrive at, which is what the rotation has to
@@ -232,6 +232,8 @@ def rotary_from_inv_freq(
     rope.register_buffer("cos_sin_cache", cache.to(dtype), persistent=False)
     rope._frequencies_injected = True
     return rope
+
+
 @RotaryEmbeddingBase.register_oot(name="Gemma4RotaryEmbedding")
 class SpyreGemma4RotaryEmbedding(_SpyreRotaryMixin, Gemma4RotaryEmbedding):
     """OOT Gemma4RotaryEmbedding (proportional RoPE) that applies the rotation on Spyre.

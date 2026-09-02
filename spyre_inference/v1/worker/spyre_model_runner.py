@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import cast
 
 import numpy as np
@@ -824,7 +824,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
-    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+    def initialize_kv_cache_tensors(
+        self,
+        kv_cache_config,
+        kernel_block_sizes,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
@@ -832,6 +837,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
         advertises. The attention kernel selects a page by indexing with a
         one-element device tensor, so the page read is a real indirect access.
+
+        ``kv_cache_allocation_context`` is vLLM's sleep-mode/CuMem allocator scope.
+        ``TorchSpyreWorker._maybe_get_memory_pool_context`` always hands us a
+        ``nullcontext()`` — Spyre's KV cache lives on-device, not in a host-side
+        cumem pool — but the allocation is wrapped in it anyway so the parameter
+        keeps its upstream meaning rather than being silently dropped.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
@@ -857,34 +868,38 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # All layers in `shared_by` use the same spec by construction.
-            spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
-            num_blocks = kv_cache_tensor.size // spec.page_size_bytes
+        with kv_cache_allocation_context or nullcontext():
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                # All layers in `shared_by` use the same spec by construction.
+                spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
+                num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Host-allocated then transferred: only .to() takes a device_layout.
-            layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-            )
+                # Host-allocated then transferred: only .to() takes a device_layout.
+                layout = slot_major_kv_layout(
+                    num_blocks * spec.block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    torch.float16,
+                )
 
-            k_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            v_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                k_pages = torch.zeros(
+                    num_blocks,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    dtype=torch.float16,
+                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                v_pages = torch.zeros(
+                    num_blocks,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    dtype=torch.float16,
+                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
 
-            page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_caches[layer_name] = page_cache
+                page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_caches[layer_name] = page_cache
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]
@@ -909,8 +924,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Spyre tensors. torch.spyre is registered by torch-spyre autoload.
         torch.spyre.synchronize(self._spyre_device)
 
-    def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
-        return 0, None
+    # No get_dp_padding override: vLLM removed that hook in "[Core] Simplify the Dp
+    # padding/should ubatch coordination logic" (#25768) and nothing calls it any
+    # more. DP > 1 is rejected in TorchSpyrePlatform.check_and_update_config, so
+    # there is no DP padding to neutralise on Spyre either way.
 
     def get_model(self) -> nn.Module:
         # Return the unwrapped model for isinstance checks

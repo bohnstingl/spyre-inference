@@ -77,17 +77,15 @@ def test_spyre_rotation_matches_hf(model, default_vllm_config):
 
     for layer_type, (inv_freq, _) in frequencies.items():
         head_dim = 2 * inv_freq.shape[0]
-        x = torch.randn(
-            batch, seq_len, heads, head_dim, generator=generator, dtype=torch.float32
-        )
+        x = torch.randn(batch, seq_len, heads, head_dim, generator=generator, dtype=torch.float32)
         extra = () if layer_type is None else (layer_type,)
 
         cos, sin = hf_rope(x, positions, *extra)
         if takes_qk_pair:
             x_heads_major = x.transpose(1, 2)
-            expected = apply_fn(
-                x_heads_major, x_heads_major, cos, sin, unsqueeze_dim=1
-            )[0].transpose(1, 2)
+            expected = apply_fn(x_heads_major, x_heads_major, cos, sin, unsqueeze_dim=1)[
+                0
+            ].transpose(1, 2)
         else:
             expected = apply_fn(x, cos, sin, unsqueeze_dim=2)
 

@@ -988,9 +988,14 @@ class SpyreAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # K and V are separate tensors in SpyrePagedKVCache, each with the same
-        # shape. The base vLLM API expects a single tuple here; callers like
-        # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        # K and V are separate tensors in SpyrePagedKVCache, each with this shape.
+        #
+        # No longer an upstream hook: vLLM replaced per-backend shape/stride methods
+        # with the KVCacheLayout descriptor (vllm/v1/kv_cache_layout.py) and dropped
+        # get_kv_cache_shape from AttentionBackend. It stays as Spyre's own single
+        # source of truth for the shape TorchSpyreModelRunner.initialize_kv_cache_tensors
+        # allocates and SpyreAttentionImpl.forward indexes, kept honest by
+        # tests/attention/test_spyre_attn.py.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
