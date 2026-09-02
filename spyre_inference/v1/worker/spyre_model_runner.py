@@ -838,6 +838,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         advertises. The attention kernel selects a page by indexing with a
         one-element device tensor, so the page read is a real indirect access.
 
+        ``kernel_block_sizes`` is ignored. It lets a backend view one manager block as
+        several smaller kernel blocks; Spyre never needs that split, because
+        ``SpyreAttentionBackend.get_supported_kernel_block_sizes`` advertises
+        ``MultipleOf(64)`` and the platform forces ``block_size`` to a 64-multiple, so
+        ``prepare_kernel_block_sizes`` hands back the manager block size unchanged.
+
         ``kv_cache_allocation_context`` is vLLM's sleep-mode/CuMem allocator scope.
         ``TorchSpyreWorker._maybe_get_memory_pool_context`` always hands us a
         ``nullcontext()`` — Spyre's KV cache lives on-device, not in a host-side
@@ -868,38 +874,46 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
+        # Every layer named by a KVCacheTensor gets its own pair of dense on-device
+        # tensors. Upstream packs all of a tensor's layers into one flat allocation and
+        # hands layer `l` a strided view at `offset + l * layer_stride` (see
+        # `create_kv_cache_views`); Spyre cannot offset- or shape-re-view an on-device
+        # buffer ("Unexpected stick expression", torch-spyre#3770), so the placement
+        # fields (`layer_stride`, `block_stride`, `offset`) are ignored and each layer is
+        # allocated on its own. That also means `num_blocks` has to come from the config:
+        # since the KV-cache layout refactor (vllm#51718) `KVCacheTensor.size` is the size
+        # of the whole shared allocation, not one layer's share of it.
+        num_blocks = kv_cache_config.num_blocks
+
         with kv_cache_allocation_context or nullcontext():
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                # All layers in `shared_by` use the same spec by construction.
-                spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
-                num_blocks = kv_cache_tensor.size // spec.page_size_bytes
+                for layer_name in kv_cache_tensor.layers:
+                    spec = spec_by_layer[layer_name]
 
-                # Host-allocated then transferred: only .to() takes a device_layout.
-                layout = slot_major_kv_layout(
-                    num_blocks * spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    torch.float16,
-                )
+                    # Host-allocated then transferred: only .to() takes a device_layout.
+                    layout = slot_major_kv_layout(
+                        num_blocks * spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        torch.float16,
+                    )
 
-                k_pages = torch.zeros(
-                    num_blocks,
-                    spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=torch.float16,
-                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-                v_pages = torch.zeros(
-                    num_blocks,
-                    spec.block_size,
-                    spec.num_kv_heads,
-                    spec.head_size,
-                    dtype=torch.float16,
-                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                    k_pages = torch.zeros(
+                        num_blocks,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        dtype=torch.float16,
+                    ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                    v_pages = torch.zeros(
+                        num_blocks,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        dtype=torch.float16,
+                    ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
 
-                page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
-                for layer_name in kv_cache_tensor.shared_by:
-                    kv_caches[layer_name] = page_cache
+                    kv_caches[layer_name] = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]

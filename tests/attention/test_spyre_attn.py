@@ -1058,9 +1058,10 @@ def test_kv_cache_shape_matches_runner_allocation():
     The dense paged KV cache has one physical layout used by three places:
     (1) the backend's advertised shape, (2) TorchSpyreModelRunner's allocation,
     and (3) the attention kernels. This regression test ensures they stay in
-    sync. If get_kv_cache_shape drifts, vLLM code that allocates from the
-    contract (KV transfer, future tests, Mamba zeroing via
-    get_kv_cache_block_dim) will allocate a transposed cache.
+    sync. get_kv_cache_shape is no longer an upstream hook (vllm#51718 replaced the
+    per-backend shape/stride methods with the KVCacheLayout descriptor), so this test
+    is what keeps Spyre's own single source of truth honest: if it drifts from the
+    allocation, the kernels read a transposed cache.
     """
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
@@ -1098,9 +1099,8 @@ def test_kv_cache_shape_matches_runner_allocation():
         num_blocks, block_size, num_kv_heads, head_size
     )
 
-    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples.
-    # The base-class get_kv_cache_block_dim does shape.index(_S), which fails
-    # if shape is a list. Spyre stores K and V as separate NamedTuple fields.
+    # One tuple, not a list of K/V tuples: Spyre stores K and V as separate
+    # SpyrePagedKVCache fields, each with this shape.
     assert isinstance(shape, tuple), f"get_kv_cache_shape must return a tuple, got {type(shape)}"
     assert shape == (
         num_blocks,
@@ -1117,9 +1117,15 @@ def test_kv_cache_shape_matches_runner_allocation():
         head_size=head_size,
         dtype=torch.float16,
     )
+    # `size` and the strides describe upstream's single packed allocation (one layer
+    # here, laid out layer-outermost). Spyre allocates a dense tensor per layer and
+    # ignores the placement fields, but they are set consistently so this config is a
+    # faithful stand-in for what the KV cache coordinator produces.
     kv_cache_tensor = KVCacheTensor(
         size=spec.page_size_bytes * num_blocks,
-        shared_by=["layers.0.self_attn"],
+        layers=["layers.0.self_attn"],
+        layer_stride=spec.page_size_bytes * num_blocks,
+        block_stride=spec.page_size_bytes,
     )
     kv_cache_group = KVCacheGroupSpec(
         layer_names=["layers.0.self_attn"],
