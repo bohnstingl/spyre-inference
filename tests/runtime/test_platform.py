@@ -156,23 +156,28 @@ def test_torch_accelerator_ops_are_noop():
     # the real empty_cache() return None too, so assert on identity here.
     assert torch.accelerator.empty_cache.__name__ == "_noop"
     assert torch.accelerator.synchronize.__name__ == "_noop"
+    assert torch.accelerator.empty_host_cache.__name__ == "_noop"
 
     def _raise(*args, **kwargs):
         raise RuntimeError("Cannot access accelerator device when none is available.")
 
     saved_empty_cache = torch.accelerator.empty_cache
     saved_synchronize = torch.accelerator.synchronize
+    saved_empty_host_cache = torch.accelerator.empty_host_cache
     try:
         torch.accelerator.empty_cache = _raise
         torch.accelerator.synchronize = _raise
+        torch.accelerator.empty_host_cache = _raise
 
         _disable_torch_accelerator()
 
         assert torch.accelerator.empty_cache() is None
         assert torch.accelerator.synchronize() is None
+        assert torch.accelerator.empty_host_cache() is None
     finally:
         torch.accelerator.empty_cache = saved_empty_cache
         torch.accelerator.synchronize = saved_synchronize
+        torch.accelerator.empty_host_cache = saved_empty_host_cache
 
 
 def test_block_size_valid_no_override():
@@ -380,6 +385,79 @@ def test_pad_head_dim_rejects_partial_rotary_factor():
     with pytest.raises(NotImplementedError, match="partial_rotary_factor"):
         TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
     assert hf.head_dim == 64
+
+
+class _AmbiguousRead(Exception):
+    """Raised if a test's per-layer head_dim is read as if it were global."""
+
+
+class _PerLayerHeadDims(SimpleNamespace):
+    """Stand-in for a transformers 5.x config that sizes attention heads per layer.
+
+    Gemma 4 is the live case: 256 dims per head on its sliding layers, 512 on its
+    global ones. Such a config refuses a global ``head_dim`` read
+    (``AmbiguousGlobalPerLayerAttributeError``) instead of answering with one of them.
+    """
+
+    per_layer_attributes = frozenset({"head_dim"})
+
+    def __init__(self, head_dims, **kwargs):
+        super().__init__(**kwargs)
+        self.per_layer_config = [SimpleNamespace(head_dim=d) for d in head_dims]
+
+    @property
+    def head_dim(self):
+        raise _AmbiguousRead("head_dim is per-layer here and must not be read globally")
+
+
+def _fake_per_layer_pad_config(head_dims, num_heads=8):
+    hf_config = _PerLayerHeadDims(
+        head_dims,
+        num_attention_heads=num_heads,
+        hidden_size=max(head_dims) * num_heads,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+        model_arch_config=SimpleNamespace(head_size=max(head_dims)),
+        using_transformers_backend=lambda: False,
+    )
+    return SimpleNamespace(model_config=model_config), hf_config, model_config
+
+
+def test_pad_head_dim_leaves_aligned_per_layer_widths_alone():
+    """Gemma-4's shape: 256/512 per layer, both stick-aligned, so there is nothing to
+    pad — and the ambiguous global head_dim must never be read to find that out."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_per_layer_pad_config([256, 512])
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+    assert mc.model_arch_config.head_size == 512
+
+
+def test_pad_head_dim_rejects_unaligned_per_layer_widths():
+    """Padding writes one global width, so layers that disagree cannot be served."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_per_layer_pad_config([64, 128])
+    with pytest.raises(NotImplementedError, match="per layer"):
+        TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_configured_head_dims_branches():
+    """The reader itself: per-layer views, a flat head_dim, and neither."""
+    from spyre_inference.custom_ops.head_pad import configured_head_dims
+
+    assert configured_head_dims(_PerLayerHeadDims([256, 512, 256])) == {256, 512}
+    assert configured_head_dims(SimpleNamespace(head_dim=64)) == {64}
+    # Models that size heads from hidden_size // num_heads carry no head_dim at all.
+    assert configured_head_dims(SimpleNamespace()) == set()
+    assert configured_head_dims(SimpleNamespace(head_dim=None)) == set()
 
 
 def test_reduced_rotary_dim_reason_branches():

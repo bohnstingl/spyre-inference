@@ -49,16 +49,19 @@ logger = init_logger(__name__)
 
 
 def _disable_torch_accelerator() -> None:
-    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
-    # raise "Cannot access accelerator device when none is available." Our OOT
-    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
-    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
-    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
+    # empty_host_cache() raise "Cannot access accelerator device when none is
+    # available." Our OOT platform (not CPU) makes vLLM's
+    # cleanup_dist_env_and_memory() skip its is_cpu() guard and call these at
+    # EngineCore shutdown. Patch at import to cover every process; matches
+    # vLLM's CPU worker (issue #327).
     def _noop(*args, **kwargs) -> None:
         return None
 
     torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
     torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+    if hasattr(torch.accelerator, "empty_host_cache"):
+        torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
 
 
 _disable_torch_accelerator()
@@ -146,6 +149,19 @@ class TorchSpyrePlatform(CpuPlatform):
         _spyre_patched._spyre_patched = True
         EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
 
+        # Delegate per-model EngineArgs overrides (e.g. text-only backbone
+        # selection) to spyre_inference.models before ModelConfig is built.
+        create_model_config = EngineArgs.create_model_config
+
+        @functools.wraps(create_model_config)
+        def _spyre_create_model_config(self):
+            from spyre_inference.models import apply_prelaunch_overrides
+
+            apply_prelaunch_overrides(self)
+            return create_model_config(self)
+
+        EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
+
     @classmethod
     def import_kernels(cls) -> None:
         # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
@@ -202,6 +218,11 @@ class TorchSpyrePlatform(CpuPlatform):
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
+
+        # A bare VllmConfig() (no model) reaches this hook too; every default below
+        # is model-specific.
+        if vllm_config.model_config is None:
+            return
 
         # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
         # mode between repeated invocations of this hook (e.g. in the EngineCore
@@ -319,7 +340,10 @@ class TorchSpyrePlatform(CpuPlatform):
         ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
         ``config.head_dim`` and uses ``out_proj``).
         """
-        from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
+        from spyre_inference.custom_ops.head_pad import (
+            configured_head_dims,
+            reduced_rotary_dim_reason,
+        )
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
@@ -333,9 +357,18 @@ class TorchSpyrePlatform(CpuPlatform):
         if not any(getattr(c, "rope_parameters", None) for c in cfgs):
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
-        if orig % 128 == 0:
-            return
+        head_dims = configured_head_dims(hf_config) or {hidden_size // num_heads}
+        if all(head_dim % 128 == 0 for head_dim in head_dims):
+            return  # nothing to align, whether the widths vary per layer or not
+        if len(head_dims) > 1:
+            # The override below is a single global width, so a model whose layers
+            # disagree would come out padded to one of them everywhere.
+            raise NotImplementedError(
+                f"Spyre must pad attention head_dim to a 128-multiple for stick "
+                f"alignment, but this model sizes heads per layer "
+                f"({sorted(head_dims)}) and padding is global."
+            )
+        orig = head_dims.pop()
 
         padded = ((orig + 127) // 128) * 128
         for cfg in (hf_config, model_config.hf_text_config):
@@ -364,16 +397,19 @@ class TorchSpyrePlatform(CpuPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
-        # Check if the model dtype is different from float16,
-        # which is only currently supported in torch-spyre
-        if vllm_config.model_config.dtype != torch.float16:
-            raise ValueError(
-                f"The model dtype needs to be torch.float16 for spyre, "
-                f"but was specified to be {vllm_config.model_config.dtype}"
-            )
+        # A bare VllmConfig() (no model) reaches this hook too; guard each
+        # model_config access like upstream CpuPlatform.
+        if vllm_config.model_config is not None:
+            # Check if the model dtype is different from float16,
+            # which is only currently supported in torch-spyre
+            if vllm_config.model_config.dtype != torch.float16:
+                raise ValueError(
+                    f"The model dtype needs to be torch.float16 for spyre, "
+                    f"but was specified to be {vllm_config.model_config.dtype}"
+                )
 
-        # Pad attention head_dim up to a stick-aligned size on the native path.
-        cls._maybe_pad_head_dim(vllm_config)
+            # Pad attention head_dim up to a stick-aligned size on the native path.
+            cls._maybe_pad_head_dim(vllm_config)
 
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
         # The Spyre paged attention backend requires 64-element stick alignment for
@@ -417,6 +453,12 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
+        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
+        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
+        # KV-cache manager gives every layer its own buffer; SWA is still computed
+        # in the model runner. No-op for non-hybrid models.
+        scheduler_config.disable_hybrid_kv_cache_manager = True
+
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
         # math in CpuPlatform.check_and_update_config is meaningless for us.
         # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
@@ -436,7 +478,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # internal layer-grouping (not knowable here), so we skip the cap and
         # let vLLM size the cache from the profiled memory budget instead.
         cache_config = vllm_config.cache_config
-        if cache_config.num_gpu_blocks_override is None:
+        if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_hybrid_attention(vllm_config):
                 logger.info(
                     "Hybrid attention model detected; leaving num_gpu_blocks "
