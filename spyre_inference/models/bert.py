@@ -15,7 +15,7 @@
 """Spyre adaptations for vLLM BERT-family pooling models.
 
 Every class here exists only to route ``token_type_ids`` around vLLM's
-bit-pack transport; see ``spyre_inference.models.token_type``.
+bit-pack transport; see ``spyre_inference.models._token_type``.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from vllm.model_executor.models.bert import (
     BertSpladeSparseEmbeddingModel,
 )
 
-from spyre_inference.models.token_type import (
+from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
 )

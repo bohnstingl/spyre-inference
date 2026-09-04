@@ -25,13 +25,14 @@ from typing import TYPE_CHECKING
 
 from vllm.model_executor.models.bert import BertModel
 from vllm.model_executor.models.roberta import (
+    BgeM3EmbeddingModel,
     RobertaEmbedding,
     RobertaEmbeddingModel,
     RobertaForSequenceClassification,
     RobertaForTokenClassification,
 )
 
-from spyre_inference.models.token_type import (
+from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
 )
@@ -63,7 +64,14 @@ class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
         return self.LayerNorm(embeddings)
 
 
-class SpyreRobertaEmbeddingModel(RobertaEmbeddingModel):
+class SpyreRobertaEmbeddingMixin:
+    """Inject the Spyre embedding through ``RobertaEmbeddingModel._build_model``.
+
+    A mixin rather than an override on the concrete class: ``RobertaEmbedding``
+    unpacks the bit-packed segment ids on every ``forward``, so every
+    ``RobertaEmbeddingModel`` subclass needs the swap to compile at all.
+    """
+
     def _build_model(self, vllm_config: VllmConfig, prefix: str = "") -> BertModel | BertWithRope:
         hf_config = vllm_config.model_config.hf_config
         if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
@@ -74,6 +82,14 @@ class SpyreRobertaEmbeddingModel(RobertaEmbeddingModel):
             prefix=prefix,
             embedding_class=SpyreRobertaEmbedding,
         )
+
+
+class SpyreRobertaEmbeddingModel(SpyreRobertaEmbeddingMixin, RobertaEmbeddingModel):
+    pass
+
+
+class SpyreBgeM3EmbeddingModel(SpyreRobertaEmbeddingMixin, BgeM3EmbeddingModel):
+    """BGE-M3 keeps its own ``__init__``/``_build_pooler`` (sparse + colbert heads)."""
 
 
 class SpyreRobertaForSequenceClassification(SpyreTokenTypeModel, RobertaForSequenceClassification):

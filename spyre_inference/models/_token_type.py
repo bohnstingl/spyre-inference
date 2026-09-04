@@ -14,6 +14,9 @@
 
 """Out-of-band ``token_type_ids`` transport for BERT-family encoders.
 
+Shared machinery rather than one architecture's adaptation, hence the private
+name: the modules beside it map one-to-one onto ``SPYRE_MODELS`` entries.
+
 vLLM packs segment ids into the high bits of ``input_ids`` (``TOKEN_TYPE_SHIFT``
 in ``vllm.model_executor.models.bert``) so torch.compile sees one persistent
 tensor, then unpacks them inside the embedding's ``forward``. That packing is a
@@ -48,36 +51,41 @@ class SpyreTokenTypeEmbedding:
         """Copy segment ids into an ``input_ids``-shaped buffer, zero-padded.
 
         Right-pad slots are segment 0. The buffer is reused across steps so the
-        compiled graph keeps seeing one tensor.
+        compiled graph keeps seeing one tensor, and it is re-shaped whenever the
+        padded length changes: a batch without ``token_type_ids`` still has to
+        leave an ``input_ids``-shaped buffer behind, or the next embedding would
+        add a stale one of the previous length.
         """
         buffer = self.spyre_token_type_ids
-        if token_type_ids is None:
-            if buffer is not None:
-                buffer.zero_()
+        if token_type_ids is not None:
+            dtype = token_type_ids.dtype
+        elif buffer is not None:
+            dtype = buffer.dtype
+        else:
+            # Single-segment model: the embedding falls back to all-zeros.
             return
 
         if (
             buffer is None
             or buffer.shape != input_ids.shape
             or buffer.device != input_ids.device
-            or buffer.dtype != token_type_ids.dtype
+            or buffer.dtype != dtype
         ):
-            buffer = torch.zeros(
-                input_ids.shape,
-                dtype=token_type_ids.dtype,
-                device=input_ids.device,
-            )
+            buffer = torch.zeros(input_ids.shape, dtype=dtype, device=input_ids.device)
             self.spyre_token_type_ids = buffer
         else:
             buffer.zero_()
 
-        n = token_type_ids.shape[0]
-        buffer[:n].copy_(token_type_ids[:n])
+        if token_type_ids is not None:
+            n = token_type_ids.shape[0]
+            buffer[:n].copy_(token_type_ids[:n])
 
     def spyre_token_type_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         token_type_ids = self.spyre_token_type_ids
-        if token_type_ids is None:
-            # Single-segment model: every token is segment 0.
+        if token_type_ids is None or token_type_ids.shape != input_ids.shape:
+            # No buffer: single-segment model, every token is segment 0. A
+            # mismatched one is unreachable via set_spyre_token_type_ids, and
+            # all-zeros beats failing to lower the add.
             token_type_ids = torch.zeros_like(input_ids)
         return self.token_type_embeddings(token_type_ids)
 

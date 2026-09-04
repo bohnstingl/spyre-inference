@@ -19,9 +19,15 @@ Each test exercises a single primitive that spyre-inference needs on-device
 xfail: when a primitive starts working in torch-spyre, the corresponding
 probe flips to XPASS and we can remove the associated workaround here.
 
-All tests run against the real Spyre device when available; otherwise they
-skip silently (the same pattern used by attention/test_spyre_attn.py).
+Section 10 applies the same idea to workarounds for upstream vLLM bugs: those
+probes need no device and inspect vLLM instead.
+
+All device tests run against the real Spyre device when available; otherwise
+they skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
+
+import inspect
+import re
 
 import pytest
 import torch
@@ -794,3 +800,38 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
     expected = x.cpu().float() ** 3
     torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 10. Upstream vLLM workarounds (no device needed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Gemma4SelfDecoderLayers re-stores four scalar buffers owned by "
+        "Gemma4Model as plain attributes, so model.to('spyre') leaves them on "
+        "CPU and the compiled embed_input_ids gets a 0-d CPU graph input. "
+        "Fixed upstream by vllm-project/vllm#54213; when that lands, drop "
+        "models/gemma4.py::register_aliased_scalars and its call site."
+    ),
+)
+def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
+    """The aliased scalars must be buffers, so ``.to(device)`` moves them.
+
+    Source inspection rather than construction: ``Gemma4SelfDecoderLayers`` is a
+    ``support_torch_compile`` wrapper whose ``__init__`` wants a built parent
+    model, and what the fix changes is exactly these four assignments.
+    """
+    from spyre_inference.models.gemma4 import _ALIASED_SCALARS
+
+    gemma4 = pytest.importorskip("vllm.model_executor.models.gemma4")
+    src = inspect.getsource(gemma4.Gemma4SelfDecoderLayers.__init__)
+
+    plain = [
+        name
+        for name in _ALIASED_SCALARS
+        if not re.search(rf"""register_buffer\(\s*["']{name}["']""", src)
+    ]
+    assert not plain, f"still plain attributes upstream: {plain}"
