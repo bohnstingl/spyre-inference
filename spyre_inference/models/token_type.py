@@ -95,8 +95,8 @@ class SpyreTokenTypeModel:
     spyre_embedding_class: type[nn.Module]
     spyre_encoder_attr: str = "bert"
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)  # ty: ignore[unknown-argument]
         embeddings = self.spyre_embeddings()
         upstream_class = self.spyre_embedding_class.__bases__[-1]
         if type(embeddings) is not upstream_class:
