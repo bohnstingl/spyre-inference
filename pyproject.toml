@@ -12,9 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre[cpsat]",
-    # Lower bound is a prerelease so the spec admits the 0.28.1rc*/0.29.0.dev*
-    # builds setuptools_scm derives from post-v0.28.1rc0 main (see tool.uv.sources).
-    "vllm>=0.28.1rc1,<0.30",
+    "vllm>=0.28.0,<0.29",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -111,13 +109,9 @@ USE_SPYRE_PROFILER = "0"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  # Post-v0.28.1rc0 main: no 0.29.0 tag exists yet, and the APIs this branch adapts
-  # to (KVCacheLayout replacing AttentionBackend.get_kv_cache_shape, the
-  # kv_cache_allocation_context argument, the DP-padding hook removal) all landed
-  # after v0.28.0, so a commit is the only pin that expresses the target.
-  { git = "https://github.com/vllm-project/vllm", rev = "6cddad414e" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "3358f39e91e2a34e855d488b1b9fce3c2f0d4c2f" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "e02b78ba35f9a1a69a458c3149e9c01d9f4fa6a8" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

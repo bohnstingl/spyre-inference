@@ -12,18 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Encoder / pooling helpers kept out of ``TorchSpyreModelRunner``."""
+import pytest
 
-from spyre_inference.v1.pool.spyre_pooler import (
-    SpyreAllPool,
-    configure_pooling_for_spyre,
-    copy_pooler_output_to_cpu,
-    select_rows,
-)
+from spyre_inference import envs
 
-__all__ = [
-    "SpyreAllPool",
-    "configure_pooling_for_spyre",
-    "copy_pooler_output_to_cpu",
-    "select_rows",
-]
+
+@pytest.fixture(autouse=True)
+def _clear_env_cache():
+    """envs.py caches each SPYRE_* value on first read; drop the cache around
+    every test so monkeypatched vars take effect and don't leak between tests."""
+    envs.clear_env_cache()
+    yield
+    envs.clear_env_cache()

@@ -71,8 +71,11 @@ class SpyreTransposedWeightMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        self.build_weight_t(layer, cast(torch.Tensor, layer.weight).data)
 
-        w = cast(torch.Tensor, layer.weight).data
+    def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
+        """Pad and transpose `w` into `WEIGHT_T_ATTR`. `w` need not be `layer.weight`:
+        a tied lm-head builds from a host copy, after the device move."""
         padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
         layer.spyre_row_padding = padding
         if padding:
@@ -119,8 +122,9 @@ class _SpyreTransposedLinearMixin:
 
     Mixed in before a concrete vLLM linear class so `super().__init__` builds the
     layer normally; we then replace the unquantized method with the transposed
-    one. Quantized layers keep their own method (and the slow `F.linear` path):
-    the transpose fast path only applies to unquantized weights.
+    one. Quantized layers keep their own method: FP8 uses
+    ``SpyreFp8LinearKernel`` (``aten._scaled_mm``). The transpose fast path only
+    applies to unquantized weights.
     """
 
     def __init__(self, *args, **kwargs):

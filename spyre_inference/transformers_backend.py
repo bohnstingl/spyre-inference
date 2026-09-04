@@ -63,23 +63,18 @@ def _rope_matmul_tokens_major(x: torch.Tensor, rot: torch.Tensor) -> torch.Tenso
     native path's RoPE custom op runs, so it delegates to that kernel; the kernel takes a
     single flat token axis, hence the fold and unfold around it.
     """
-    *tokens, heads, head_dim = x.shape
-    if 2 * rot.shape[-1] != head_dim:
-        # A model that rotates only part of each head (Phi-3) lays the rotated dims out
-        # contiguously, not split in halves, so the 2x2 formulation cannot stand in for it.
-        # ``_maybe_pad_head_dim`` already rejects these whenever padding is needed; this
-        # names the mismatch for the cases it does not reach, in place of the shape error
-        # the kernel would raise two frames down.
-        raise NotImplementedError(
-            f"Spyre RoPE rotates every dim of a head, but this rotation covers "
-            f"{2 * rot.shape[-1]} of {head_dim}; partial rotary is unsupported."
-        )
-    rotated = rotate_neox_2x2(
-        x.reshape(-1, heads, head_dim),
-        rot.reshape(-1, 2, 2, rot.shape[-1]),
-        head_dim,
-    )
-    return rotated.view(*tokens, heads, head_dim)
+    rope_half = inv_freq.shape[0]
+    freqs = torch.outer(torch.arange(max_position, dtype=torch.float32), inv_freq)
+    cos, sin = torch.cos(freqs) * scaling, torch.sin(freqs) * scaling
+    rot = torch.stack([cos, -sin, sin, cos], dim=1).view(max_position, 2, 2, rope_half)
+
+    if padded_head_dim is not None and padded_head_dim // 2 > rope_half:
+        identity = torch.zeros(max_position, 2, 2, padded_head_dim // 2 - rope_half)
+        identity[:, 0, 0, :] = 1.0
+        identity[:, 1, 1, :] = 1.0
+        rot = torch.cat([rot, identity], dim=-1)
+
+    return rot.to(dtype)
 
 
 def _apply_rope_matmul(x: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:
