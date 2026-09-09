@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_LX_KV_LAYOUT: bool = False
     SPYRE_ATTN_MAX_CORES: int = 0
+    SPYRE_ATTN_PAGE_GROUP: int = 1
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -77,6 +78,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 32. "0" (default) lets the LX layout pick its own cap and leaves the legacy
     # layout uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    # Number of adjacent physical KV pages processed by one online-softmax
+    # update. Experimental; one preserves the production kernel.
+    "SPYRE_ATTN_PAGE_GROUP": lambda: int(os.getenv("SPYRE_ATTN_PAGE_GROUP", "1")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

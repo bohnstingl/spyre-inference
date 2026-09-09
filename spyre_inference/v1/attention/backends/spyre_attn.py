@@ -317,6 +317,7 @@ def _page_attn_kernel(
     num_kv_heads,
     head_size,
     logits_soft_cap=0.0,
+    page_group=1,
     alibi_bias_tiles=None,
     out=None,
 ):
@@ -358,17 +359,29 @@ def _page_attn_kernel(
     tile_sum = None
     tile_output = None
 
-    for i in range(num_blocks):
+    assert num_blocks % page_group == 0
+    for group_start in range(0, num_blocks, page_group):
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = page_index_table[i, 0:1]
+        page_idx = page_index_table[group_start : group_start + page_group, 0]
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
         # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+        tile_tokens = page_group * k_page.shape[1]
+        k_page_4d = (
+            k_page.permute(2, 0, 1, 3)
+            .reshape(num_kv_heads, tile_tokens, head_size)
+            .unsqueeze(1)
+        )
+        v_page_4d = (
+            v_page.permute(2, 0, 1, 3)
+            .reshape(num_kv_heads, tile_tokens, head_size)
+            .unsqueeze(1)
+        )
 
-        mask_tile = mask_tiles[i]
+        mask_tile = torch.cat(
+            mask_tiles[group_start : group_start + page_group], dim=-1
+        )
 
         scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
@@ -380,11 +393,13 @@ def _page_attn_kernel(
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
-            scores = scores + alibi_bias_tiles[i]
+            scores = scores + torch.cat(
+                alibi_bias_tiles[group_start : group_start + page_group], dim=-1
+            )
         scores = scores + mask_tile
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
+        if group_start == 0:
             tile_max = scores_max
             tile_probs = torch.exp(scores - tile_max)
             tile_output = torch.matmul(tile_probs, v_page_4d)
@@ -1406,6 +1421,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # treat as compiled. The platform resolves compiled runs to STOCK.
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
+        self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1829,6 +1845,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self.num_kv_heads,
                 self.head_size,
                 self.logits_soft_cap,
+                self._page_group,
                 alibi_bias_tiles,
                 out_staging,
             )
@@ -2151,6 +2168,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.num_kv_heads,
                     self.head_size,
                     self.logits_soft_cap,
+                    self._page_group,
                     alibi_bias_tiles,
                     out_staging if store_out else None,
                 )
