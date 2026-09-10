@@ -1,0 +1,27 @@
+{
+  "run_label": "granite33_8b_bs128_query_fold",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 8,
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 5,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": ["online_softmax_compiled"],
+  "capture_batches": [
+    {
+      "name": "decode_q1_kv1024",
+      "query_lens": [1],
+      "seq_lens": [1024]
+    },
+    {
+      "name": "prefill_q512_kv1024",
+      "query_lens": [512],
+      "seq_lens": [1024]
+    }
+  ]
+}
