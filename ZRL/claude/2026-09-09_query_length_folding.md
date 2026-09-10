@@ -299,6 +299,53 @@ communication setup over repeated page consumption, or backend support for a
 fused gather-and-broadcast operation. Until then, multisource LX broadcast stays
 experimental and cost-selected rather than unconditional.
 
+### KV-inner query-owner ordering
+
+A torch-spyre `SPYRE_QUERY_FOLD_KV_INNER=1` prototype changes the output-dimension
+priority from query-first to KV-first for BMM-like operations:
+
+```text
+before: priorities [query, KV, output-stick, reduction]
+after:  priorities [KV, query, output-stick, reduction]
+```
+
+For `KV=8`, `Q=512`, this produces the intended split factors:
+
+```text
+KV split = 8
+query split = 4
+total = 32 cores
+```
+
+and should geometrically group four query consumers under each KV source owner.
+The graph remains correct, but the current page gather's projected read view is
+still reported as covering one core. The tensor-view projection loses the
+virtual replicated query axis before relayout classification, so changing the
+operation's radix order alone does not turn the transfer into the desired
+fanin-1/fanout-4 broadcast.
+
+Cost selection therefore disables multisource all-gather and the result is:
+
+```text
+latency: 5298.8 us
+HBM pool: 5376 KB
+```
+
+This is slower than the best earlier greedy sample (4897.4 us) and offers no HBM
+improvement. The next missing compiler concept is a broadcast operand ownership
+view that preserves a consumer-only virtual dimension:
+
+```text
+physical source split: KV=8
+consumer virtual split: query_partition=4
+owner map: source kv -> destinations kv + 8*qpart
+```
+
+That view must be derived from the BMM operand's broadcast semantics rather than
+the source tensor's physical coordinates. Until torch-spyre can represent it,
+there is no justified production spyre-inference kernel change: explicit query
+expansion is much slower, and the general all-gather is cost-selected away.
+
 ## Reproduction files
 
 ```text
