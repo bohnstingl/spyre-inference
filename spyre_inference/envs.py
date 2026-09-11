@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_LX_KV_LAYOUT: bool = False
     SPYRE_ATTN_MAX_CORES: int = 0
+    SPYRE_ATTN_QUERY_FOLD: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -77,6 +78,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 32. "0" (default) lets the LX layout pick its own cap and leaves the legacy
     # layout uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    # Use explicit KV-inner/query-partition work ownership for the folded-cache
+    # prefill kernel. The token-major kernel has a different loop frame.
+    "SPYRE_ATTN_QUERY_FOLD": lambda: bool(int(os.getenv("SPYRE_ATTN_QUERY_FOLD", "0"))),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

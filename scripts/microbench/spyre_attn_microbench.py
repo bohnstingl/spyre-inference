@@ -201,7 +201,10 @@ def build_inputs_from_requests(
     from vllm.utils.torch_utils import set_random_seed
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        head_major_kv_layout,
+        slot_major_kv_layout,
+    )
 
     assert len(query_lens) == len(seq_lens)
     for ql, sl in zip(query_lens, seq_lens):
@@ -279,6 +282,12 @@ def build_inputs_from_requests(
         if cache_device.type != "spyre" or kv_layout == "plain":
             return cache.to(cache_device)
         nb, bsz, h, d = cache.shape
+        if kv_layout == "head_major":
+            folded = cache.permute(0, 2, 1, 3).contiguous().reshape(nb * h, bsz, d)
+            return folded.to(
+                cache_device,
+                device_layout=head_major_kv_layout(nb * h, bsz, d, cache.dtype),
+            )
         layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
         if kv_layout == "slot_major":
             return cache.to(cache_device, device_layout=layout)
@@ -558,10 +567,17 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
+        ref_k = inputs["k_pages"].to("cpu")
+        ref_v = inputs["v_pages"].to("cpu")
+        if cfg.get("kv_layout") == "head_major":
+            num_pages = ref_k.shape[0] // num_kv
+            ref_shape = (num_pages, num_kv, block_size, head_size)
+            ref_k = ref_k.reshape(ref_shape).permute(0, 2, 1, 3).contiguous()
+            ref_v = ref_v.reshape(ref_shape).permute(0, 2, 1, 3).contiguous()
         ref = ref_attn(
             inputs["query_cpu"],
-            inputs["k_pages"].to("cpu"),
-            inputs["v_pages"].to("cpu"),
+            ref_k,
+            ref_v,
             inputs["query_lens"],
             inputs["seq_lens"],
             inputs["block_tables"],
@@ -694,7 +710,7 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument(
         "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill"],
+        choices=["plain", "head_major", "slot_major", "slot_major_devfill"],
         default=None,
         help="KV page device layout. 'plain' (default) is correct for a "
         "host-populated cache. 'slot_major_devfill' matches the "
@@ -786,6 +802,7 @@ def main():
             cfg["block_size"],
             cfg["num_blocks"],
             cfg["device"],
+            kv_layout=cfg.get("kv_layout", "plain"),
         )
         probe_run, _ = make_forward(
             probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]

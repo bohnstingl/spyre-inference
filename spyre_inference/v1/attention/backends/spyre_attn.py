@@ -23,6 +23,7 @@ from typing import ClassVar, NamedTuple
 
 import torch
 from torch._dynamo.utils import counters
+from torch_spyre._inductor import spyre_hint
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -470,7 +471,14 @@ def _lx_page_attn_kernel(
         mask_tile = mask_tiles[i]
 
         for g in range(num_queries_per_kv):
-            scores = torch.matmul(q_groups[g], k_t) * scale
+            if envs.SPYRE_ATTN_QUERY_FOLD and padded_query_len > 1:
+                with spyre_hint(
+                    named_dims=["KV", "Q", "T"],
+                    work_div={"KV": num_kv_heads, "Q": _SPYRE_CORES // num_kv_heads},
+                ):
+                    scores = torch.matmul(q_groups[g], k_t) * scale
+            else:
+                scores = torch.matmul(q_groups[g], k_t) * scale
             if logits_soft_cap > 0.0:
                 scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
             if alibi_bias_tiles is not None:
@@ -481,7 +489,18 @@ def _lx_page_attn_kernel(
             if i == 0:
                 probs = torch.exp(scores - scores_max)
                 tile_max.append(scores_max)
-                tile_out.append(torch.matmul(probs, v_page))
+                if envs.SPYRE_ATTN_QUERY_FOLD and padded_query_len > 1:
+                    with spyre_hint(
+                        named_dims=["KV", "Q", "D"],
+                        work_div={
+                            "KV": num_kv_heads,
+                            "Q": _SPYRE_CORES // num_kv_heads,
+                        },
+                    ):
+                        weighted = torch.matmul(probs, v_page)
+                else:
+                    weighted = torch.matmul(probs, v_page)
+                tile_out.append(weighted)
                 tile_sum.append(probs.sum(dim=-1, keepdim=True))
             else:
                 new_max = torch.maximum(tile_max[g], scores_max)
@@ -489,7 +508,18 @@ def _lx_page_attn_kernel(
                 tile_out[g] = tile_out[g] * rescale
                 tile_sum[g] = tile_sum[g] * rescale
                 probs = torch.exp(scores - new_max)
-                tile_out[g] = tile_out[g] + torch.matmul(probs, v_page)
+                if envs.SPYRE_ATTN_QUERY_FOLD and padded_query_len > 1:
+                    with spyre_hint(
+                        named_dims=["KV", "Q", "D"],
+                        work_div={
+                            "KV": num_kv_heads,
+                            "Q": _SPYRE_CORES // num_kv_heads,
+                        },
+                    ):
+                        weighted = torch.matmul(probs, v_page)
+                else:
+                    weighted = torch.matmul(probs, v_page)
+                tile_out[g] = tile_out[g] + weighted
                 tile_sum[g] = tile_sum[g] + probs.sum(dim=-1, keepdim=True)
                 tile_max[g] = new_max
 

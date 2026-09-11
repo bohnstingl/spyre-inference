@@ -484,7 +484,10 @@ def paged_attn_kernel_group_loop(
                     ) * SCALE
                 else:
                     if QUERY_BMM_WORK_DIV == "batch_query":
-                        with spyre_hint(work_div={"KV": 8, "Q": 4}):
+                        with spyre_hint(
+                            named_dims=["KV", "Q", "T"],
+                            work_div={"KV": 8, "Q": 4},
+                        ):
                             scores_raw = torch.matmul(q_g, k_t) * SCALE
                     else:
                         scores_raw = torch.matmul(q_g, k_t) * SCALE
@@ -523,7 +526,10 @@ def paged_attn_kernel_group_loop(
                         ).reshape(KV_HEADS, Q_LEN, HEAD_SIZE)
                     else:
                         if QUERY_BMM_WORK_DIV == "batch_query":
-                            with spyre_hint(work_div={"KV": 8, "Q": 4}):
+                            with spyre_hint(
+                                named_dims=["KV", "Q", "D"],
+                                work_div={"KV": 8, "Q": 4},
+                            ):
                                 tile_out[g] = torch.matmul(probs, v_3d)
                         else:
                             tile_out[g] = torch.matmul(probs, v_3d)
@@ -563,7 +569,10 @@ def paged_attn_kernel_group_loop(
                         ).reshape(KV_HEADS, Q_LEN, HEAD_SIZE)
                     else:
                         if QUERY_BMM_WORK_DIV == "batch_query":
-                            with spyre_hint(work_div={"KV": 8, "Q": 4}):
+                            with spyre_hint(
+                                named_dims=["KV", "Q", "D"],
+                                work_div={"KV": 8, "Q": 4},
+                            ):
                                 value_out = torch.matmul(probs, v_3d)
                         else:
                             value_out = torch.matmul(probs, v_3d)

@@ -5,6 +5,7 @@
   "num_kv_heads": 8,
   "head_size": 128,
   "block_size": 128,
+  "kv_layout": "head_major",
   "num_blocks": 8,
   "seed": 0,
   "warmup": 2,

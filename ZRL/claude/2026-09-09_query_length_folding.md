@@ -346,6 +346,91 @@ the source tensor's physical coordinates. Until torch-spyre can represent it,
 there is no justified production spyre-inference kernel change: explicit query
 expansion is much slower, and the general all-gather is cost-selected away.
 
+## Exact KV-specific virtual broadcast implemented
+
+The missing representation was implemented without adding a fake physical query
+axis to `PerCoreView`. A consumer-only query partition is represented by repeating
+the same physical KV owner over a larger core domain:
+
+```text
+source view:      KV split 8, physical cores 8
+destination view: KV split 8, physical cores 32
+destination KV:   core_id % 8
+```
+
+The exact routes are:
+
+```text
+source k -> k, 8+k, 16+k, 24+k
+fanin=1, fanout=4
+```
+
+This is ordinary broadcast, not multisource all-gather. Explicit routes are now
+generated for unequal source/destination core domains even when
+`SPYRE_LX_MULTISOURCE_BROADCAST=0`. Multisource gating remains necessary only
+for `fanin>1` transfers.
+
+The attention BMMs use explicit named hints:
+
+```text
+work_div = {KV: 8, Q: 4}
+```
+
+and `SPYRE_QUERY_FOLD_KV_INNER=1` keeps KV as the fastest owner coordinate for
+downstream operations. Planner evidence confirms:
+
+```text
+source:      PerCoreView(KV split 8, num_cores=8)
+destination: PerCoreView(KV split 8, owner=core_id%8, num_cores=32)
+K/V gathers: LX
+score BMM:   LX
+value BMM:   LX
+```
+
+### Standalone result
+
+Eight-page Q=512 transposed-K/head-major-V graph:
+
+| Variant | Latency | HBM pool |
+|---|---:|---:|
+| Best earlier greedy sample | 4897.4 us | 5376 KB |
+| Exact KV-specific query broadcast | **4859.0 us** | **5120 KB** |
+
+This is the first query-folded page-sharing formulation that improves both
+latency and HBM usage. The latency gain is modest (0.8%) and should be confirmed
+with interleaved/repeated runs, but it validates the theoretical ownership model.
+
+### Production result
+
+The folded-cache production kernel now has an opt-in gate:
+
+```bash
+SPYRE_LX_KV_LAYOUT=1
+SPYRE_ATTN_QUERY_FOLD=1
+SPYRE_QUERY_FOLD_KV_INNER=1
+```
+
+The microbenchmark was extended to construct and reference-check the physical
+head-major cache correctly. On `SPYRE_DEVICES=1`, `Q/KV=512/1024`:
+
+```text
+folded-cache baseline:   5610.4 us
+query-folded broadcast:  3341.5 us
+improvement:             40.4%
+```
+
+Both runs passed correctness (`max_diff=0.00488`). Decode is intentionally not
+query-folded (`Q=1`), but its measured times changed between separate compilation
+runs (879.9 us baseline versus 1990.4 us in the query-fold-enabled process). This
+requires a same-process/interleaved decode check before claiming no regression;
+the query-fold branch condition itself is false for decode.
+
+The standard token-major production kernel does not yet accept the same named
+hint: its aligned iteration frame maps `Q` to a two-stick output axis and rejects
+a four-way split. The successful production path is therefore specifically the
+folded head-major cache kernel, which already unrolls GQA groups and exposes
+`[KV,Q,...]` directly.
+
 ## Reproduction files
 
 ```text
