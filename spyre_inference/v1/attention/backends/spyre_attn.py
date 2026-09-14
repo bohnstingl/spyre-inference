@@ -171,30 +171,28 @@ def _alibi_tile_shape(
     return (num_kv_heads, num_queries_per_kv, 1, block_size)
 
 
-def _mirror_mask_tiles(
+def _mirror_mask_stacks(
     tiles_cpu: list[list[torch.Tensor]], device: torch.device
-) -> list[list[torch.Tensor]]:
-    """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
+) -> list[torch.Tensor | None]:
+    """Stack each sequence's per-block mask tiles, one transfer per sequence.
 
-    `_get_zero_tile` hands the same CPU tensor to every interior block, so
-    keying on `id()` collapses those to a single H2D transfer instead of one
-    per block. `tiles_cpu` keeps strong references for the whole call, so no
-    id can be recycled mid-flight, and sharing one device buffer across blocks
-    is safe because mask tiles are read-only by contract (see
-    `_get_zero_tile`).
+    `_page_attn_kernel` tiles its block axis with `for_each_tile`, which tiles a
+    tensor axis rather than indexing a Python list, so the per-block tiles must
+    arrive as one `[num_blocks, aligned_query_len, block_size]` tensor. One stack
+    per sequence, not one per batch: `aligned_query_len` differs across sequences.
+    `None` for a sequence with no active blocks -- the dispatch writes zeros for
+    those without consulting the mask.
+
+    This replaces an `id()`-keyed dedup that collapsed the shared all-zero
+    interior tile (`_get_zero_tile`) to one H2D transfer for the whole batch. The
+    transfer COUNT stays low (one per sequence) but the BYTES now grow with
+    num_blocks. Deliberate and temporary: `for_each_tile`'s `Gather(axis, index)`
+    spec is that dedup expressed as a tile spec, and restoring it is the follow-up.
     """
-    mirrored: dict[int, torch.Tensor] = {}
-    tiles_device: list[list[torch.Tensor]] = []
-    for seq_tiles in tiles_cpu:
-        row: list[torch.Tensor] = []
-        for tile in seq_tiles:
-            dev_tile = mirrored.get(id(tile))
-            if dev_tile is None:
-                dev_tile = convert(tile, device=device)
-                mirrored[id(tile)] = dev_tile
-            row.append(dev_tile)
-        tiles_device.append(row)
-    return tiles_device
+    return [
+        convert(torch.stack(seq_tiles), device=device) if seq_tiles else None
+        for seq_tiles in tiles_cpu
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +237,7 @@ def _page_attn_kernel(
     k_pages,
     v_pages,
     page_index_table,
-    mask_tiles,
+    mask_stack,
     scale,
     num_blocks,
     padded_query_len,
@@ -247,13 +245,17 @@ def _page_attn_kernel(
     num_kv_heads,
     head_size,
     logits_soft_cap=0.0,
-    alibi_bias_tiles=None,
+    alibi_stack=None,
     out=None,
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
 
-    Under `dynamic=False` Dynamo specializes on every non-tensor argument, so the
-    page loop is unrolled per variant.
+    The page walk is one `for_each_tile` level, not a Python loop, so the traced
+    graph holds a single block body instead of `num_blocks` copies of one. Under
+    `dynamic=False` Dynamo still specializes on every non-tensor argument, so
+    there is a variant per (num_blocks, padded_query_len, ...) combination, but
+    each variant's graph — and its compile time — no longer grows with
+    num_blocks.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
@@ -263,9 +265,12 @@ def _page_attn_kernel(
         v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
             tensor, row i holding the i-th active block's page index at
-            column 0.
-        mask_tiles: [num_blocks]
-        alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size],
+            column 0; the other 31 columns are stick padding. Extra rows are
+            tolerated and ignored, as the unrolled loop tolerated them.
+        mask_stack: [num_blocks, padded_query_len, block_size] additive mask,
+            block-major. One stacked tensor, not a list: for_each_tile tiles a
+            tensor axis. See _mirror_mask_stacks.
+        alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
             per-query-row constants — see the derivation at the bias-tile
             construction site in _online_softmax_attention.
@@ -274,6 +279,19 @@ def _page_attn_kernel(
     Returns [padded_query_len, num_heads, head_size], or ``out`` when this
     kernel stored the result itself.
     """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    # num_blocks is the tiled operands' dim-0 extent now, not a Python range, so a
+    # mask_stack that disagrees runs a different number of blocks than was asked
+    # for, rather than the extra rows being ignored.
+    assert mask_stack.shape[0] == num_blocks, (
+        f"mask_stack has {mask_stack.shape[0]} block rows, expected {num_blocks}"
+    )
+    if alibi_stack is not None:
+        assert alibi_stack.shape[0] == num_blocks, (
+            f"alibi_stack has {alibi_stack.shape[0]} block rows, expected {num_blocks}"
+        )
+
     num_queries_per_kv = num_heads // num_kv_heads
     # A compiled region reads a view from offset 0, ignoring storage_offset
     # (torch-spyre#3770), so the rows are gathered here rather than sliced outside.
@@ -284,56 +302,105 @@ def _page_attn_kernel(
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
 
-    tile_max = None
-    tile_sum = None
-    tile_output = None
+    # Gather the pages ONCE, ahead of the loop, not one page per trip inside the
+    # body. A per-trip gather reads a single page index per step -- just the loop
+    # variable, with no iteration dim beside it -- so coarse tiling has no tiled
+    # dim to resolve that advance against and bails in _plan_read_copies. (The
+    # batched decode kernel can gather inside its body: there the index row is
+    # num_seqs wide.) Same bytes moved, once instead of num_blocks times; the cost
+    # is peak footprint, the whole stack live at once. for_each_tile's
+    # Gather(axis, index) spec avoids that and is the intended follow-up.
+    #
+    # The gather runs THROUGH the permute the body used to do, so each stack
+    # arrives in matmul order: K [num_blocks, num_kv_heads, head_size, block_size]
+    # (already transposed), V [num_blocks, num_kv_heads, block_size, head_size].
+    # Not cosmetic — permuting inside the body asks to change which axis is
+    # innermost on a narrow of the stack, whose device layout the whole stack
+    # already fixed, and nothing can move the stick axis of a strided page-offset
+    # view: optimize_restickify raises "no mechanism to resolve stick
+    # incompatibility". Materializing one page per trip left its layout free to
+    # choose; permuting in the gather restores that freedom.
+    #
+    # index_select, not `k_pages[ids]`: subscripting lowers to aten.index, which
+    # upcasts the int32 index to int64 and fails eager. The row narrow is a no-op
+    # for both callers; it is here so an over-long table is ignored rather than
+    # silently adding trips.
+    ids = page_index_table[:num_blocks, 0]
+    k_stack = k_pages.permute(0, 2, 3, 1).index_select(0, ids)
+    v_stack = v_pages.permute(0, 2, 1, 3).index_select(0, ids)
 
-    for i in range(num_blocks):
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
-        # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = page_index_table[i, 0:1]
-        k_page = k_pages.index_select(0, page_idx)
-        v_page = v_pages.index_select(0, page_idx)
-        # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+    operands = [k_stack, v_stack, mask_stack, q]
+    dims: list[int | None] = [0, 0, 0, None]
+    use_alibi = alibi_stack is not None
+    if use_alibi:
+        # A trace-time branch, so the body is specialized either way and a
+        # non-ALiBi layer pays nothing. for_each_tile operands cannot be None,
+        # which is why this is a conditional operand and not a zero tensor.
+        operands.append(alibi_stack)
+        dims.append(0)
 
-        mask_tile = mask_tiles[i]
+    def block_body(carry, tiles):
+        tile_max, tile_sum, tile_output = carry
+        # Tiles are rank-preserving (narrow, not select), so each keeps a leading
+        # 1: k is [1, num_kv_heads, head_size, block_size], v is
+        # [1, num_kv_heads, block_size, head_size] and the mask
+        # [1, padded_query_len, block_size].
+        if use_alibi:
+            k_page, v_page, mask_row, q_whole, alibi_row = tiles
+        else:
+            k_page, v_page, mask_row, q_whole = tiles
+            alibi_row = None
 
-        scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+        # The stacks are already in matmul order, so a tile only needs the
+        # query-group axis the matmuls broadcast over opened up next to the
+        # KV-head axis: [1, num_kv_heads, *, *] -> [num_kv_heads, 1, *, *].
+        k_page_t = k_page.squeeze(0).unsqueeze(1)
+        v_page_4d = v_page.squeeze(0).unsqueeze(1)
+        mask_tile = mask_row[0]
+
+        scores = torch.matmul(q_whole, k_page_t) * scale
         if logits_soft_cap > 0.0:
             # Pull logits into (-cap, +cap) before the mask add so masked
             # positions still map cleanly to -inf. Applied before the ALiBi
             # bias so the positional term is not squashed by the tanh.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        if alibi_bias_tiles is not None:
+        if alibi_row is not None:
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
-            scores = scores + alibi_bias_tiles[i]
+            scores = scores + alibi_row[0]
         scores = scores + mask_tile
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page_4d)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-        else:
-            # i > 0 only reachable after the i == 0 branch initialized these.
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output += torch.matmul(tile_probs, v_page_4d)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
+        new_max = torch.maximum(tile_max, torch.amax(scores, dim=-1, keepdim=True))
+        rescale = torch.exp(tile_max - new_max)
+        tile_probs = torch.exp(scores - new_max)
+        new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
+        new_output = tile_output * rescale + torch.matmul(tile_probs, v_page_4d)
+        return (new_max, new_sum, new_output), None
 
-    assert tile_output is not None and tile_sum is not None
+    # A (-inf, 0, 0) start makes the general update reproduce the block-0 one, so
+    # no iteration is peeled: exp(-inf - m) == 0 zeroes the rescale on the first
+    # trip. Safe for every mask this builder emits, all-masked rows included,
+    # because masked positions carry finfo.min rather than -inf — so this is
+    # always -inf minus something finite, never the undefined -inf - -inf.
+    state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
+    state_kwargs = {"dtype": q.dtype, "device": q.device}
+    (_, tile_sum, tile_output), _ = for_each_tile(
+        block_body,
+        tuple(operands),
+        # Blocks slice the gathered pages, the mask and the bias; the query is
+        # read whole on every step.
+        dims=tuple(dims),
+        tile_size=1,
+        init=(
+            torch.full(state_shape, float("-inf"), **state_kwargs),
+            torch.zeros(state_shape, **state_kwargs),
+            torch.zeros(
+                (num_kv_heads, num_queries_per_kv, padded_query_len, head_size),
+                **state_kwargs,
+            ),
+        ),
+    )
     attn = tile_output / tile_sum
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
     attn = attn.reshape(padded_query_len, num_heads, head_size)
@@ -367,8 +434,9 @@ def _batched_decode_kernel(
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
-    Gathers one block at a time; block_ids rows must stay stick-aligned, since a
-    flat per-block slice does not compile.
+    Walks the blocks with one ``for_each_tile`` level rather than a Python loop,
+    so the graph holds a single copy of the body and compile time stops growing
+    with the KV length. Gathers one block per step.
 
     k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
     block_ids: [num_blocks, stick-padded num_seqs] int32, row i holding the
@@ -378,55 +446,82 @@ def _batched_decode_kernel(
     num_seqs rows instead of gathering; ``out`` None returns the result instead
     of storing it.
     """
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    # num_blocks is the tiled operands' dim-0 extent now, not a Python range, so a
+    # caller that disagrees runs a different number of blocks than it asked for.
+    assert block_ids.shape[0] == num_blocks, (
+        f"block_ids has {block_ids.shape[0]} block rows, expected {num_blocks}"
+    )
+    assert mask_by_block.shape[0] == num_blocks, (
+        f"mask_by_block has {mask_by_block.shape[0]} block rows, expected {num_blocks}"
+    )
+
     num_heads = num_kv_heads * num_queries_per_kv
     # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
     # -inf-masked and dropped by the caller, so any b_seqs-row prefix serves.
     q_rows = query[:num_seqs] if query_row_ids is None else query.index_select(0, query_row_ids)
     # lower_bmm's 4-D form takes two batch axes, so num_seqs and KV stay separate.
     q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size)
+    # Drop the builder's stick padding here, materialized, rather than slicing it
+    # off inside the body: a tiled operand's per-block stride has to equal what the
+    # body reads from its tile, which is how coarse tiling recognizes the read
+    # advances at all. Left padded that is _stick_aligned_len(num_seqs) against a
+    # read of num_seqs, which it cannot reconcile.
+    ids = block_ids[:, 0:num_seqs].contiguous()
 
-    tile_max = None
-    tile_sum = None
-    tile_output = None
-
-    for i in range(num_blocks):
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
+    def block_body(carry, tiles):
+        tile_max, tile_sum, tile_output = carry
+        # Tiles keep the block axis (narrow, not select), so the index row is
+        # [1, num_seqs] and the mask tile [1, num_seqs * KV, 1, block_size].
+        ids_row, mask_row, q_whole, k_whole, v_whole = tiles
+        # index_select, not `k_whole[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = block_ids[i, 0:num_seqs]
+        page_idx = ids_row[0]
         # Token-major cache page to head-major; a view, so do not add
         # .contiguous() -- merging these axes is what materializes the page.
-        k_page = k_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
-        v_page = v_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
+        k_page = k_whole.index_select(0, page_idx).permute(0, 2, 1, 3)
+        v_page = v_whole.index_select(0, page_idx).permute(0, 2, 1, 3)
         # Builder already broadcast across KV heads; split them back out.
-        mask_tile = mask_by_block[i].reshape(num_seqs, num_kv_heads, 1, block_size)
+        mask_tile = mask_row.reshape(num_seqs, num_kv_heads, 1, block_size)
 
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        scores = torch.matmul(q_whole, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         scores = scores + mask_tile
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-        else:
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output += torch.matmul(tile_probs, v_page)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
+        new_max = torch.maximum(tile_max, torch.amax(scores, dim=-1, keepdim=True))
+        rescale = torch.exp(tile_max - new_max)
+        tile_probs = torch.exp(scores - new_max)
+        new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
+        new_output = tile_output * rescale + torch.matmul(tile_probs, v_page)
+        return (new_max, new_sum, new_output), None
 
-    assert tile_output is not None and tile_sum is not None
+    # A (-inf, 0, 0) start makes the general update reproduce the block-0 one,
+    # so no iteration is peeled. Safe because the builder never emits an
+    # all-masked block 0: real rows have a valid page there and rows past the
+    # batch get finfo.min, both finite, so this is exp(-inf - finite) == 0 and
+    # never the undefined -inf - -inf.
+    state_shape = (num_seqs, num_kv_heads, num_queries_per_kv, 1)
+    state_kwargs = {"dtype": q.dtype, "device": q.device}
+    (_, tile_sum, tile_output), _ = for_each_tile(
+        block_body,
+        (ids, mask_by_block, q, k_pages, v_pages),
+        # Blocks slice the index rows and the mask; the pools and the query are
+        # read whole on every step.
+        dims=(0, 0, None, None, None),
+        tile_size=1,
+        init=(
+            torch.full(state_shape, float("-inf"), **state_kwargs),
+            torch.zeros(state_shape, **state_kwargs),
+            torch.zeros(
+                (num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+                **state_kwargs,
+            ),
+        ),
+    )
     attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
     if out is not None:
         # The destination prefix starts at offset 0, so torch-spyre#3770 does not
@@ -438,8 +533,13 @@ def _batched_decode_kernel(
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these.
-_page_attn_compiled = torch.compile(_page_attn_kernel, dynamic=False)
-_batched_decode_compiled = torch.compile(_batched_decode_kernel, dynamic=False)
+#
+# fullgraph is required, not just tidy: the block scan lowers to a while_loop
+# whose body reads the trip counter with .item(), which the tracing ShapeEnv only
+# permits under `one_graph or capture_scalar_outputs`. Without it the lowering
+# dies in decompose_scan_to_while_loop with DataDependentOutputException.
+_page_attn_compiled = torch.compile(_page_attn_kernel, dynamic=False, fullgraph=True)
+_batched_decode_compiled = torch.compile(_batched_decode_kernel, dynamic=False, fullgraph=True)
 
 _warmup_complete = False
 
@@ -558,8 +658,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # query_len repeat the sequence's last real row; the mask discards them.
     query_row_tables: list[torch.Tensor] | None = None
 
-    # Device mirror of attention_mask_tiles, filled once per step by forward().
-    attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+    # Device mirror of attention_mask_tiles, filled once per step by forward():
+    # one [num_blocks, aligned_query_len, block_size] stack per sequence, since
+    # _page_attn_kernel tiles the block axis rather than indexing a list. None
+    # for a sequence with no active blocks. See _mirror_mask_stacks.
+    attention_mask_stacks_device: list[torch.Tensor | None] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). query_row_ids is int64 because
@@ -1362,12 +1465,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.page_index_tables = [
                 convert(table, device=_target_device) for table in tables_cpu
             ]
-        if attn_metadata.attention_mask_tiles_device is None:
+        if attn_metadata.attention_mask_stacks_device is None:
             tiles_cpu = attn_metadata.attention_mask_tiles
             assert tiles_cpu is not None, (
                 "attention_mask_tiles must be precomputed by the metadata builder"
             )
-            attn_metadata.attention_mask_tiles_device = _mirror_mask_tiles(
+            attn_metadata.attention_mask_stacks_device = _mirror_mask_stacks(
                 tiles_cpu, _target_device
             )
 
@@ -1513,24 +1616,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             device=device,
         )
 
-        # All-zero additive tiles: values are irrelevant to tracing, and zero is
+        # All-zero additive mask: values are irrelevant to tracing, and zero is
         # the one choice that cannot leave a row fully masked (which would make
-        # tile_sum 0 and attn NaN).
-        mask_tiles = [
-            convert(torch.zeros(q_len, block_size, dtype=self.model_dtype), device=device)
-            for _ in range(bucket.num_blocks)
-        ]
+        # tile_sum 0 and attn NaN). Block-major stack, matching what
+        # _mirror_mask_stacks hands the dispatch.
+        mask_stack = convert(
+            torch.zeros(bucket.num_blocks, q_len, block_size, dtype=self.model_dtype),
+            device=device,
+        )
 
-        alibi_bias_tiles = None
+        alibi_stack = None
         if self.alibi_slopes is not None:
             tile_shape = _alibi_tile_shape(self.num_kv_heads, self.num_queries_per_kv, block_size)
-            alibi_bias_tiles = [
-                convert(
-                    torch.zeros(tile_shape, dtype=self.model_dtype),
-                    device=device,
-                )
-                for _ in range(bucket.num_blocks)
-            ]
+            alibi_stack = convert(
+                torch.zeros((bucket.num_blocks, *tile_shape), dtype=self.model_dtype),
+                device=device,
+            )
 
         self._attn_fn(
             query,
@@ -1538,7 +1639,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             k_pages,
             v_pages,
             page_index_table,
-            mask_tiles,
+            mask_stack,
             self.scale,
             bucket.num_blocks,
             q_len,
@@ -1546,7 +1647,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.num_kv_heads,
             self.head_size,
             self.logits_soft_cap,
-            alibi_bias_tiles,
+            alibi_stack,
             out_staging,
         )
 
@@ -1597,12 +1698,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output: torch.Tensor,
     ) -> None:
         # Spyre-lowering shapes drive several structural choices here:
-        # (1) block_ids_padded_cpu rows are stick-padded, so the kernel's row
-        # slice emits no Mod(d0, ...) stick expression; (2) K/V/q keep (B_seqs, KV)
-        # as the two batch axes lower_bmm allows; (3) the kernel's per-block
-        # index stays at Dynamo-trace time (torch-spyre would emit
-        # Mod(d0, num_blocks) for a runtime .select); (4) result scatter is a
-        # single contiguous copy_ at offset 0, valid because Q=1 forces
+        # (1) block_ids_padded_cpu rows are stick-padded, which keeps the host
+        # copy stickifiable (the kernel repacks them to B_seqs itself, see
+        # _batched_decode_kernel); (2) K/V/q keep (B_seqs, KV) as the two batch
+        # axes lower_bmm allows; (3) the block axis is the tiled operands' dim 0,
+        # so the kernel walks it with one for_each_tile level instead of
+        # unrolling one body per block; (4) result scatter is a single
+        # contiguous copy_ at offset 0, valid because Q=1 forces
         # query_row_ids_cpu[:num_seqs] == range(num_seqs) (asserted in builder).
         b_seqs = attn_metadata.padded_num_seqs
         b_blocks = attn_metadata.padded_batch_blocks
@@ -1695,15 +1797,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        mask_tiles_all = attn_metadata.attention_mask_tiles_device
+        mask_stacks_all = attn_metadata.attention_mask_stacks_device
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
         page_index_tables = attn_metadata.page_index_tables
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
-        assert mask_tiles_all is not None, (
-            "attention_mask_tiles_device must be mirrored by forward()"
+        assert mask_stacks_all is not None, (
+            "attention_mask_stacks_device must be mirrored by forward()"
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
@@ -1760,10 +1862,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
             # cache key misses. Narrowing belongs before the convert, not here.
             page_index_table = page_index_tables[seq_idx]
-            # mask_tiles_all[seq_idx] is indexed by position within active_bs.
-            mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
-            # A short slice here would silently hand the kernel a wrong shape.
-            assert len(mask_tiles) == len(active_bs)
+            # The stack's block axis is indexed by position within active_bs, and
+            # narrowing dim 0 from the front keeps storage_offset 0, so
+            # torch-spyre#3770 does not apply and no clone is needed. Non-None
+            # because len(active_bs) > 0 here.
+            mask_stack = mask_stacks_all[seq_idx]
+            assert mask_stack is not None
+            mask_stack = mask_stack[: len(active_bs)]
+            assert mask_stack.shape[0] == len(active_bs)
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
@@ -1783,11 +1889,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
             #
-            # Shape enforced via _alibi_tile_shape, matching _record_one's dummy tiles.
-            alibi_bias_tiles: list[torch.Tensor] | None = None
+            # Shape enforced via _alibi_tile_shape, matching _record_one's dummy
+            # stack: stacked block-major on the host, then one transfer, because
+            # the kernel tiles the block axis rather than indexing a list.
+            alibi_stack: torch.Tensor | None = None
             if self.alibi_slopes is not None:
                 context_len = kv_len - query_len
-                alibi_bias_tiles = []
+                bias_tiles = []
                 for b in active_bs:
                     kv_pos = torch.arange(
                         b * block_size,
@@ -1795,8 +1903,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                         dtype=torch.float16,
                     )
                     rel = (kv_pos - context_len).view(1, 1, 1, block_size)
-                    bias = self.alibi_slopes * rel
-                    alibi_bias_tiles.append(convert(bias, device=_target_device))
+                    bias_tiles.append(self.alibi_slopes * rel)
+                alibi_stack = convert(torch.stack(bias_tiles), device=_target_device)
 
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(
@@ -1813,7 +1921,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 k_pages,
                 v_pages,
                 page_index_table,
-                mask_tiles,
+                mask_stack,
                 self.scale,
                 len(active_bs),
                 aligned_query_lens[seq_idx],
@@ -1821,7 +1929,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self.num_kv_heads,
                 self.head_size,
                 self.logits_soft_cap,
-                alibi_bias_tiles,
+                alibi_stack,
                 out_staging if store_out else None,
             )
 
