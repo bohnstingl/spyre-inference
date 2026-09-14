@@ -32,11 +32,13 @@ from vllm.logger import _print_warning_once
 
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
-    INT32_ELEMS_PER_STICK,
     SpyreAttentionImpl,
     SpyrePagedKVCache,
     _build_query_row_tables,
-    _stick_aligned_len,
+)
+from spyre_inference.v1.attention.ops.layout import (
+    INT32_ELEMS_PER_STICK,
+    stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
@@ -84,11 +86,12 @@ def kv_cache():
     )
 
 
-def make_bucketer(max_model_len=256, max_num_batched_tokens=64):
+def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    config.scheduler_config.max_num_seqs = max_num_seqs
     return SpyreAttnBucketer(config)
 
 
@@ -280,7 +283,7 @@ class TestRecordGraphs:
 
         row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
 
-        widths = [(t.shape[-1], _stick_aligned_len(al)) for t, al in zip(row_tables, aligned)]
+        widths = [(t.shape[-1], stick_aligned_len(al)) for t, al in zip(row_tables, aligned)]
         assert all(got == want for got, want in widths), (
             f"row-table widths {widths} (got, want) differ from the recorder's, so these "
             "sequences dispatch to an unrecorded graph"
