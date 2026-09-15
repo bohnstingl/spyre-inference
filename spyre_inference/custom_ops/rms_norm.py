@@ -25,9 +25,6 @@ from .lazy_compile import CompileOutermost, compile_when_outermost
 class SpyreRMSNorm(CompileOutermost, RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     @compile_when_outermost(force_compile=True)
     def forward_oot(
         self,

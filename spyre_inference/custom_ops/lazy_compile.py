@@ -69,18 +69,12 @@ def compile_when_outermost(method: F | None = None, *, force_compile: bool = Fal
             ):
                 return method(self, *args, **kwargs)
             if self.spyre_compiled_kernel is None:
-                if force_compile:
-                    logger.info_once(
-                        "Compiling %s.%s as its own graph: force_compile is set.",
-                        type(self).__name__,
-                        method.__name__,
-                    )
-                else:
-                    logger.info_once(
-                        "Compiling %s.%s as its own graph: no enclosing graph covers it.",
-                        type(self).__name__,
-                        method.__name__,
-                    )
+                logger.info_once(
+                    "Compiling %s.%s as its own graph: %s.",
+                    type(self).__name__,
+                    method.__name__,
+                    "force_compile is set" if force_compile else "no enclosing graph covers it",
+                )
                 # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
                 self.spyre_compiled_kernel = torch.compile(
                     method.__get__(self),
