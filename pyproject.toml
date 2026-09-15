@@ -132,7 +132,7 @@ vllm = [
 # conversion; unblocks Gemma q_norm/k_norm under native FP32 RMSNorm). The commit
 # lives on a fork branch but is fetchable from this URL via refs/pull/4475/head.
 # Bump to a merged main rev once #4475 lands.
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "71fae863b4207655dc0da4e3945ee298ae5a4f2a" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "44709dd79bc7b5da8ec36015df78d49290b0f0b2" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
