@@ -20,13 +20,13 @@ which Spyre inductor cannot lower. ``TorchSpyrePlatform._maybe_pad_intermediate_
 rounds it up to a 64-multiple before the model is built; the pass here zero-fills the
 added gate/up output rows and down_proj input columns as the checkpoint streams in.
 
-Zero-padding is arithmetically inert for a supported gated MLP: each added lane has a
-zero up-projection value, so ``activation(0) * 0`` is zero. Unlike QK-norm, nothing
-normalizes over ``intermediate_size`` so no rescale is needed, and there is no RoPE
-half-split so plain end-padding (not interleaving) suffices.
+Zero-padding is arithmetically inert for a gated MLP: each added lane has a zero
+up-projection value, so ``activation(0) * 0`` is zero. Unlike QK-norm, nothing normalizes
+over ``intermediate_size`` so no rescale is needed, and there is no RoPE half-split so
+plain end-padding (not interleaving) suffices.
 
-Scope: dense SwiGLU (``gate_proj``/``up_proj``/``down_proj``, fused or separate); MoE
-experts (``moe_intermediate_size``) are out of scope — a fused expert tensor differs.
+Scope: dense gated MLPs (``gate_proj``/``up_proj``/``down_proj``, fused or separate);
+MoE experts (``moe_intermediate_size``) are out of scope — a fused expert tensor differs.
 """
 
 from __future__ import annotations
@@ -54,13 +54,27 @@ def intermediate_padding_active(hf_config) -> bool:
 
 
 def supports_intermediate_padding(hf_config) -> bool:
-    """Whether the config uses the gated MLP layout handled by this module."""
-    return getattr(hf_config, "model_type", None) in {
+    """Whether the config uses the gated MLP layout handled by this module.
+
+    Entries must build their dense gated MLP width from ``config.intermediate_size``
+    and load ``gate_proj``/``up_proj``/``down_proj`` weights (fused or separate).
+    Mistral-format ``params.json`` configs use the generic ``transformer`` model type,
+    so their architecture is required as a second discriminator.
+    """
+    model_type = getattr(hf_config, "model_type", None)
+    if model_type in {
         "gemma4",
         "gemma4_text",
+        "granite",
+        "llama",
+        "ministral3",
+        "mistral",
         "qwen2",
         "qwen3",
-    }
+    }:
+        return True
+    architectures = getattr(hf_config, "architectures", None) or ()
+    return model_type == "transformer" and "MistralForCausalLM" in architectures
 
 
 def _pad_rows_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
@@ -150,7 +164,7 @@ def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
 
 
 def verify_padded_intermediate_size(model, hf_config) -> None:
-    """Fail loudly if any SwiGLU MLP was still built at the unpadded width.
+    """Fail loudly if any gated MLP was still built at the unpadded width.
 
     Guards the silent-corruption path: the linear weight loader narrows an
     over-wide tensor to the param width without raising, so a module the config
