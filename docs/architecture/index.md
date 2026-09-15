@@ -196,6 +196,28 @@ the write can scatter through a slot-major view of it:
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
+The compiled kernels themselves — the per-sequence page attention, the batched decode
+path, the KV store, and the cache's device layout — live under
+`spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
+the host-side orchestration that calls them.
+
+### Head-major KV cache
+
+`SPYRE_ATTN_KV_LAYOUT=head_major` selects a second backend,
+`SpyreHeadMajorAttentionBackend`, that stores a page as
+`[num_blocks, num_kv_heads, block_size, head_size]` instead. The page then arrives in the
+shape the matmuls want, so step 4's per-page permute disappears — that is the whole point
+of the layout. It moves the transpose to the write: a token's KV heads are `block_size`
+rows apart, so step 2 becomes one `index_copy_` per KV head (`kv_write_index` publishes
+one index per head) over a source materialized contiguously first, rather than a single
+store of one contiguous run per token.
+
+Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
+warmup recording and dispatch — is shared with the token-major backend. What differs is
+duplicated rather than parameterised: the advertised shape, the allocation
+(`head_major_kv_layout`), and the three kernels that touch a page. The worker follows the
+layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot disagree.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
@@ -207,8 +229,8 @@ Key constraints:
   `block_size` is rounded up to the next multiple of 64
 - **GQA only**: MHA (`num_queries_per_kv = 1`) currently fails in the Spyre compiler's
   layout-propagation pass; only GQA configurations are exercised today
-- **Supported**: sliding-window masking and logits soft-capping are both handled;
-  ALiBi slopes are not
+- **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
+  layers stay unwindowed) and logits soft-capping are both handled; ALiBi slopes are not
 
 ### Encoder-only attention
 

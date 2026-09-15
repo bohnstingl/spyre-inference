@@ -122,7 +122,21 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
+    _head_major_backend_path = (
+        "spyre_inference.v1.attention.backends.spyre_head_major_attn.SpyreHeadMajorAttentionBackend"
+    )
+    _KV_LAYOUTS = ("token_major", "head_major")
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
+
+    @classmethod
+    def _decoder_backend_path(cls) -> str:
+        """The decoder attention backend for the requested KV cache layout."""
+        from spyre_inference import envs
+
+        layout = envs.SPYRE_ATTN_KV_LAYOUT
+        if layout not in cls._KV_LAYOUTS:
+            raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
+        return cls._head_major_backend_path if layout == "head_major" else cls._backend_path
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -324,8 +338,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 "SpyreEncoderAttentionBackend"
             )
         else:
-            # Standard Spyre attention.
-            backend_path = cls._backend_path
+            backend_path = cls._decoder_backend_path()
 
         # Register the selected Spyre attention implementation as CUSTOM.
         register_backend(AttentionBackendEnum.CUSTOM, backend_path)
@@ -481,6 +494,15 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
+        # The attention KV buckets are powers of two starting at block_size; a
+        # non-power-of-two block size makes that ladder start off-grid, so block
+        # counts stop being a clean doubling sequence.
+        if aligned & (aligned - 1):
+            raise ValueError(
+                f"Block size must be a power of two for the Spyre paged attention "
+                f"backend, got {aligned}."
+            )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
@@ -546,8 +568,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
         # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
-        # KV-cache manager gives every layer its own buffer; SWA is still computed
-        # in the model runner. No-op for non-hybrid models.
+        # KV-cache manager gives every layer its own buffer; SWA is still computed, per
+        # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
         scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
@@ -569,7 +591,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # Pin the on-device KV cache to what's needed to fill the batch area:
         # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
         # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
-        # one `UniformTypeKVCacheSpecs` group drawing from the single global BlockPool.
+        # a single group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
