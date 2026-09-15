@@ -201,6 +201,23 @@ path, the KV store, and the cache's device layout — live under
 `spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
 the host-side orchestration that calls them.
 
+### Head-major KV cache
+
+`SPYRE_ATTN_KV_LAYOUT=head_major` selects a second backend,
+`SpyreHeadMajorAttentionBackend`, that stores a page as
+`[num_blocks, num_kv_heads, block_size, head_size]` instead. The page then arrives in the
+shape the matmuls want, so step 4's per-page permute disappears — that is the whole point
+of the layout. It moves the transpose to the write: a token's KV heads are `block_size`
+rows apart, so step 2 becomes one `index_copy_` per KV head (`kv_write_index` publishes
+one index per head) over a source materialized contiguously first, rather than a single
+store of one contiguous run per token.
+
+Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
+warmup recording and dispatch — is shared with the token-major backend. What differs is
+duplicated rather than parameterised: the advertised shape, the allocation
+(`head_major_kv_layout`), and the three kernels that touch a page. The worker follows the
+layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot disagree.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`

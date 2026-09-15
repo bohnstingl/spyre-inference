@@ -43,7 +43,11 @@ from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
-from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK, stick_aligned_len
+from spyre_inference.v1.attention.ops.layout import (
+    INT32_ELEMS_PER_STICK,
+    slot_major_kv_layout,
+    stick_aligned_len,
+)
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
@@ -1481,6 +1485,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         q_staging, out_staging = self._staging_buffers(kv_cache[0].device)
         self.forward(layer, q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
         return realized
+
+    @classmethod
+    def allocate_pages(
+        cls, num_blocks: int, spec: AttentionSpec, device: torch.device
+    ) -> SpyrePagedKVCache:
+        """Allocate the paged K/V tensors in the layout this impl's kernels read."""
+        # Host-allocated then transferred: only .to() takes a device_layout.
+        layout = slot_major_kv_layout(
+            num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+        )
+        shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
+        return SpyrePagedKVCache(
+            k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+        )
+
+    def kv_write_index(self, slot_mapping: torch.Tensor, device: torch.device):
+        """Mirror a host slot mapping to the index ``do_kv_cache_update`` takes.
+
+        Token-major puts a token's heads in one contiguous run, so the slot is the index.
+        """
+        return convert(slot_mapping, device=device)
 
     def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
         """Slot-major views of the pages, built once outside any graph.
