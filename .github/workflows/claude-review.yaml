@@ -1,4 +1,4 @@
-name: Claude PR Review (${{ (github.event.comment.body == '/claude-review-static' || startsWith(github.event.comment.body, '/claude-review-static ')) && 'static' || 'on-hardware' }})
+name: Claude PR Review (on-hardware)
 run-name: Claude ${{ (github.event.comment.body == '/claude-review-static' || startsWith(github.event.comment.body, '/claude-review-static ')) && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number }}
 
 # ---------------------------------------------------------------------------
