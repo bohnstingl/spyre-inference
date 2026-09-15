@@ -174,8 +174,7 @@ def _build_query_row_tables(
 # ShapeEnv only permits under `one_graph or capture_scalar_outputs`. Without it
 # the lowering dies in decompose_scan_to_while_loop with
 # DataDependentOutputException.
-# _page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False, fullgraph=True)
-_page_attn_compiled = page_attn_kernel
+_page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False, fullgraph=True)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
 
 _warmup_complete = False
