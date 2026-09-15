@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Sampled hidden-state rows are gathered on Spyre before output D2H."""
+
 import torch
 import torch.nn as nn
 

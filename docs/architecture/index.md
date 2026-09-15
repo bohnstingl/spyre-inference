@@ -279,9 +279,11 @@ The weight transposes happen before that, in each layer's
 call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
-- **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling)
-- **`compute_logits`**: moves the CPU-sliced `hidden_states[logits_indices]` back onto
-  Spyre for the `SpyreParallelLMHead` matmul, which returns logits on Spyre
+- **Output**: for normal compiled generation, gather the rows selected by
+  `logits_indices` on Spyre and move only those rows to CPU. Modes that need additional
+  hidden states retain the full-output copy
+- **`compute_logits`**: moves the selected CPU hidden-state rows back onto Spyre for the
+  `SpyreParallelLMHead` matmul; logits return to CPU after projection and TP gathering
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward`. The weight moves to Spyre with the rest of the model, and the
@@ -294,10 +296,12 @@ int64 comparisons against Python int constants, which the Spyre inductor backend
 rejects), then `convert`s `masked_input`/`keep` back to Spyre before the on-device gather
 and `all_reduce`.
 
-Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (the per-sequence
-attention varlen loop, logits indexing). RoPE's rotation-cache gather and the embedding
-gather both run on-device now, so neither is among them.
+Hidden states flow on Spyre between decoder layers. The per-sequence attention varlen
+loop still crosses the device boundary, but generation's final row selection runs on
+Spyre so the full body output does not need to move to CPU. Prompt logprobs, auxiliary
+hidden-state outputs, speculative decoding, KV-sharing fast prefill, pooling, and
+unbucketed execution retain their full-output behavior. RoPE's rotation-cache gather and
+the embedding gather also run on-device.
 
 ## Transformers backend
 

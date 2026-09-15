@@ -21,7 +21,8 @@ Data flow in the current WIP version:
 - self.device = CPU. Buffers and scatter ops stay on CPU.
 - _SpyreModelWrapper converts input_ids/positions to Spyre int64 at the
   model call boundary.
-- Generative: D2H hidden_states for logits/sampling. Pooling: keep on Spyre;
+- Generative: gather sampled hidden-state rows on Spyre before D2H; modes that
+  need the full output retain the full-copy path. Pooling: keep on Spyre;
   pooler D2Hs only the final pooled vectors in ``_pool``.
 - Embedding: Spyre int64 input → Spyre compute → float16 output on Spyre.
 - Hidden states flow on Spyre between decoder layers.
@@ -289,10 +290,10 @@ class _SpyreModelWrapper:
         Convert them to int64 and provide them to the model.
 
     Output conversion (Spyre → CPU):
-        The model's final hidden_states come out on Spyre. Downstream
-        operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
-        which handles H2D/D2H for the sample_hidden_states subset.
+        The model's final hidden_states come out on Spyre. For normal generation,
+        gather the rows selected by logits_indices before D2H. Full-output
+        consumers retain the full-copy path. The selected rows return to Spyre
+        for the lm_head matmul, and logits return to CPU for sampling.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -344,7 +345,7 @@ class _SpyreModelWrapper:
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
-        # Pooling: keep on Spyre. Generative: D2H for sampling.
+        # Pooling stays on Spyre; generation D2Hs sampled rows or the full fallback.
         if not self._keep_outputs_on_device:
             result = self._outputs_to_cpu(result)
 
@@ -355,7 +356,7 @@ class _SpyreModelWrapper:
         return result
 
     def _outputs_to_cpu(self, result):
-        """Gather sampled rows on Spyre before copying model output to CPU."""
+        """D2H sampled rows from a 2-D output, or copy the complete output tree."""
         sample_rows = self._sample_rows
         object.__setattr__(self, "_sample_rows", None)
         if (
@@ -370,7 +371,7 @@ class _SpyreModelWrapper:
         return tree_map(lambda x: convert(x, device="cpu"), result)
 
     def _d2h_sampled_rows(self, hidden_states: torch.Tensor, rows: torch.Tensor):
-        """Gather rows on device before transferring them to the host."""
+        """Gather a warmed row width on device and return only the requested rows."""
         num_tokens = hidden_states.shape[0]
         rows = rows.to(device="cpu", dtype=torch.int64)
         num_rows = rows.numel()
@@ -469,14 +470,11 @@ class _SpyreModelWrapper:
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
 
-        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
-        `select_rows`), so the tensor handed to compute_logits is on CPU;
-        move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        The optimized path gathers sampled rows on Spyre before D2H and rewrites
+        logits_indices so upstream's CPU indexing is an identity operation. Fallback
+        paths copy the full output and retain upstream's original CPU selection.
+        In either case this method receives selected CPU rows and moves them to Spyre
+        for the lm_head. SpyreLogitsProcessor returns logits to CPU for sampling.
 
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
         row buckets keeps the projection on shapes warmup compiled.
@@ -622,7 +620,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = self._create_shape_bucketer()
 
-        # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
+        # Generation D2Hs sampled rows when safe; pooling keeps hidden states on Spyre.
         bucketer = self.spyre_shape_bucketer
         self.model = _SpyreModelWrapper(
             self.model,
@@ -776,10 +774,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def warming_up_model(self) -> None:
         """Warm kernels / compile.
 
-        Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then a dummy
-        logits/sampler run at each *sampled-row* width so the lm_head compiles here
-        rather than mid-request. The two bucket sets differ: body buckets are packed
-        token counts, rows are at most ``max_num_reqs``.
+        Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then warm the
+        output gather and logits/sampler at each *sampled-row* width. The two bucket
+        sets differ: body buckets are packed token counts, rows are at most
+        ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
         attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
@@ -980,7 +978,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def _build_attention_metadata(self, *args, **kwargs):
-        """Forward sampled row indices to the model output boundary."""
+        """Arm output gathering and make upstream indexing select the compact result."""
         wrapper = self.model
         rows = kwargs.get("logits_indices")
         metadata = super()._build_attention_metadata(*args, **kwargs)
@@ -993,6 +991,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             and rows is not None
             and rows.numel() > 0
         ):
+            # Preserve body offsets for the device gather, then make upstream's later
+            # hidden_states[logits_indices] an identity over the compact CPU result.
             object.__setattr__(wrapper, "_sample_rows", rows.clone())
             rows.copy_(torch.arange(rows.numel(), dtype=rows.dtype, device=rows.device))
         return metadata
