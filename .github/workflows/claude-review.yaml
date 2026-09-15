@@ -1,5 +1,5 @@
-name: Claude PR Review
-run-name: Claude ${{ (github.event.comment.body == '/claude-review-static' || startsWith(github.event.comment.body, '/claude-review-static ')) && 'static ' || '' }}review of PR #${{ github.event.issue.number }}
+name: Claude PR Review (${{ (github.event.comment.body == '/claude-review-static' || startsWith(github.event.comment.body, '/claude-review-static ')) && 'static' || 'on-hardware' }})
+run-name: Claude ${{ (github.event.comment.body == '/claude-review-static' || startsWith(github.event.comment.body, '/claude-review-static ')) && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number }}
 
 # ---------------------------------------------------------------------------
 # On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner;
