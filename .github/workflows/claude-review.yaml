@@ -42,7 +42,7 @@ jobs:
     # "Verify commenter has write access" step below, which asks the API.
     if: >-
       github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/claude-review') &&
+      (github.event.comment.body == '/claude-review' || startsWith(github.event.comment.body, '/claude-review ')) &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on:
       - x86_64
