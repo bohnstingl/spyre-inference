@@ -126,7 +126,10 @@ Two adaptations worth knowing:
   gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
   in the post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
   `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
-  since the device cannot hold both layouts at once. Each model's own adaptation module
+  since the device cannot hold both layouts at once. Tensor parallelism needs nothing
+  further: upstream shards each expert's intermediate dim, so the forms just see a
+  narrower `M` — zero-widened to whole sticks where a shard lands mid-stick — and
+  `MoERunner` all-reduces the per-rank partial sums. Each model's own adaptation module
   supplies its recipe and any model-owned scaling (`configure_gemma4_moe_layers` in
   `models/gemma4.py`). `Gemma4DecoderLayer.forward` and `MoERunner` are untouched: vLLM
   reaches the experts through `torch.ops.vllm.moe_forward`, an opaque custom op, so the
@@ -192,6 +195,11 @@ the write can scatter through a slot-major view of it:
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to its bucket |
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
+
+The compiled kernels themselves — the per-sequence page attention, the batched decode
+path, the KV store, and the cache's device layout — live under
+`spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
+the host-side orchestration that calls them.
 
 Key constraints:
 
