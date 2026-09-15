@@ -65,7 +65,11 @@ def supports_intermediate_padding(hf_config) -> bool:
     if model_type in {
         "gemma4",
         "gemma4_text",
+        "gemma",
+        "gemma2",
+        "gemma3_text",
         "granite",
+        "granitemoehybrid",
         "llama",
         "ministral3",
         "mistral",

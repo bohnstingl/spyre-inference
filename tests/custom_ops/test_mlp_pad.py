@@ -278,6 +278,10 @@ def _config_stub(*, tp=1, **fields):
         (2, {"model_type": "qwen3", "intermediate_size": 160}, 256),
         (1, {"model_type": "llama", "intermediate_size": 160}, 192),
         (1, {"model_type": "granite", "intermediate_size": 160}, 192),
+        (1, {"model_type": "gemma", "intermediate_size": 160}, 192),
+        (1, {"model_type": "gemma2", "intermediate_size": 160}, 192),
+        (1, {"model_type": "gemma3_text", "intermediate_size": 160}, 192),
+        (1, {"model_type": "granitemoehybrid", "intermediate_size": 160}, 192),
         # micro-g3.3 stays unchanged: 12800 and its TP=2 shard are stick-aligned.
         (2, {"model_type": "granite", "intermediate_size": 12800}, None),
         (1, {"model_type": "mistral", "intermediate_size": 160}, 192),
@@ -313,7 +317,8 @@ def _config_stub(*, tp=1, **fields):
         ),
         # A MoE that sizes its experts from intermediate_size would load them truncated.
         (2, {"model_type": "qwen2", "intermediate_size": 2112, "num_experts": 8}, None),
-        # BERT's MLP is not gated, so widening its config would load truncated weights.
+        # BERT's MLP is not gated: widened weights match no gate/up/down name, so startup
+        # aborts with no down_proj module.
         (2, {"model_type": "bert", "intermediate_size": 2112}, None),
     ],
 )
