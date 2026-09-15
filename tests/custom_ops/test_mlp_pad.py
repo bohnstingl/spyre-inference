@@ -30,7 +30,6 @@ from spyre_inference.custom_ops.mlp_pad import (
     _pad_weight,
     install_mlp_pad_weight_loader,
     original_intermediate_size,
-    supports_intermediate_padding,
     verify_padded_intermediate_size,
     width_multipliers,
 )
@@ -250,19 +249,15 @@ def test_install_allows_an_unpadded_config_with_any_loader():
 
 
 def test_install_allows_dummy_load_format_with_padding():
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
     hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
 
-    loader = SimpleNamespace(load_config=SimpleNamespace(load_format="dummy"))
+    loader = DummyModelLoader(LoadConfig(load_format="dummy"))
+    assert loader.load_config.load_format == "dummy"
+    assert not hasattr(loader, "get_all_weights")
     install_mlp_pad_weight_loader(loader, hf_config)
-
-
-def test_supported_intermediate_padding_models_have_gated_mlp_layouts():
-    assert supports_intermediate_padding(SimpleNamespace(model_type="gemma4"))
-    assert supports_intermediate_padding(SimpleNamespace(model_type="gemma4_text"))
-    assert supports_intermediate_padding(SimpleNamespace(model_type="qwen2"))
-    assert supports_intermediate_padding(SimpleNamespace(model_type="qwen3"))
-    assert not supports_intermediate_padding(SimpleNamespace(model_type="llama"))
-    assert not supports_intermediate_padding(SimpleNamespace())
 
 
 def _config_stub(*, tp=1, **fields):
@@ -281,6 +276,30 @@ def _config_stub(*, tp=1, **fields):
         (2, {"model_type": "gemma4", "intermediate_size": 2112}, 2176),
         (1, {"model_type": "qwen2", "intermediate_size": 160}, 192),
         (2, {"model_type": "qwen3", "intermediate_size": 160}, 256),
+        (1, {"model_type": "llama", "intermediate_size": 160}, 192),
+        (1, {"model_type": "granite", "intermediate_size": 160}, 192),
+        # micro-g3.3 stays unchanged: 12800 and its TP=2 shard are stick-aligned.
+        (2, {"model_type": "granite", "intermediate_size": 12800}, None),
+        (1, {"model_type": "mistral", "intermediate_size": 160}, 192),
+        (1, {"model_type": "ministral3", "intermediate_size": 160}, 192),
+        (
+            1,
+            {
+                "model_type": "transformer",
+                "architectures": ["MistralForCausalLM"],
+                "intermediate_size": 160,
+            },
+            192,
+        ),
+        (
+            1,
+            {
+                "model_type": "transformer",
+                "architectures": ["UnrelatedForCausalLM"],
+                "intermediate_size": 160,
+            },
+            None,
+        ),
         # A MoE with its own expert width: only the dense MLP is widened here.
         (
             2,
@@ -294,7 +313,7 @@ def _config_stub(*, tp=1, **fields):
         ),
         # A MoE that sizes its experts from intermediate_size would load them truncated.
         (2, {"model_type": "qwen2", "intermediate_size": 2112, "num_experts": 8}, None),
-        # An unsupported architecture must not mutate its config based on activation alone.
+        # BERT's MLP is not gated, so widening its config would load truncated weights.
         (2, {"model_type": "bert", "intermediate_size": 2112}, None),
     ],
 )

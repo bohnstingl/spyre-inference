@@ -409,9 +409,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
         A gated MLP whose per-rank ``intermediate_size`` is not a multiple of the fp16
         stick fuses gate+up and slices the up half at an unaligned offset, which Spyre
-        inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3``/``Gemma4MLP``
-        read ``config.intermediate_size`` directly, so overriding the config value
-        before the model is built widens the modules with no per-class shim.
+        inductor cannot lower. Supported model MLPs read ``config.intermediate_size``
+        directly, so overriding the config value before the model is built widens the
+        modules with no per-class shim.
 
         Supported dense gated MLPs only: routed experts are widened in
         ``spyre_inference.moe`` instead, and a MoE that sizes its experts from
@@ -433,13 +433,13 @@ class TorchSpyrePlatform(CpuPlatform):
         align = BLOCK_SIZE * vllm_config.parallel_config.tensor_parallel_size
         if not orig or orig % align == 0:
             return
+        if not supports_intermediate_padding(text_config):
+            return
         moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
         is_moe = any(getattr(text_config, a, None) for a in moe_attrs)
         expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
             text_config, "expert_intermediate_size", None
         )
-        if not supports_intermediate_padding(text_config):
-            return
         # Experts sized from ``intermediate_size``, or from its double-wide ``2x``
         # form (e.g. gemma4), would load truncated: the loader cannot reach the
         # stacked tensors to widen them.
