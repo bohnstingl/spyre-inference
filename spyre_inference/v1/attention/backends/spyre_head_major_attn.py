@@ -62,7 +62,12 @@ logger = init_logger(__name__)
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
-_page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
+#
+# The prefill kernel needs fullgraph because of ``for_each_tile``'s
+# DataDependentOutputException.
+_page_attn_prefill_compiled = torch.compile(
+    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=True
+)
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
 
@@ -195,13 +200,16 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     # together and `_run_page_attn` picks the one its kernel reads.
     def build_index_tables(  # ty: ignore[invalid-method-override]
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
-    ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
+    ) -> list[tuple[list[torch.Tensor], torch.Tensor | None]]:
         """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,
-        paired with the page id alone for the wide-query kernel.
+        paired with the base's stacked page-id table for the wide-query kernel.
 
         One [KV, 1] tensor per block, not rows of one table: an index tensor reaches the
         hardware as a tensor argument, so a slice's nonzero storage offset is dropped and
-        every block would gather block 0 (torch-spyre#3770).
+        every block would gather block 0 (torch-spyre#3770). The wide-query kernel walks its
+        table with `for_each_tile` instead, which advances the operand rather than slicing it,
+        so there the whole [num_blocks, INT32_ELEMS_PER_STICK] table travels as one
+        offset-0 tensor.
         """
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
@@ -213,14 +221,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     convert(int(pages[b, 0]) * self.num_kv_heads + heads, device=device)
                     for b in range(pages.shape[0])
                 ],
-                # Only a wide query reads these, and building them for a decode step would
-                # add an H2D transfer per page to the path this layout exists to speed up.
-                [
-                    convert(torch.tensor([int(pages[b, 0])], dtype=torch.int32), device=device)
-                    for b in range(pages.shape[0])
-                ]
-                if query_lens[s] > 1
-                else [],
+                # Only a wide query reads this, and building it for a decode step would add an
+                # H2D transfer to the path this layout exists to speed up.
+                convert(pages, device=device) if query_lens[s] > 1 else None,
             )
             for s, pages in enumerate(tables_cpu)
         ]
@@ -266,10 +269,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         index_table,
-        mask_tiles: list[torch.Tensor],
+        mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        alibi_bias_tiles: list[torch.Tensor] | None,
+        alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
@@ -277,6 +280,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
+            assert page_table is not None, "the wide-query table is built for query_len > 1"
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
@@ -286,7 +290,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     k_pages,
                     v_pages,
                     page_table,
-                    mask_tiles,
+                    mask_stack,
                     self.scale,
                     num_blocks,
                     padded_query_len,
@@ -309,7 +313,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 k_folded,
                 v_folded,
                 kv_row_table,
-                mask_tiles,
+                mask_stack,
                 self.scale,
                 num_blocks,
                 padded_query_len,

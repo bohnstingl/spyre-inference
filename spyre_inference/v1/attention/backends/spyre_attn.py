@@ -173,7 +173,7 @@ def _build_query_row_tables(
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these.
 #
-# page_attn needs fullgraph because of ``for_each_loop``
+# page_attn needs fullgraph because of ``for_each_tile``
 # DataDependentOutputException.
 _page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False, fullgraph=True)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
