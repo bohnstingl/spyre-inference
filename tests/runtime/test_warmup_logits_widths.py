@@ -21,7 +21,11 @@ import types
 import torch
 from vllm.config import CompilationMode
 
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+from spyre_inference.v1.worker.spyre_model_runner import (
+    TorchSpyreModelRunner,
+    _SpyreModelWrapper,
+)
+from spyre_inference.v1.worker.spyre_shape_bucketer import logits_row_buckets
 
 HIDDEN = 8
 BODY_BUCKETS = [1, 2, 4, 8, 16, 32, 512]
@@ -115,3 +119,66 @@ def test_warmup_marks_the_bucketer_warmed():
     runner.warming_up_model()
 
     assert runner.spyre_shape_bucketer.warmed_up
+
+
+class TestOutputGatherWarmup:
+    """The output row gather is warmed on every reachable (body, rows) pair.
+
+    ``select_rows`` reaches eager ``index_select``, whose torch-spyre kernel
+    specializes on both operand shapes. Warming only ``(widest_body, rows)`` leaves
+    every narrower body to compile mid-request, measured at ~0.5-1.5s per pair.
+    """
+
+    HIDDEN = 4096
+
+    def _armed_runner(self, monkeypatch, bucket_sizes=(32, 64, 128, 512), max_num_reqs=4):
+        runner, body_rows, _ = _runner(bucket_sizes=list(bucket_sizes), max_num_reqs=max_num_reqs)
+        # Real hidden width: the savings guard is a byte threshold, so HIDDEN=8
+        # would put every pair under the floor and warm nothing.
+        hidden = self.HIDDEN
+
+        def dummy_run(size, *args, **kwargs):
+            body_rows.append(size)
+            return None, torch.zeros(size, hidden, dtype=torch.float16)
+
+        runner._dummy_run = dummy_run
+        runner.model = _SpyreModelWrapper(
+            torch.nn.Identity(),
+            torch.device("cpu"),
+            logits_row_buckets=logits_row_buckets(list(bucket_sizes), max_num_reqs),
+        )
+        runner._can_trim_output_d2h = lambda: True
+
+        gathered: list[tuple[int, int]] = []
+        original = _SpyreModelWrapper._d2h_sampled_rows
+
+        def recording(wrapper, hidden_states, rows):
+            gathered.append((hidden_states.shape[0], rows.numel()))
+            return original(wrapper, hidden_states, rows)
+
+        monkeypatch.setattr(_SpyreModelWrapper, "_d2h_sampled_rows", recording)
+        runner.warming_up_model()
+        return gathered
+
+    def test_every_reachable_body_is_warmed_not_only_the_widest(self, monkeypatch):
+        gathered = self._armed_runner(monkeypatch)
+
+        bodies = {body for body, _ in gathered}
+        # 32 is excluded by the savings guard: trimming 32->4 rows of 4096 fp16
+        # saves 224 KiB, under the 256 KiB floor.
+        assert bodies == {64, 128, 512}, bodies
+
+    def test_each_body_is_warmed_at_every_row_width(self, monkeypatch):
+        # Small buckets are what make row_widths wider than one entry:
+        # min(size, max_num_reqs) over [1, 2, 4, ...] yields [1, 2, 4].
+        gathered = self._armed_runner(monkeypatch, bucket_sizes=(1, 2, 4, 64, 512))
+
+        for body in (64, 512):
+            widths = {rows for b, rows in gathered if b == body}
+            assert widths == {1, 2, 4}, (body, widths)
+
+    def test_pairs_the_runtime_would_skip_are_not_warmed(self, monkeypatch):
+        gathered = self._armed_runner(monkeypatch, bucket_sizes=(4, 8, 16))
+
+        # Every body here is too small for the gather to pay off.
+        assert gathered == []
