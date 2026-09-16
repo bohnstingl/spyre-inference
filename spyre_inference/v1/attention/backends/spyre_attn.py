@@ -141,6 +141,8 @@ def _mirror_mask_tiles(
             if dev_tile is None:
                 dev_tile = convert(tile, device=device)
                 mirrored[id(tile)] = dev_tile
+            else:
+                dev_tile = dev_tile.clone()
             row.append(dev_tile)
         tiles_device.append(row)
     return tiles_device
