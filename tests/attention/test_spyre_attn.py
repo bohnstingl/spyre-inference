@@ -34,9 +34,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _mirror_mask_tiles,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
-from spyre_inference.v1.attention.ops.batched_decode_head_major import (
-    batched_decode_head_major_kernel,
-)
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
@@ -2039,7 +2036,6 @@ def _decode_reference_fp32(
         pytest.param(6, 6, 10, 5, 2, 1, True, id="non_pow2_seq_bucket_ragged"),
     ],
 )
-@pytest.mark.parametrize("cache_layout", ["token_major", "head_major"])
 def test_batched_decode_matches_fp32_reference(
     num_seqs: int,
     b_seqs: int,
@@ -2048,14 +2044,13 @@ def test_batched_decode_matches_fp32_reference(
     num_kv_heads: int,
     qpk: int,
     ragged: bool,
-    cache_layout: str,
 ) -> None:
     """The chunked reduction equals an unchunked per-sequence softmax.
 
-    Card-free and in fp32, so it pins both cache layouts' reductions rather than
-    the fp16 tolerances the integration tests have to use. ``ragged`` masks each
-    sequence down to a different length, which is what puts wholly--inf chunks
-    and -inf padding columns in front of the running max.
+    Card-free and in fp32, so it pins the reduction itself rather than the fp16
+    tolerances the integration tests have to use. ``ragged`` masks each sequence
+    down to a different length, which is what puts wholly--inf chunks and -inf
+    padding columns in front of the running max.
     """
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -2107,20 +2102,11 @@ def test_batched_decode_matches_fp32_reference(
     query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
     query_padded[:num_seqs] = query
 
-    kernel = (
-        batched_decode_kernel if cache_layout == "token_major" else batched_decode_head_major_kernel
-    )
-    actual_k_pages = (
-        k_pages if cache_layout == "token_major" else k_pages.permute(0, 2, 1, 3).contiguous()
-    )
-    actual_v_pages = (
-        v_pages if cache_layout == "token_major" else v_pages.permute(0, 2, 1, 3).contiguous()
-    )
-    actual = kernel(
+    actual = batched_decode_kernel(
         query_padded,
         rep_row_ids,
-        actual_k_pages,
-        actual_v_pages,
+        k_pages,
+        v_pages,
         chunk_page_ids,
         mask_by_chunk,
         scale,
