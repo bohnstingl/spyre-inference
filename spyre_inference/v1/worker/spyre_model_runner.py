@@ -914,7 +914,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
-                self._warmup_output_row_gather(widest_hidden_states, bucket_sizes, row_widths)
+                # Pass the hidden size only: `widest_hidden_states` is upstream's
+                # `hidden_states[logit_indices]`, i.e. already the sampled rows on
+                # CPU, so it is neither the body width nor on Spyre.
+                self._warmup_output_row_gather(
+                    widest_hidden_states.shape[1],
+                    widest_hidden_states.dtype,
+                    bucket_sizes,
+                    row_widths,
+                )
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -924,7 +932,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._record_attention_graphs()
 
     def _warmup_output_row_gather(
-        self, hidden_states: torch.Tensor, bucket_sizes: list[int], row_widths: list[int]
+        self,
+        hidden_size: int,
+        dtype: torch.dtype,
+        bucket_sizes: list[int],
+        row_widths: list[int],
     ) -> None:
         """Compile the output row gather on every reachable (body, rows) shape.
 
@@ -935,27 +947,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         which is why the ``_worth_trimming`` filter is applied here too -- warming a
         pair the runtime will never choose only burns warmup time.
 
-        Each body is a freshly allocated tensor, not ``hidden_states[:body]``: a
-        narrowed view compiles a kernel that a real body of the same logical shape
-        does not hit, so warming through views leaves every runtime shape uncovered.
+        Takes ``hidden_size``/``dtype`` rather than a sample tensor, and allocates
+        each body on ``self._spyre_device``. Two reasons the caller's tensor cannot
+        be used: upstream's ``_dummy_run`` returns ``hidden_states[logit_indices]``,
+        which is already reduced to the sampled rows (at most ``max_num_reqs``, so
+        no body bucket is reachable from it), and generative warmup leaves it on
+        CPU, where ``select_rows`` compiles nothing for Spyre.
         """
         wrapper = getattr(self, "model", None)
         if not isinstance(wrapper, _SpyreModelWrapper) or not self._can_trim_output_d2h():
             return
-        widest = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
         pairs = {
-            (body, wrapper._padded_row_width(rows))
-            for body in bucket_sizes
-            if body <= widest
-            for rows in row_widths
+            (body, wrapper._padded_row_width(rows)) for body in bucket_sizes for rows in row_widths
         }
+        probe = torch.zeros(1, hidden_size, dtype=dtype)
         reachable = sorted(
-            (
-                (body, padded)
-                for body, padded in pairs
-                if _worth_trimming(body, padded, hidden_states)
-            ),
+            ((body, padded) for body, padded in pairs if _worth_trimming(body, padded, probe)),
             reverse=True,
         )
         if not reachable:
@@ -964,9 +971,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # compile each. Log it so the startup cost is attributable.
         logger.info("Warming output row gather on %d (bucket, rows) pairs...", len(reachable))
         for body, padded in reachable:
-            dummy = torch.zeros(
-                body, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
-            )
+            dummy = torch.zeros(body, hidden_size, dtype=dtype, device=self._spyre_device)
             rows = torch.arange(padded, dtype=torch.int64)
             wrapper._d2h_sampled_rows(dummy, rows)
             # Drop the cached device rows: nothing consumes them during warmup.

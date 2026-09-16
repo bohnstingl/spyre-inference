@@ -138,8 +138,13 @@ class TestOutputGatherWarmup:
         hidden = self.HIDDEN
 
         def dummy_run(size, *args, **kwargs):
+            # Mirror upstream: the second value is hidden_states[logit_indices],
+            # already reduced to the sampled rows and left on CPU for generation.
+            # A fake returning [size, hidden] would hide a warmup that keys off
+            # the wrong tensor -- which is exactly the defect this covers.
             body_rows.append(size)
-            return None, torch.zeros(size, hidden, dtype=torch.float16)
+            sampled = min(size, max_num_reqs)
+            return None, torch.zeros(sampled, hidden, dtype=torch.float16, device="cpu")
 
         runner._dummy_run = dummy_run
         runner.model = _SpyreModelWrapper(
@@ -182,3 +187,38 @@ class TestOutputGatherWarmup:
 
         # Every body here is too small for the gather to pay off.
         assert gathered == []
+
+    def test_warmed_bodies_are_body_buckets_on_the_spyre_device(self, monkeypatch):
+        """Regression: the warmup must not key off ``_dummy_run``'s second value.
+
+        That value is ``hidden_states[logit_indices]`` -- already reduced to at most
+        ``max_num_reqs`` rows and left on CPU. Deriving the warmup bodies from it
+        made every pair fail ``_worth_trimming`` (nothing was warmed) and allocated
+        CPU dummies, which compile no Spyre kernel. Assert both properties directly.
+        """
+        seen: list[tuple[int, str]] = []
+        original = _SpyreModelWrapper._d2h_sampled_rows
+
+        def recording(wrapper, hidden_states, rows):
+            seen.append((hidden_states.shape[0], hidden_states.device.type))
+            return original(wrapper, hidden_states, rows)
+
+        monkeypatch.setattr(_SpyreModelWrapper, "_d2h_sampled_rows", recording)
+        runner, _, _ = _runner(bucket_sizes=[1, 2, 4, 512], max_num_reqs=4)
+        hidden = self.HIDDEN
+        runner._dummy_run = lambda size, *a, **k: (
+            None,
+            torch.zeros(min(size, 4), hidden, dtype=torch.float16, device="cpu"),
+        )
+        runner.model = _SpyreModelWrapper(
+            torch.nn.Identity(),
+            torch.device("cpu"),
+            logits_row_buckets=logits_row_buckets([1, 2, 4, 512], 4),
+        )
+        runner._can_trim_output_d2h = lambda: True
+        runner.warming_up_model()
+
+        # 512 is the only body bucket wide enough to clear the byte floor.
+        assert {body for body, _ in seen} == {512}, seen
+        # Allocated on the runner's Spyre device, not wherever the sample tensor sat.
+        assert {dev for _, dev in seen} == {runner._spyre_device.type}, seen
