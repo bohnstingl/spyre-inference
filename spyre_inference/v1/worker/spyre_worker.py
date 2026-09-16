@@ -39,6 +39,7 @@ from spyre_inference import envs
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -182,6 +183,8 @@ class TorchSpyreWorker(Worker):
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
+        # Arm compile guard right after warm-up.
+        compile_guard.arm(compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD))
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

@@ -100,6 +100,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     default_encoder_len_buckets,
@@ -731,6 +732,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             fullgraph=fullgraph,
             dynamic=False,
         )
+        compile_guard.watch(self.model, f"{model_name} (whole-model graph)")
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
     def _compile_blocks(self, fullgraph: bool = True) -> int:
@@ -747,6 +749,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
                 block.compile(backend="inductor", fullgraph=fullgraph, dynamic=False)
+                # Identical blocks share one `forward` code object -- that is why this
+                # granularity shares a single artifact -- so this collapses to one
+                # registration per block *class*, which is the right granularity for
+                # the message too.
+                compile_guard.watch(block, f"{type(block).__name__} (transformer block)")
                 num_blocks += 1
         return num_blocks
 

@@ -46,12 +46,16 @@ from spyre_inference.v1.attention.ops.page_attn_head_major import page_attn_head
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
+from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
 _page_attn_compiled = torch.compile(page_attn_head_major_kernel, dynamic=False)
+
+compile_guard.watch(page_attn_head_major_kernel, "page attention kernel (head-major)")
+compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kernel (head-major)")
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8

@@ -16,6 +16,7 @@ import pytest
 from spyre_testing_plugin.tags import result_tags
 
 from spyre_inference import envs
+from spyre_inference.v1.worker import compile_guard
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +26,19 @@ def _clear_env_cache():
     envs.clear_env_cache()
     yield
     envs.clear_env_cache()
+
+
+@pytest.fixture(autouse=True)
+def _disarm_compile_guard():
+    """The compile guard installs a process-wide Dynamo callback, so an armed guard
+    leaking out of a test would raise inside an unrelated one. Registrations made at
+    import (attention kernels) are restored so ordering stays irrelevant."""
+    watched = compile_guard._guard.watched_labels()
+    compile_guard.disarm()
+    yield
+    compile_guard.reset()
+    for code, label in watched.items():
+        compile_guard.watch(code, label)
 
 
 @pytest.fixture(autouse=True)
