@@ -758,7 +758,7 @@ def test_head_major_matches_token_major(
         # Each impl builds its own device tables onto the metadata; clear the first one's
         # so the second is not handed the wrong shapes.
         attn_metadata.kernel_index_tables = None
-        attn_metadata.attention_mask_tiles_device = None
+        attn_metadata.attention_mask_stacks_device = None
         attn_metadata.query_row_tables = None
         impl.forward(
             layer=None,
