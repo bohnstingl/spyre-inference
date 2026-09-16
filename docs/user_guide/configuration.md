@@ -41,8 +41,10 @@ The reduced output transfer is used when sampled rows are the only output consum
 Prompt logprobs, auxiliary hidden-state outputs, speculative decoding, KV-sharing fast
 prefill, pooling, eager execution, and unbucketed shapes retain the full-output path. It
 is also skipped when the rows it would drop are too few to cover the gather: the gather
-costs roughly a fixed 0.2 ms while the copy it removes scales with the body, so trimming
-only pays once at least 256 KiB of hidden states would be left behind.
+is a near-fixed cost while the copy it removes scales with the body, so trimming only
+pays once enough hidden states would be left behind. All of these conditions are
+evaluated in one place before the step runs, because arming the trim rewrites the
+sampled-row indices and that rewrite cannot be undone later.
 
 ## Encoder / pooling compile buckets
 
