@@ -17,6 +17,9 @@
 from __future__ import annotations
 
 import types
+from unittest import mock
+
+import pytest
 
 import torch
 from vllm.config import CompilationMode
@@ -222,3 +225,107 @@ class TestOutputGatherWarmup:
         assert {body for body, _ in seen} == {512}, seen
         # Allocated on the runner's Spyre device, not wherever the sample tensor sat.
         assert {dev for _, dev in seen} == {runner._spyre_device.type}, seen
+
+
+class TestArming:
+    """The ``logits_indices`` rewrite happens only when the trim is certain.
+
+    The rewrite is destructive: it replaces the real body offsets with
+    ``arange(n)``. If the wrapper then declined to trim, upstream's
+    ``hidden_states[logits_indices]`` would select the first ``n`` rows of the
+    full body instead of the sampled ones, silently sampling wrong tokens. These
+    pin the invariant that the decision is made once, here, before the rewrite.
+    """
+
+    HIDDEN = 4096
+
+    def _runner_for_arming(self, *, bucket_sizes=(1, 2, 4, 512), max_num_reqs=4, **gates):
+        runner, _, _ = _runner(bucket_sizes=list(bucket_sizes), max_num_reqs=max_num_reqs)
+        runner.model = _SpyreModelWrapper(
+            torch.nn.Identity(),
+            torch.device("cpu"),
+            logits_row_buckets=logits_row_buckets(list(bucket_sizes), max_num_reqs),
+        )
+        runner.model_config = types.SimpleNamespace(
+            runner_type="generate", get_hidden_size=lambda: self.HIDDEN
+        )
+        runner.spyre_shape_bucketer.find_bucket = lambda n: n
+        runner.is_pooling_model = gates.get("is_pooling_model", False)
+        runner.num_prompt_logprobs = gates.get("num_prompt_logprobs", {})
+        runner.use_aux_hidden_state_outputs = gates.get("use_aux_hidden_state_outputs", False)
+        runner.speculative_config = gates.get("speculative_config")
+        runner.cache_config = types.SimpleNamespace(
+            kv_sharing_fast_prefill=gates.get("kv_sharing_fast_prefill", False)
+        )
+        return runner
+
+    def _build(self, runner, num_tokens, rows):
+        idx = torch.tensor(rows, dtype=torch.int64)
+        with mock.patch.object(
+            TorchSpyreModelRunner.__bases__[0],
+            "_build_attention_metadata",
+            return_value=object(),
+        ):
+            runner._build_attention_metadata(num_tokens=num_tokens, logits_indices=idx)
+        return idx, runner.model._sample_rows
+
+    def test_arms_and_rewrites_when_the_trim_is_worthwhile(self):
+        runner = self._runner_for_arming()
+
+        idx, stashed = self._build(runner, 512, [0, 255, 511])
+
+        assert stashed.tolist() == [0, 255, 511], "real offsets must be preserved"
+        assert idx.tolist() == [0, 1, 2], "indices must become an identity"
+
+    def test_does_not_rewrite_when_the_trim_is_not_worthwhile(self):
+        """The regression: a small body must keep its real offsets."""
+        runner = self._runner_for_arming()
+
+        idx, stashed = self._build(runner, 4, [3])
+
+        assert stashed is None, "must not arm a trim that will not happen"
+        assert idx.tolist() == [3], "real offsets must survive so upstream samples row 3"
+
+    def test_mixed_batch_keeps_real_offsets(self):
+        """Decodes plus a short prefill: non-identity rows, body too small to trim."""
+        runner = self._runner_for_arming()
+
+        idx, stashed = self._build(runner, 7, [0, 1, 2, 6])
+
+        assert stashed is None
+        assert idx.tolist() == [0, 1, 2, 6]
+
+    @pytest.mark.parametrize(
+        "gate",
+        [
+            {"is_pooling_model": True},
+            {"num_prompt_logprobs": {"req": 3}},
+            {"use_aux_hidden_state_outputs": True},
+            {"speculative_config": object()},
+            {"kv_sharing_fast_prefill": True},
+        ],
+    )
+    def test_gated_modes_never_arm(self, gate):
+        runner = self._runner_for_arming(**gate)
+
+        idx, stashed = self._build(runner, 512, [0, 255, 511])
+
+        assert stashed is None, f"must not arm with {gate}"
+        assert idx.tolist() == [0, 255, 511]
+
+    def test_num_tokens_passed_positionally_does_not_raise(self):
+        """Upstream may move ``num_tokens`` out of kwargs; that must not KeyError."""
+        runner = self._runner_for_arming()
+        idx = torch.tensor([0, 255, 511], dtype=torch.int64)
+
+        with mock.patch.object(
+            TorchSpyreModelRunner.__bases__[0],
+            "_build_attention_metadata",
+            return_value=object(),
+        ):
+            runner._build_attention_metadata(512, logits_indices=idx)
+
+        # Without num_tokens the trim cannot be decided, so it declines safely
+        # rather than raising or arming on an unknown body size.
+        assert runner.model._sample_rows is None
+        assert idx.tolist() == [0, 255, 511]

@@ -117,34 +117,35 @@ def test_full_copy_when_the_padded_gather_is_as_wide_as_the_body(monkeypatch):
 
 
 class TestSavingsGuard:
-    """Trimming is skipped when the gather would cost more than the copy it saves."""
+    """The trim is skipped when the gather would cost more than the copy it saves.
 
-    def test_small_body_copies_whole_output(self, monkeypatch):
-        copied: list[int] = []
-        wrapper = _wrapper(monkeypatch, buckets=[1, 4], copied=copied)
-
-        # 16 rows x 4096 x fp16 = 128 KiB of body; trimming to 1 row saves
-        # 120 KiB, under the floor, and was measured at -0.35ms.
-        _run(wrapper, 16, rows=[15])
-
-        assert copied == [16]
+    The decision lives in the runner, before ``logits_indices`` is rewritten, so
+    these cover the predicate directly; the runner wiring is covered by
+    ``TestArming`` in ``test_warmup_logits_widths.py``.
+    """
 
     def test_threshold_is_on_bytes_saved_not_rows(self):
-        wide = torch.zeros(64, 4096, dtype=torch.float16)
-        narrow = torch.zeros(64, 64, dtype=torch.float16)
+        # Same row count either side; only the wide body moves enough bytes to
+        # pay for the gather. A rows-based threshold would decide these the same
+        # way and be wrong on any model with a different hidden size.
+        assert _worth_trimming(64, 4, 4096)
+        assert not _worth_trimming(64, 4, 64)
 
-        # Same row counts, but only the wide body moves enough bytes to pay
-        # for the gather.
-        assert _worth_trimming(64, 4, wide)
-        assert not _worth_trimming(64, 4, narrow)
+    def test_no_narrowing_is_rejected(self):
+        assert not _worth_trimming(4, 4, 4096)
+        assert not _worth_trimming(4, 8, 4096)
 
     def test_floor_is_exact(self):
-        row_bytes = 4096 * 2
-        hidden = torch.zeros(4096, 4096, dtype=torch.float16)
-        exact_rows = _OUTPUT_TRIM_MIN_BYTES // row_bytes
+        exact_rows = _OUTPUT_TRIM_MIN_BYTES // (4096 * 2)
 
-        assert _worth_trimming(1 + exact_rows, 1, hidden)
-        assert not _worth_trimming(exact_rows, 1, hidden)
+        assert _worth_trimming(1 + exact_rows, 1, 4096)
+        assert not _worth_trimming(exact_rows, 1, 4096)
+
+    def test_itemsize_is_honoured(self):
+        # fp32 halves the rows needed to clear the floor.
+        rows_fp16 = _OUTPUT_TRIM_MIN_BYTES // (4096 * 2)
+        assert not _worth_trimming(rows_fp16, 1, 4096, itemsize=2)
+        assert _worth_trimming(rows_fp16, 1, 4096, itemsize=4)
 
 
 class TestNoRoundTrip:
