@@ -179,8 +179,11 @@ own layer name and compiles separately, which is worse than the whole-model grap
 runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
 defeats sharing the same way, by folding each block's weights into its own graph.
 
-Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
-never in the compiled region; `compute_logits` is a separate call on the wrapper.
+Embeddings and the final norm sit outside the block list, so no enclosing block graph
+covers them. The embedding stays eager when compilation is off; the final norm does not —
+`SpyreRMSNorm`/`SpyreGemmaRMSNorm` pass `force_compile=True`, so they compile as their own
+one-op graph in every mode, including `enforce_eager`. `lm_head` was never in the compiled
+region; `compute_logits` is a separate call on the wrapper.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.
@@ -362,8 +365,9 @@ device before compile, leaving only an `index_select` in the graph — plus a ma
 only has to rebuild the rotation cache at the pre-pad frequencies.
 
 Because the fusers key on class names, the OOT registry also covers the fused norms
-(`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`); otherwise they fall back to
-`forward_native` and its fp32 promotion.
+(`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`); otherwise they would run
+`forward_native` uncompiled, which is the broken-eager EA case the OOT wrapper exists to
+avoid (row 1 of the table above).
 
 ## Distributed (TP)
 

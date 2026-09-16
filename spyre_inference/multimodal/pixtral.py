@@ -358,9 +358,10 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     The patch-embedding conv is absent on purpose: `SpyreConv2d` in
     `custom_ops/conv.py` handles it through OOT dispatch.
 
-    `model` and `device` are unused: every remaining patch rewrites upstream module
-    attributes rather than a loaded instance. They stay for the `apply(model, device)`
-    contract the sibling architecture modules share.
+    `device` is unused: every patch either rewrites upstream module attributes or reads
+    the device off the tensors it sees. It stays for the `apply(model, device)` contract
+    the sibling architecture modules share. `model` is used —
+    `patch_pre_transformer_norm` wraps the loaded tower's `ln_pre` instance.
     """
     try:
         from vllm.model_executor.models import pixtral
