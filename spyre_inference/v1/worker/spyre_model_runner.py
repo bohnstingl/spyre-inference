@@ -338,10 +338,6 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_sample_rows", None)
-        # Set when the sampled rows were gathered on Spyre: the padded device
-        # tensor plus the CPU copy handed upstream. ``compute_logits`` reuses the
-        # device tensor instead of sending the same rows back H2D.
-        object.__setattr__(self, "_gathered_rows", None)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -384,7 +380,6 @@ class _SpyreModelWrapper:
     def _outputs_to_cpu(self, result):
         sample_rows = self._sample_rows
         object.__setattr__(self, "_sample_rows", None)
-        object.__setattr__(self, "_gathered_rows", None)
         if sample_rows is not None:
             # The runner committed to the trim and rewrote logits_indices, so the
             # output must be the 2-D Spyre tensor the gather expects. Falling back
@@ -395,7 +390,7 @@ class _SpyreModelWrapper:
                 and result.dim() == 2
                 and result.device.type == self._spyre_device.type
             ):
-                raise AssertionError(
+                raise RuntimeError(
                     "output row trim was armed, but the model output is not a 2-D "
                     f"{self._spyre_device.type} tensor "
                     f"(got {type(result).__name__}"
@@ -434,11 +429,7 @@ class _SpyreModelWrapper:
             gather_rows = F.pad(rows, (0, padded_rows - num_rows), value=int(rows[-1]))
 
         gathered = select_rows(hidden_states, gather_rows)
-        sampled = convert(gathered, device="cpu")[:num_rows]
-        # The lm_head wants exactly these rows back on Spyre at exactly this
-        # padded width. Keep the device tensor so compute_logits can skip the H2D.
-        object.__setattr__(self, "_gathered_rows", (sampled, gathered))
-        return sampled
+        return convert(gathered, device="cpu")[:num_rows]
 
     def embed_multimodal(self, **kwargs):
         """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
@@ -530,48 +521,15 @@ class _SpyreModelWrapper:
         num_rows = hidden_states.shape[0]
         padded_rows = self._padded_row_width(num_rows)
 
-        device_rows = self._take_gathered_rows(hidden_states, padded_rows)
-        if device_rows is not None:
-            hidden_states = device_rows
-        else:
-            if padded_rows != num_rows:
-                hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
-            hidden_states = convert(hidden_states, device=self._spyre_device)
+        if padded_rows != num_rows:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
+        hidden_states = convert(hidden_states, device=self._spyre_device)
 
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
             logits = logits[:num_rows]
         return logits
-
-    def _take_gathered_rows(self, hidden_states: torch.Tensor, padded_rows: int):
-        """Return the Spyre-resident copy of ``hidden_states``, or None.
-
-        ``_d2h_sampled_rows`` already gathered these rows on Spyre and padded them
-        to ``padded_rows``; reusing that tensor avoids sending the same rows back
-        H2D. The cache is consumed unconditionally so a mismatch cannot leak into
-        a later step.
-
-        Upstream re-materializes the rows via ``hidden_states[logits_indices]``,
-        which copies, so identity and storage cannot be compared. Verify by value
-        instead: the tensor is only ``[num_rows, hidden]``, and any interposed
-        transform (a logits-processor hook, spec decode) makes the check fail and
-        falls back to the H2D path.
-        """
-        cached = self._gathered_rows
-        object.__setattr__(self, "_gathered_rows", None)
-        if cached is None:
-            return None
-        sampled_cpu, gathered_device = cached
-        if (
-            gathered_device.shape[0] != padded_rows
-            or sampled_cpu.shape != hidden_states.shape
-            or sampled_cpu.dtype != hidden_states.dtype
-            or hidden_states.device.type != "cpu"
-            or not torch.equal(sampled_cpu, hidden_states)
-        ):
-            return None
-        return gathered_device
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -955,7 +913,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         not cover a narrower body: an unwarmed pair costs ~0.5-1.5s of compile
         mid-request. Walk the same pairs ``_d2h_sampled_rows`` can select at runtime,
         which is why the ``_worth_trimming`` filter is applied here too -- warming a
-        pair the runtime will never choose only burns warmup time.
+        pair the runtime will never choose only burns warmup time. Its inputs must
+        match the ones ``_build_attention_metadata`` passes, ``itemsize`` included:
+        a filter here that is stricter than the runtime's leaves a pair the runtime
+        will arm unwarmed, which is the compile this method exists to remove.
 
         Takes ``hidden_size``/``dtype`` rather than a sample tensor, and allocates
         each body on ``self._spyre_device``. Two reasons the caller's tensor cannot
@@ -974,7 +935,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             (
                 (body, padded)
                 for body, padded in pairs
-                if _worth_trimming(body, padded, hidden_size)
+                if _worth_trimming(body, padded, hidden_size, dtype.itemsize)
             ),
             reverse=True,
         )
@@ -987,8 +948,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             dummy = torch.zeros(body, hidden_size, dtype=dtype, device=self._spyre_device)
             rows = torch.arange(padded, dtype=torch.int64)
             wrapper._d2h_sampled_rows(dummy, rows)
-            # Drop the cached device rows: nothing consumes them during warmup.
-            object.__setattr__(wrapper, "_gathered_rows", None)
 
     @torch.inference_mode()
     def _record_encoder_pack_graphs(self) -> None:
@@ -1147,20 +1106,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rows = kwargs.get("logits_indices")
         metadata = super()._build_attention_metadata(*args, **kwargs)
         bucketer = self.spyre_shape_bucketer
-        # Positional passthrough: upstream may move num_tokens out of kwargs.
-        num_tokens = kwargs.get("num_tokens")
+        # ``num_tokens`` is upstream's first parameter and may be passed positionally.
+        num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if (
             not isinstance(wrapper, _SpyreModelWrapper)
             or bucketer is None
             or num_tokens is None
-            or bucketer.find_bucket(num_tokens) is None
             or not self._can_trim_output_d2h()
             or rows is None
             or rows.numel() == 0
         ):
             return metadata
-        if not _worth_trimming(
-            num_tokens, wrapper._padded_row_width(rows.numel()), self.model_config.get_hidden_size()
+        body_rows = bucketer.find_bucket(num_tokens)
+        if body_rows is None or not _worth_trimming(
+            body_rows,
+            wrapper._padded_row_width(rows.numel()),
+            self.model_config.get_hidden_size(),
+            self.model_config.dtype.itemsize,
         ):
             return metadata
 

@@ -20,7 +20,6 @@ import types
 from unittest import mock
 
 import pytest
-
 import torch
 from vllm.config import CompilationMode
 
@@ -42,6 +41,9 @@ class _Bucketer:
 
     def mark_warmed_up(self):
         self.warmed_up = True
+
+    def find_bucket(self, num_tokens):
+        return next((size for size in self.bucket_sizes if size >= num_tokens), None)
 
 
 def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
@@ -134,7 +136,13 @@ class TestOutputGatherWarmup:
 
     HIDDEN = 4096
 
-    def _armed_runner(self, monkeypatch, bucket_sizes=(32, 64, 128, 512), max_num_reqs=4):
+    def _armed_runner(
+        self,
+        monkeypatch,
+        bucket_sizes=(32, 64, 128, 512),
+        max_num_reqs=4,
+        dtype=torch.float16,
+    ):
         runner, body_rows, _ = _runner(bucket_sizes=list(bucket_sizes), max_num_reqs=max_num_reqs)
         # Real hidden width: the savings guard is a byte threshold, so HIDDEN=8
         # would put every pair under the floor and warm nothing.
@@ -147,7 +155,7 @@ class TestOutputGatherWarmup:
             # the wrong tensor -- which is exactly the defect this covers.
             body_rows.append(size)
             sampled = min(size, max_num_reqs)
-            return None, torch.zeros(sampled, hidden, dtype=torch.float16, device="cpu")
+            return None, torch.zeros(sampled, hidden, dtype=dtype, device="cpu")
 
         runner._dummy_run = dummy_run
         runner.model = _SpyreModelWrapper(
@@ -191,6 +199,23 @@ class TestOutputGatherWarmup:
         # Every body here is too small for the gather to pay off.
         assert gathered == []
 
+    @pytest.mark.parametrize(
+        ("dtype", "expected"),
+        [(torch.float16, {64}), (torch.float32, {32, 64})],
+    )
+    def test_the_savings_filter_uses_the_hidden_state_itemsize(self, monkeypatch, dtype, expected):
+        """The warmup filter must not be stricter than the runtime's.
+
+        ``_build_attention_metadata`` arms on ``model_config.dtype.itemsize``. A
+        warmup hardcoded to 2 bytes would skip the 32-row body at fp32 -- which the
+        runtime then arms, paying the mid-request compile this warmup removes.
+        Body 32 trims to 4 rows of 4096: 224 KiB at fp16 (under the floor), 448 KiB
+        at fp32 (over it).
+        """
+        gathered = self._armed_runner(monkeypatch, bucket_sizes=(32, 64), dtype=dtype)
+
+        assert {body for body, _ in gathered} == expected, gathered
+
     def test_warmed_bodies_are_body_buckets_on_the_spyre_device(self, monkeypatch):
         """Regression: the warmup must not key off ``_dummy_run``'s second value.
 
@@ -200,14 +225,13 @@ class TestOutputGatherWarmup:
         CPU dummies, which compile no Spyre kernel. Assert both properties directly.
         """
         seen: list[tuple[int, str]] = []
-        original = _SpyreModelWrapper._d2h_sampled_rows
 
         def recording(wrapper, hidden_states, rows):
             seen.append((hidden_states.shape[0], hidden_states.device.type))
-            return original(wrapper, hidden_states, rows)
 
         monkeypatch.setattr(_SpyreModelWrapper, "_d2h_sampled_rows", recording)
         runner, _, _ = _runner(bucket_sizes=[1, 2, 4, 512], max_num_reqs=4)
+        runner._spyre_device = torch.device("meta")
         hidden = self.HIDDEN
         runner._dummy_run = lambda size, *a, **k: (
             None,
@@ -215,7 +239,7 @@ class TestOutputGatherWarmup:
         )
         runner.model = _SpyreModelWrapper(
             torch.nn.Identity(),
-            torch.device("cpu"),
+            runner._spyre_device,
             logits_row_buckets=logits_row_buckets([1, 2, 4, 512], 4),
         )
         runner._can_trim_output_d2h = lambda: True
@@ -239,7 +263,7 @@ class TestArming:
 
     HIDDEN = 4096
 
-    def _runner_for_arming(self, *, bucket_sizes=(1, 2, 4, 512), max_num_reqs=4, **gates):
+    def _runner_for_arming(self, *, bucket_sizes=(1, 2, 4, 8, 512), max_num_reqs=4, **gates):
         runner, _, _ = _runner(bucket_sizes=list(bucket_sizes), max_num_reqs=max_num_reqs)
         runner.model = _SpyreModelWrapper(
             torch.nn.Identity(),
@@ -247,9 +271,8 @@ class TestArming:
             logits_row_buckets=logits_row_buckets(list(bucket_sizes), max_num_reqs),
         )
         runner.model_config = types.SimpleNamespace(
-            runner_type="generate", get_hidden_size=lambda: self.HIDDEN
+            runner_type="generate", dtype=torch.float16, get_hidden_size=lambda: self.HIDDEN
         )
-        runner.spyre_shape_bucketer.find_bucket = lambda n: n
         runner.is_pooling_model = gates.get("is_pooling_model", False)
         runner.num_prompt_logprobs = gates.get("num_prompt_logprobs", {})
         runner.use_aux_hidden_state_outputs = gates.get("use_aux_hidden_state_outputs", False)
@@ -295,6 +318,25 @@ class TestArming:
         assert stashed is None
         assert idx.tolist() == [0, 1, 2, 6]
 
+    def test_uses_the_padded_body_bucket_for_the_savings_guard(self):
+        runner = self._runner_for_arming(bucket_sizes=(64, 128), max_num_reqs=64)
+
+        rows = [*range(63), 127]
+        idx, stashed = self._build(runner, 65, rows)
+
+        assert stashed.tolist() == rows
+        assert idx.tolist() == list(range(64))
+
+    def test_uses_the_model_dtype_itemsize_for_the_savings_guard(self):
+        runner = self._runner_for_arming(bucket_sizes=(64, 128), max_num_reqs=64)
+        runner.model_config.dtype = torch.float32
+        runner.model_config.get_hidden_size = lambda: 1024
+
+        idx, stashed = self._build(runner, 65, list(range(64)))
+
+        assert stashed.tolist() == list(range(64))
+        assert idx.tolist() == list(range(64))
+
     @pytest.mark.parametrize(
         "gate",
         [
@@ -313,8 +355,8 @@ class TestArming:
         assert stashed is None, f"must not arm with {gate}"
         assert idx.tolist() == [0, 255, 511]
 
-    def test_num_tokens_passed_positionally_does_not_raise(self):
-        """Upstream may move ``num_tokens`` out of kwargs; that must not KeyError."""
+    def test_num_tokens_passed_positionally_arms_the_trim(self):
+        """Upstream may pass its first ``num_tokens`` parameter positionally."""
         runner = self._runner_for_arming()
         idx = torch.tensor([0, 255, 511], dtype=torch.int64)
 
@@ -325,7 +367,5 @@ class TestArming:
         ):
             runner._build_attention_metadata(512, logits_indices=idx)
 
-        # Without num_tokens the trim cannot be decided, so it declines safely
-        # rather than raising or arming on an unknown body size.
-        assert runner.model._sample_rows is None
-        assert idx.tolist() == [0, 255, 511]
+        assert runner.model._sample_rows.tolist() == [0, 255, 511]
+        assert idx.tolist() == [0, 1, 2]
