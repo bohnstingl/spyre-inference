@@ -50,6 +50,7 @@ from spyre_inference.v1.attention.ops.layout import (
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
     SpyreAttnBatchedDecodeBucket,
@@ -174,8 +175,9 @@ def _build_query_row_tables(
 # hold the per-sequence Python loop around these.
 #
 # page_attn needs fullgraph because of ``for_each_tile``
-# DataDependentOutputException.
-_page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False, fullgraph=True)
+# DataDependentOutputException, so the requirement follows the walk's own gate: with
+# SPYRE_ATTN_FOR_EACH_TILE unset this is the pre-for_each_tile compilation exactly.
+_page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
 
 _warmup_complete = False

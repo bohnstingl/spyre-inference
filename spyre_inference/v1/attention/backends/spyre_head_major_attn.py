@@ -56,6 +56,7 @@ from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 
 logger = init_logger(__name__)
 
@@ -64,9 +65,10 @@ logger = init_logger(__name__)
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
 #
 # The prefill kernel needs fullgraph because of ``for_each_tile``'s
-# DataDependentOutputException.
+# DataDependentOutputException, so the requirement follows the walk's own gate: with
+# SPYRE_ATTN_FOR_EACH_TILE unset this is the pre-for_each_tile compilation exactly.
 _page_attn_prefill_compiled = torch.compile(
-    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=True
+    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)

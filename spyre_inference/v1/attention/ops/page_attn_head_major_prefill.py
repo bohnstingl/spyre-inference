@@ -22,6 +22,8 @@ amortised over every query row, so this kernel spends it instead: batched GQA ov
 
 import torch
 
+from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+
 
 def page_attn_head_major_prefill_kernel(
     query,
@@ -42,16 +44,16 @@ def page_attn_head_major_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    The page walk uses `for_each_tile`, so the graph holds one block body rather than an
-    unrolled copy per page. Shapes are ``page_attn_head_major``'s, except:
+    With SPYRE_ATTN_FOR_EACH_TILE set the page walk goes through `for_each_tile` and the
+    graph holds one block body rather than an unrolled copy per page; unset, the same body
+    runs under a plain Python loop. See `walk_tiles`. Shapes are
+    ``page_attn_head_major``'s, except:
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor, row i
             holding the i-th active block's page index at column 0, indexing
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
         mask_tiles: [num_blocks, padded_query_len, block_size] additive masks, stacked
             block-major so the block axis is the one `for_each_tile` walks.
     """
-    from torch_spyre._inductor.wsr import for_each_tile
-
     num_queries_per_kv = num_heads // num_kv_heads
 
     # Gathered, not sliced: a compiled region reads a view from offset 0 and ignores its
@@ -63,14 +65,13 @@ def page_attn_head_major_prefill_kernel(
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
 
-    # `for_each_tile` consumes tensor axes, so what the unrolled walk read per block arrives
+    # The tiled walk consumes tensor axes, so what the unrolled walk read per block arrives
     # stacked on dim 0. The page gather, score calculation, and online-softmax update
     # otherwise follow the unrolled loop body directly.
     operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_tiles[:num_blocks], q)
     dims: tuple[int | None, ...] = (0, None, None, 0, None)
 
     def block_body(carry, tiles):
-        tile_max, tile_sum, tile_output = carry
         page_index, k_pages, v_pages, mask_tile, q = tiles
 
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
@@ -87,6 +88,19 @@ def page_attn_head_major_prefill_kernel(
         scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
+        if carry is None:
+            # First tile of the Python-loop path: the carry is built here rather than
+            # rescaled from an init constant. Equal to the tiled path's first trip against
+            # a -inf/0/0 carry, whose rescale is exp(-inf - max) = 0. See `walk_tiles` for
+            # why that constant cannot be materialized here.
+            tile_probs = torch.exp(scores - scores_max)
+            return (
+                scores_max,
+                tile_probs.sum(dim=-1, keepdim=True),
+                torch.matmul(tile_probs, v_page),
+            ), None
+
+        tile_max, tile_sum, tile_output = carry
         new_max = torch.maximum(tile_max, scores_max)
         rescale = torch.exp(tile_max - new_max)
         tile_probs = torch.exp(scores - new_max)
@@ -94,12 +108,9 @@ def page_attn_head_major_prefill_kernel(
         new_output = tile_output * rescale + torch.matmul(tile_probs, v_page)
         return (new_max, new_sum, new_output), None
 
-    # The -inf/0/0 init makes trip 0 the same expression as every other trip: its rescale is
-    # exp(-inf - max) = 0, which is exact as long as the first block's mask leaves one finite
-    # lane per query row — true because a masked lane is finfo.min, not -inf.
     state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = for_each_tile(
+    (_, tile_sum, tile_output), _ = walk_tiles(
         block_body,
         operands,
         dims=dims,

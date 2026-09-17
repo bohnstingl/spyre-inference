@@ -16,6 +16,8 @@
 
 import torch
 
+from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+
 
 def page_attn_kernel(
     query,
@@ -36,9 +38,10 @@ def page_attn_kernel(
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
 
-    Under `dynamic=False` Dynamo specializes on every non-tensor argument. The
-    page walk uses `for_each_tile`, so its graph has one block body rather than an
-    unrolled copy per page.
+    Under `dynamic=False` Dynamo specializes on every non-tensor argument, so a
+    Python page loop is unrolled per variant. With SPYRE_ATTN_FOR_EACH_TILE set the
+    walk goes through `for_each_tile` instead and the graph holds one block body;
+    unset, the same body runs under a plain loop. See `walk_tiles`.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
@@ -71,10 +74,8 @@ def page_attn_kernel(
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
 
-    from torch_spyre._inductor.wsr import for_each_tile
-
-    # `for_each_tile` consumes tensor axes, so the baseline's per-block lists
-    # arrive stacked on dim 0. The table, page gather, score calculation, and
+    # The tiled walk consumes tensor axes, so the baseline's per-block lists arrive
+    # stacked on dim 0. The table, page gather, score calculation, and
     # online-softmax update otherwise follow the baseline loop body directly.
     operands = [
         page_index_table[:num_blocks],
@@ -89,7 +90,6 @@ def page_attn_kernel(
         dims.append(0)
 
     def block_body(carry, tiles):
-        tile_max, tile_sum, tile_output = carry
         if alibi_bias_tiles is not None:
             page_index, k_pages, v_pages, mask_tile, q, alibi_bias_tile = tiles
         else:
@@ -115,6 +115,20 @@ def page_attn_kernel(
         scores = scores + mask_tile[0]
 
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+        if carry is None:
+            # First tile of the Python-loop path: the carry is built here rather
+            # than rescaled from an init constant. Equal to the tiled path's first
+            # trip against a -inf/0/0 carry, whose rescale is exp(-inf - max) = 0.
+            # See `walk_tiles` for why that constant cannot be materialized here.
+            tile_probs = torch.exp(scores - scores_max)
+            return (
+                scores_max,
+                tile_probs.sum(dim=-1, keepdim=True),
+                torch.matmul(tile_probs, v_page_4d),
+            ), None
+
+        tile_max, tile_sum, tile_output = carry
         new_max = torch.maximum(tile_max, scores_max)
         rescale = torch.exp(tile_max - new_max)
         tile_probs = torch.exp(scores - new_max)
@@ -124,7 +138,7 @@ def page_attn_kernel(
 
     state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
-    (_, tile_sum, tile_output), _ = for_each_tile(
+    (_, tile_sum, tile_output), _ = walk_tiles(
         block_body,
         tuple(operands),
         dims=tuple(dims),
