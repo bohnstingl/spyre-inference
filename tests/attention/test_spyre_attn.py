@@ -1812,12 +1812,11 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     assert md.blocks_per_chunk is not None, "batched decode declined this batch"
     assert md.mask_by_chunk_cpu is not None
     entries = md.padded_num_seqs * md.blocks_per_chunk
-    assert md.mask_by_chunk_cpu.shape[1] == entries * num_kv_heads, (
-        f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; the kernel reshapes it to "
-        f"{entries} x {num_kv_heads}"
+    assert md.mask_by_chunk_cpu.shape[1] == entries, (
+        f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; expected one row per sequence/block entry"
     )
-    # The shape the kernel actually asks for.
-    md.mask_by_chunk_cpu[0].reshape(entries, num_kv_heads, 1, block_size)
+    # Both token- and head-major kernels broadcast this over KV heads.
+    md.mask_by_chunk_cpu[0].reshape(num_seqs, md.blocks_per_chunk, 1, 1, block_size)
 
 
 def _decode_reference_fp32(
