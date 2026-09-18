@@ -25,6 +25,7 @@ def page_attn_kernel(
     k_pages,
     v_pages,
     page_index_table,
+    mask_index_table,
     mask_tiles,
     scale,
     num_blocks,
@@ -52,9 +53,11 @@ def page_attn_kernel(
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
             tensor, row i holding the i-th active block's page index at
             column 0.
-        mask_tiles: [num_blocks, padded_query_len, block_size] additive masks,
-            stacked block-major for `for_each_tile`.
-        alibi_bias_tiles: [num_blocks, num_kv_heads, num_queries_per_kv, 1,
+        mask_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
+            tensor, row i holding the mask pool row at column 0.
+        mask_tiles: [max_num_blocks, padded_query_len, block_size] additive
+            mask pool.
+        alibi_bias_tiles: [max_num_blocks, num_kv_heads, num_queries_per_kv, 1,
             block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
             per-query-row constants; see the derivation at the bias-tile
@@ -78,26 +81,29 @@ def page_attn_kernel(
     # stacked on dim 0. The table, page gather, score calculation, and
     # online-softmax update otherwise follow the baseline loop body directly.
     operands = [
-        page_index_table[:num_blocks],
+        page_index_table,
+        mask_index_table,
         k_pages,
         v_pages,
-        mask_tiles[:num_blocks],
+        mask_tiles,
         q,
     ]
-    dims: list[int | None] = [0, None, None, 0, None]
+    dims: list[int | None] = [0, 0, None, None, None, None]
     if alibi_bias_tiles is not None:
-        operands.append(alibi_bias_tiles[:num_blocks])
-        dims.append(0)
+        operands.append(alibi_bias_tiles)
+        dims.append(None)
 
     def block_body(carry, tiles):
         if alibi_bias_tiles is not None:
-            page_index, k_pages, v_pages, mask_tile, q, alibi_bias_tile = tiles
+            page_index, mask_index, k_pages, v_pages, mask_tiles, q, alibi_pool = tiles
         else:
-            page_index, k_pages, v_pages, mask_tile, q = tiles
+            page_index, mask_index, k_pages, v_pages, mask_tiles, q = tiles
 
         page_idx = page_index[0, 0:1]
+        mask_idx = mask_index[0, 0:1]
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
+        mask_tile = mask_tiles.index_select(0, mask_idx)
         k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
         v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
@@ -111,6 +117,7 @@ def page_attn_kernel(
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
+            alibi_bias_tile = alibi_pool.index_select(0, mask_idx)
             scores = scores + alibi_bias_tile[0]
         scores = scores + mask_tile[0]
 
