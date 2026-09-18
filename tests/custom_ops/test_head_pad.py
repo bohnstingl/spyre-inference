@@ -233,16 +233,18 @@ def test_pad_weight_qk_norm_reproduces_the_original_rmsnorm():
 def test_fix_padded_qk_norm_eps_scales_only_qk_norms():
     q_norm = torch.nn.Module()
     q_norm.variance_epsilon = 1e-6
-    other_norm = torch.nn.Module()
-    other_norm.variance_epsilon = 1e-6
+    q_norm.weight = torch.nn.Parameter(torch.ones(_ORIG))
+    other_q_norm = torch.nn.Module()
+    other_q_norm.variance_epsilon = 1e-6
+    other_q_norm.weight = torch.nn.Parameter(torch.ones(_ORIG * 7))
     model = torch.nn.Module()
     model.q_norm = q_norm
-    model.other_norm = other_norm
+    model.other_q_norm = other_q_norm
 
     fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
 
     assert q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
-    assert other_norm.variance_epsilon == pytest.approx(1e-6)
+    assert other_q_norm.variance_epsilon == pytest.approx(1e-6)
 
 
 def test_pad_weight_leaves_a_norm_of_another_width_alone():

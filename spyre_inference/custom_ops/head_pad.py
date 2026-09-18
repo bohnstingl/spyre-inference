@@ -336,7 +336,13 @@ def fix_padded_qk_norm_eps(model, hf_config) -> None:
     padded = hf_config.head_dim
     n = 0
     for name, module in model.named_modules():
-        if not name.endswith(("q_norm", "k_norm")) or not hasattr(module, "variance_epsilon"):
+        weight = getattr(module, "weight", None)
+        if (
+            not name.endswith(("q_norm", "k_norm"))
+            or not hasattr(module, "variance_epsilon")
+            or weight is None
+            or weight.numel() != orig
+        ):
             continue
         if getattr(module, "_spyre_padded_qk_norm_eps", False):
             continue
