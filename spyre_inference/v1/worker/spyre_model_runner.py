@@ -293,7 +293,7 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
 _OUTPUT_TRIM_MIN_BYTES = 256 * 1024
 
 
-def _worth_trimming(num_tokens: int, padded_rows: int, hidden_size: int, itemsize: int = 2) -> bool:
+def _worth_trimming(body_rows: int, padded_rows: int, hidden_size: int, itemsize: int = 2) -> bool:
     """Whether an on-device row gather beats copying the whole body output.
 
     Requires the gather to actually narrow the copy, and the copy it removes to be
@@ -301,9 +301,9 @@ def _worth_trimming(num_tokens: int, padded_rows: int, hidden_size: int, itemsiz
     tensor so the runner can evaluate it before the body has run -- the trim
     decision must be final before ``logits_indices`` is rewritten.
     """
-    if padded_rows >= num_tokens:
+    if padded_rows >= body_rows:
         return False
-    return (num_tokens - padded_rows) * hidden_size * itemsize >= _OUTPUT_TRIM_MIN_BYTES
+    return (body_rows - padded_rows) * hidden_size * itemsize >= _OUTPUT_TRIM_MIN_BYTES
 
 
 class _SpyreModelWrapper:
@@ -882,15 +882,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
-                # Pass the hidden size only: `widest_hidden_states` is upstream's
-                # `hidden_states[logit_indices]`, i.e. already the sampled rows on
-                # CPU, so it is neither the body width nor on Spyre.
-                self._warmup_output_row_gather(
-                    widest_hidden_states.shape[1],
-                    widest_hidden_states.dtype,
-                    bucket_sizes,
-                    row_widths,
-                )
+                self._warmup_output_row_gather(bucket_sizes, row_widths)
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -901,8 +893,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _warmup_output_row_gather(
         self,
-        hidden_size: int,
-        dtype: torch.dtype,
         bucket_sizes: list[int],
         row_widths: list[int],
     ) -> None:
@@ -918,16 +908,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         a filter here that is stricter than the runtime's leaves a pair the runtime
         will arm unwarmed, which is the compile this method exists to remove.
 
-        Takes ``hidden_size``/``dtype`` rather than a sample tensor, and allocates
-        each body on ``self._spyre_device``. Two reasons the caller's tensor cannot
-        be used: upstream's ``_dummy_run`` returns ``hidden_states[logit_indices]``,
-        which is already reduced to the sampled rows (at most ``max_num_reqs``, so
-        no body bucket is reachable from it), and generative warmup leaves it on
-        CPU, where ``select_rows`` compiles nothing for Spyre.
+        Uses the same model-config hidden size and dtype as the runtime guard, then
+        allocates each body on ``self._spyre_device``. The ``_dummy_run`` output
+        cannot provide those inputs: it is upstream's ``hidden_states[logit_indices]``,
+        already reduced to the sampled rows (at most ``max_num_reqs``) and left on
+        CPU for generative warmup.
         """
         wrapper = getattr(self, "model", None)
         if not isinstance(wrapper, _SpyreModelWrapper) or not self._can_trim_output_d2h():
             return
+        hidden_size = self.model_config.get_hidden_size()
+        dtype = self.model_config.dtype
         pairs = {
             (body, wrapper._padded_row_width(rows)) for body in bucket_sizes for rows in row_widths
         }

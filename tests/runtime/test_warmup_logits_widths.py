@@ -56,7 +56,11 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
         mode=CompilationMode.NONE,
     )
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner.model_config = types.SimpleNamespace(runner_type="generate")
+    runner.model_config = types.SimpleNamespace(
+        runner_type="generate",
+        dtype=torch.float16,
+        get_hidden_size=lambda: HIDDEN,
+    )
     runner.vllm_config = types.SimpleNamespace(
         model_config=types.SimpleNamespace(enforce_eager=False),
         compilation_config=compilation_config,
@@ -147,6 +151,11 @@ class TestOutputGatherWarmup:
         # Real hidden width: the savings guard is a byte threshold, so HIDDEN=8
         # would put every pair under the floor and warm nothing.
         hidden = self.HIDDEN
+        runner.model_config = types.SimpleNamespace(
+            runner_type="generate",
+            dtype=dtype,
+            get_hidden_size=lambda: hidden,
+        )
 
         def dummy_run(size, *args, **kwargs):
             # Mirror upstream: the second value is hidden_states[logit_indices],
@@ -203,7 +212,7 @@ class TestOutputGatherWarmup:
         ("dtype", "expected"),
         [(torch.float16, {64}), (torch.float32, {32, 64})],
     )
-    def test_the_savings_filter_uses_the_hidden_state_itemsize(self, monkeypatch, dtype, expected):
+    def test_the_savings_filter_uses_the_model_dtype_itemsize(self, monkeypatch, dtype, expected):
         """The warmup filter must not be stricter than the runtime's.
 
         ``_build_attention_metadata`` arms on ``model_config.dtype.itemsize``. A
@@ -233,6 +242,11 @@ class TestOutputGatherWarmup:
         runner, _, _ = _runner(bucket_sizes=[1, 2, 4, 512], max_num_reqs=4)
         runner._spyre_device = torch.device("meta")
         hidden = self.HIDDEN
+        runner.model_config = types.SimpleNamespace(
+            runner_type="generate",
+            dtype=torch.float16,
+            get_hidden_size=lambda: hidden,
+        )
         runner._dummy_run = lambda size, *a, **k: (
             None,
             torch.zeros(min(size, 4), hidden, dtype=torch.float16, device="cpu"),
