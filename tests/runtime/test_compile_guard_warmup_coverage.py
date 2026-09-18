@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import copy
 import types
+import unittest.mock
 
 import pytest
 import torch
 from torch._dynamo.utils import counters
 from vllm.config import CompilationMode
+from vllm.model_executor.layers.attention.attention import Attention
 
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.compile_guard import (
@@ -50,14 +52,29 @@ UNWARMED_TOKENS = 6
 
 
 class _Block(torch.nn.Module):
-    """One transformer block's stand-in: compiled once, guarded on its row count."""
+    """One transformer block's stand-in: compiled once, guarded on its row count.
 
-    def __init__(self) -> None:
+    Carries a real ``Attention`` so ``_repeated_block_lists`` recognises the list as a
+    decoder stack, which is what makes ``_compile_blocks`` compile and register it.
+    """
+
+    def __init__(self, attn: Attention) -> None:
         super().__init__()
         self.linear = torch.nn.Linear(HIDDEN, HIDDEN, bias=False)
+        # Never called: it exists so the block looks like a decoder layer. Its own
+        # forward would need a KV cache and an attention metadata object.
+        self.self_attn = attn
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.relu(self.linear(hidden))
+
+
+class _Decoder(torch.nn.Module):
+    """A model shaped the way ``_repeated_block_lists`` expects: one ModuleList."""
+
+    def __init__(self, attn: Attention) -> None:
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_Block(attn)])
 
 
 class _Bucketer:
@@ -87,8 +104,13 @@ def clean_guard():
 
 
 @pytest.fixture
-def warmed_runner():
-    """A runner whose warmup really compiled ``BODY_BUCKETS``, plus its block."""
+def warmed_runner(default_vllm_config):
+    """A runner whose warmup really compiled ``BODY_BUCKETS``, plus its block.
+
+    Blocks are compiled and registered by the production ``_compile_blocks``, not by
+    the test: hand-registering here would keep passing if that call site ever stopped
+    watching, which is the regression this file exists to catch.
+    """
     # NONE keeps warmup off the attention recorder, which needs a real KV cache.
     compilation_config = types.SimpleNamespace(
         compile_sizes=list(BODY_BUCKETS),
@@ -107,10 +129,27 @@ def warmed_runner():
     runner.spyre_shape_bucketer = _Bucketer(list(BODY_BUCKETS))
     runner.max_num_reqs = MAX_NUM_REQS
 
-    block = _Block()
-    # As _compile_blocks does it: compiled in place, then registered.
-    block.compile(backend="eager", fullgraph=True, dynamic=False)
-    compile_guard.watch(block, "_Block (transformer block)")
+    attn = Attention(
+        num_heads=1,
+        head_size=HIDDEN,
+        scale=1.0,
+        prefix="layers.0.self_attn",
+    )
+    runner.model = _Decoder(attn)
+    block = runner.model.layers[0]
+
+    # The real wiring: compiles the block in place and registers it with the guard.
+    # The backend is forced to "eager" so this stays card-free; the guard keys on the
+    # traced code object, which is decided before any backend runs. Bound to the
+    # original method first, or the patch would re-enter itself.
+    real_compile = torch.nn.Module.compile
+    with unittest.mock.patch.object(
+        torch.nn.Module,
+        "compile",
+        autospec=True,
+        side_effect=lambda self, **kw: real_compile(self, **{**kw, "backend": "eager"}),
+    ):
+        assert runner._compile_blocks() == 1, "the stub decoder was not recognised"
 
     def dummy_run(size, *args, **kwargs):
         hidden = torch.zeros(size, HIDDEN)

@@ -59,7 +59,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup, which costs a full Inductor compile mid-request:
     #  - "off": nothing (default)
     #  - "warn": log each distinct violation
-    #  - "error": raise. Use in CI to keep a warmup-coverage regression from landing.
+    #  - "error": raise. Use in CI to keep a warmup-coverage regression from landing,
+    #    bearing in mind it catches most but not all: torch runs its compile-start
+    #    callbacks only when a process-wide pending counter goes 0 -> 1, so a compile
+    #    starting while another is in flight goes unreported.
     # torch-spyre compiles every eager aten op, so those compiles continue for the
     # whole run; they are never reported.
     "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "off",

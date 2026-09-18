@@ -121,8 +121,11 @@ class _CompileGuard:
         self._level = CompileGuardLevel.OFF
         self._armed = False
         self._callback: Callable[[Any], None] | None = None
-        # Per-thread: allow_compile() on one thread must not blind the guard to a
-        # compile triggered on another.
+        # Per-thread, so allow_compile() on one thread does not blind the guard to a
+        # compile triggered on another. Not a hard guarantee by itself: torch fires
+        # start callbacks only when its process-wide pending counter goes 0 -> 1, so a
+        # compile that begins while another is in flight is not reported at all. It
+        # under-reports rather than over-reports, which is the safe direction.
         self._suppressed = threading.local()
         # One report per (label, is_recompile). A recompiling shape usually repeats
         # every step, and the point is to name it once, not to flood the log.
@@ -150,8 +153,16 @@ class _CompileGuard:
             return dict(self._watched)
 
     def arm(self, level: CompileGuardLevel) -> None:
-        """Start reporting. Idempotent; re-arming at a different level is allowed."""
+        """Start reporting at ``level``. Idempotent; re-arming at a new level is allowed.
+
+        ``OFF`` disarms, so ``arm`` always leaves the guard at the level asked for
+        rather than keeping an earlier one.
+        """
         if level is CompileGuardLevel.OFF:
+            if self._armed:
+                logger.debug("Compile guard disarmed by arm(OFF)")
+                self.disarm()
+                return
             logger.debug("Compile guard disabled (SPYRE_COMPILE_GUARD=off)")
             return
 
@@ -212,6 +223,15 @@ class _CompileGuard:
             self._watched_names.clear()
             self._reported.clear()
         self._suppressed.depth = 0
+
+    def clear_reported(self) -> None:
+        """Forget which violations were already logged, keeping the registry.
+
+        One report per (label, kind) is what keeps a recompiling shape from flooding
+        the log, which across tests would mute a report the next one expects.
+        """
+        with self._lock:
+            self._reported.clear()
 
     @property
     def armed(self) -> bool:
@@ -344,8 +364,11 @@ def _traced_code() -> CodeType | None:
         if code.co_name == "_compile" and code.co_filename.replace("\\", "/").endswith(
             "torch/_dynamo/convert_frame.py"
         ):
-            traced = frame.f_locals.get("frame")
-            return getattr(traced, "f_code", None)
+            # `code`, not `frame.f_code`: _compile takes the code object as its first
+            # required parameter, while its `frame` parameter is optional and None for
+            # the debug replay() helper.
+            traced = frame.f_locals.get("code")
+            return traced if isinstance(traced, CodeType) else None
         frame = frame.f_back
     return None
 
@@ -379,12 +402,41 @@ def _code_objects(target: object) -> Iterable[CodeType]:
             yield code
             continue
 
-        # A module: Dynamo traces `forward`, looked up on the class, so every
-        # instance of that class shares the code object registered here.
-        forward = getattr(type(obj), "forward", None)
-        code = getattr(forward, "__code__", None)
-        if isinstance(code, CodeType):
-            yield code
+        # A module: Dynamo traces the entry point, looked up on the class, so every
+        # instance of that class shares the code object registered here. `forward` on
+        # an OptimizedModule is an *instance* attribute, so type(obj).forward falls
+        # through to nn.Module's abstract placeholder; skipping it keeps that
+        # never-traced function out of the registry (and out of arm's site count), and
+        # falls back to __call__ for a module that implements that instead. The queue
+        # still has to be drained either way: an OptimizedModule yields nothing here
+        # and is resolved through the `_orig_mod` entry queued above.
+        for name in ("forward", "__call__"):
+            candidate = getattr(type(obj), name, None)
+            code = getattr(candidate, "__code__", None)
+            if isinstance(code, CodeType) and not _is_placeholder(code):
+                yield code
+                break
+
+
+def _is_placeholder(code: CodeType) -> bool:
+    """Whether ``code`` is a shared dispatcher rather than a layer's own kernel.
+
+    ``nn.Module.forward`` is ``_forward_unimplemented`` and ``__call__`` is the
+    ``_wrapped_call_impl`` dispatcher every module shares, so registering either says
+    nothing about the layer being watched. ``OptimizedModule.__call__`` is likewise
+    torch's compile wrapper, not the traced kernel: the real one is reached through
+    ``_orig_mod``.
+    """
+    import torch.nn as nn
+    from torch._dynamo.eval_frame import OptimizedModule
+
+    stubs = (
+        nn.Module.forward,
+        getattr(nn.Module, "_call_impl", None),
+        nn.Module.__call__,
+        OptimizedModule.__call__,
+    )
+    return any(code is getattr(stub, "__code__", None) for stub in stubs if stub is not None)
 
 
 _guard = _CompileGuard()
@@ -410,6 +462,11 @@ def reset() -> None:
     _guard.reset()
 
 
+def clear_reported() -> None:
+    """Forget already-logged violations, keeping the registry. For tests."""
+    _guard.clear_reported()
+
+
 def is_armed() -> bool:
     return _guard.armed
 
@@ -419,5 +476,18 @@ def level() -> CompileGuardLevel:
 
 
 def allow_compile(reason: str) -> Any:
-    """Context manager permitting compiles on this thread (recorders, profiling)."""
+    """Suspend the guard on this thread, for a phase that compiles on purpose.
+
+    Reserved escape hatch: nothing in ``spyre_inference`` calls this today, because the
+    guard is armed only once warmup has finished, so every deliberate compile phase
+    (whole-model or per-block compile, attention recording) has already run by then,
+    and a layer that recompiles per input shape by contract opts out through
+    ``CompileOutermost.allow_inference_recompiles`` instead. Kept for a future phase
+    that has to compile after arming.
+
+    Suppression is per-thread, but that cannot be a guarantee on its own: torch runs
+    start callbacks only when its *process-wide* pending-compile counter goes 0 -> 1,
+    so a compile beginning while another is in flight fires no callback at all. That
+    direction fails safe -- a missed report, never a false one.
+    """
     return _guard.allow_compile(reason)

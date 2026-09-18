@@ -110,6 +110,26 @@ class TestLevelParsing:
         envs.clear_env_cache()
         assert compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD) is CompileGuardLevel.ERROR
 
+    def test_the_worker_parses_the_level_before_it_loads_the_model(self):
+        """A typo must fail in ``init_device``, not at the ``arm`` call after warmup.
+
+        Parsing only where the guard is armed means ``SPYRE_COMPILE_GUARD=error`` kills
+        the engine *after* an 8B model has finished compiling. Asserted on the source
+        order because standing up a real worker needs a card.
+        """
+        import inspect
+
+        from spyre_inference.v1.worker.spyre_worker import TorchSpyreWorker
+
+        init_source = inspect.getsource(TorchSpyreWorker.init_device)
+        warmup_source = inspect.getsource(TorchSpyreWorker.compile_or_warm_up_model)
+
+        assert "parse_level" in init_source, "init_device no longer validates the level"
+        assert "parse_level" not in warmup_source, (
+            "the level is parsed after warmup again, so a typo costs a full compile"
+        )
+        assert "compile_guard.arm" in warmup_source
+
 
 class TestArming:
     def test_off_installs_nothing(self, guard, violations):
@@ -166,6 +186,22 @@ class TestArming:
     def test_disarm_without_arm_is_a_noop(self, guard):
         guard.disarm()
         assert not guard.is_armed()
+
+    def test_arming_off_disarms_an_armed_guard(self, guard, violations):
+        """``arm`` must leave the guard at the level asked for, not keep an older one."""
+
+        def fn(x):
+            return x * 2
+
+        guard.watch(fn, "fn")
+        guard.arm(CompileGuardLevel.ERROR)
+        guard.arm(CompileGuardLevel.OFF)
+
+        assert not guard.is_armed()
+        assert guard.level() is CompileGuardLevel.OFF
+        # Would raise if arm(OFF) had left the ERROR callback installed.
+        _compiled(fn)(torch.randn(4))
+        assert violations() == []
 
     def test_a_dynamo_reset_does_not_break_disarm(self, guard):
         """``torch._dynamo.reset()`` calls ``callback_handler.clear()``, dropping the
@@ -457,6 +493,32 @@ class TestWatch:
         guard.watch(compiled, "block")
 
         assert Block.forward.__code__ in guard._guard.watched_labels()
+
+    def test_a_compiled_module_registers_nothing_else(self, guard):
+        """``forward`` is an *instance* attribute on OptimizedModule, so
+        ``type(obj).forward`` falls through to nn.Module's never-traced placeholder and
+        ``__call__`` is torch's compile wrapper. Registering either inflates the
+        "%d watched compile sites" count arm() logs."""
+
+        class Block(torch.nn.Module):
+            def forward(self, x):
+                return x * 2
+
+        guard.watch(torch.compile(Block(), backend="eager", dynamic=False), "block")
+
+        assert list(guard._guard.watched_labels()) == [Block.forward.__code__]
+
+    def test_a_module_implementing_call_instead_of_forward_is_registered(self, guard):
+        """Only the placeholder would have been registered, so the violation was missed
+        entirely rather than merely mislabelled."""
+
+        class Layer(torch.nn.Module):
+            def __call__(self, x):
+                return x * 2
+
+        guard.watch(Layer(), "call-only layer")
+
+        assert guard._guard.watched_labels() == {Layer.__call__.__code__: "call-only layer"}
 
     def test_a_bound_method_registers_the_underlying_function(self, guard):
         class Layer:
