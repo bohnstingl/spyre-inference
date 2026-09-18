@@ -239,9 +239,7 @@ def test_fix_padded_qk_norm_eps_scales_only_qk_norms():
     model.q_norm = q_norm
     model.other_norm = other_norm
 
-    fix_padded_qk_norm_eps(
-        model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
-    )
+    fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
 
     assert q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
     assert other_norm.variance_epsilon == pytest.approx(1e-6)
