@@ -397,7 +397,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         model_config = vllm_config.model_config
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
-        self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        # From the spec, like block_size and head_size above: gemma-4 resolves KV heads
+        # per layer, so this group's count need not be the model-level one.
+        self.num_kv_heads = kv_cache_spec.num_kv_heads
         # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
         # `TorchSpyrePlatform.check_and_update_config` rejects anything but
         # `torch.float16` upstream so it's always a real torch.dtype here.
@@ -1182,12 +1184,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kernel reads its arguments from storage offset 0 (torch-spyre#3770), so a
         slice past row 0 reads the wrong storage. Allocated whole (hence at offset
         0) and reused, at one size for the whole run.
+
+        Row-outermost: the kernels gather from and scatter into the row axis, which the
+        default tiled layout would relayout whole per call.
         """
         if self._staging is None:
             shape = (self.staging_rows, self.num_heads, self.head_size)
             self._staging = (
-                convert(torch.zeros(shape, dtype=self.model_dtype), device=device),
-                convert(torch.zeros(shape, dtype=self.model_dtype), device=device),
+                convert(torch.zeros(shape, dtype=self.model_dtype), device, row_major=True),
+                convert(torch.zeros(shape, dtype=self.model_dtype), device, row_major=True),
             )
         return self._staging
 
