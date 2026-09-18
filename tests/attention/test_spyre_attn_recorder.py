@@ -186,6 +186,40 @@ class TestRecordGraphs:
 
         assert recorded == len(_recordable(bucketer)) > 0
 
+    def test_for_each_tile_records_one_frontend_graph_per_query_bucket(
+        self, impl, kv_cache, builder, monkeypatch
+    ):
+        bucketer = builder._attn_bucketer = make_bucketer()
+        monkeypatch.setattr(spyre_attn, "USE_FOR_EACH_TILE", True)
+
+        selected = impl._per_seq_recording_variants(bucketer.variants(), builder, NUM_PAGES)
+
+        recordable = _recordable(bucketer)
+        expected_widths = {variant.padded_query_len for variant in recordable}
+        assert len(selected) == len(expected_widths)
+        assert {variant.padded_query_len for variant in selected} == expected_widths
+        assert all(
+            variant.num_blocks
+            == max(
+                candidate.num_blocks
+                for candidate in recordable
+                if candidate.padded_query_len == variant.padded_query_len
+            )
+            for variant in selected
+        )
+
+    def test_for_each_tile_keeps_sliding_window_block_variants(
+        self, impl, kv_cache, sliding_window_builder, monkeypatch
+    ):
+        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        monkeypatch.setattr(spyre_attn, "USE_FOR_EACH_TILE", True)
+
+        selected = impl._per_seq_recording_variants(
+            bucketer.variants(), sliding_window_builder, NUM_PAGES
+        )
+
+        assert selected == _recordable(bucketer)
+
     def test_dispatch_after_recording_compiles_nothing(self, impl, kv_cache, builder):
         """The acceptance criterion: no request compiles a new variant.
 

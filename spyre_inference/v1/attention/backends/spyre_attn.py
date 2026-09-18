@@ -1330,7 +1330,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return 0
 
         num_pages = kv_cache[0].shape[0]
-        variants = builder.attn_bucketer.variants()
+        variants = self._per_seq_recording_variants(
+            builder.attn_bucketer.variants(), builder, num_pages
+        )
         decode_variants = (
             builder.attn_bucketer.batched_decode_variants()
             if self._batched_decode_supported()
@@ -1411,6 +1413,35 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 time.time() - t0,
             )
         return len(recorded)
+
+    @staticmethod
+    def _per_seq_recording_variants(
+        variants: "list[SpyreAttnBucket]",
+        builder: "SpyreAttentionMetadataBuilder",
+        num_pages: int,
+    ) -> "list[SpyreAttnBucket]":
+        """Select the per-sequence frontend traces warmup must create.
+
+        A symbolic ``for_each_tile`` graph reuses one trace across block counts,
+        so retain only the first (largest) recordable count for each query-width
+        bucket. Tracing the maximum first also prepares the largest backend
+        variant; the dynamic ``max=`` comes independently from metadata's full
+        configured capacity. Other paths still specialize on block count and
+        keep the full enumeration. Sliding-window attention is excluded until
+        its compact active-block count uses the same symbolic contract.
+        """
+        recordable = [variant for variant in variants if variant.num_blocks <= num_pages]
+        if not USE_FOR_EACH_TILE or builder.sliding_window is not None:
+            return recordable
+
+        selected = []
+        seen_query_widths = set()
+        for variant in recordable:
+            if variant.padded_query_len in seen_query_widths:
+                continue
+            selected.append(variant)
+            seen_query_widths.add(variant.padded_query_len)
+        return selected
 
     def _record_one(
         self,
