@@ -19,11 +19,13 @@ the time ``arm`` is called; from then on a compile of one is reported, because i
 costs a full Inductor compile wherever it lands. Callers decide when that is --
 ``TorchSpyreWorker`` arms once warmup returns.
 
-``on_compile_start`` gives a ``compile_id`` of the form ``"<frame>/<sub>"``, where a
-non-zero sub-index means Dynamo already had an entry for the frame and a guard
-rejected it, so a first compile and a guard-triggered recompile are distinguishable.
-The traced code object is what identifies the callable; Dynamo passes no frame to
-start callbacks, so ``_traced_code`` reads it from Dynamo's own frame.
+``on_compile_start`` gives a ``compile_id`` whose last component is the frame's
+compile count, so a first compile and a guard-triggered recompile are
+distinguishable. The traced code object is what identifies the callable; Dynamo
+passes no frame to start callbacks, so ``_traced_code`` reads it from Dynamo's own
+frame. A watched kernel compiled without ``fullgraph`` also reaches the callback as
+the resume frames a graph break creates, which ``_resume_label`` maps back to the
+kernel that owns them.
 
 torch-spyre executes eager aten ops by registering ``torch.compile(op)`` as the
 ``PrivateUse1`` kernel, so a new shape on any eager op compiles legitimately and
@@ -92,6 +94,13 @@ class UnexpectedCompileError(AssertionError, RuntimeError):
 # the function name keeps this working if the function inside it is renamed.
 _EAGER_OP_TRACE_FILE = "torch/_dynamo/external_utils.py"
 
+try:
+    from torch._dynamo.resume_execution import TORCH_DYNAMO_RESUME_IN_PREFIX as _RESUME_PREFIX
+except ImportError:  # pragma: no cover - a torch refactor moving the constant
+    # Same string, hard-coded: a wrong guess only costs resume-frame attribution,
+    # which degrades to the UNKNOWN reporting this replaced.
+    _RESUME_PREFIX = "torch_dynamo_resume_in"
+
 
 class _CompileGuard:
     """Process-wide state; ``torch._dynamo``'s own state is per-process too."""
@@ -105,6 +114,10 @@ class _CompileGuard:
         # (torch_spyre/execution/async_compile.py) that never re-enters Dynamo.
         self._lock = threading.Lock()
         self._watched: dict[CodeType, str] = {}
+        # (co_filename, co_name) -> label, for resolving the resume frames a graph
+        # break inside a watched callable creates. Keyed by name because those code
+        # objects are synthesized at compile time, so `watch` never saw them.
+        self._watched_names: dict[tuple[str, str], str] = {}
         self._level = CompileGuardLevel.OFF
         self._armed = False
         self._callback: Callable[[Any], None] | None = None
@@ -127,6 +140,10 @@ class _CompileGuard:
                 # First label wins: identical blocks share one code object, and the
                 # first registration carries the more general name.
                 self._watched.setdefault(code, label)
+                # Graph breaks split a kernel into resume frames Dynamo synthesizes
+                # fresh, so they are not in `_watched` and have to be matched by
+                # (file, name) instead. See `_classify`.
+                self._watched_names.setdefault((code.co_filename, code.co_name), label)
 
     def watched_labels(self) -> dict[CodeType, str]:
         with self._lock:
@@ -192,6 +209,7 @@ class _CompileGuard:
         self.disarm()
         with self._lock:
             self._watched.clear()
+            self._watched_names.clear()
             self._reported.clear()
         self._suppressed.depth = 0
 
@@ -213,7 +231,11 @@ class _CompileGuard:
         try:
             yield
         finally:
-            self._suppressed.depth = getattr(self._suppressed, "depth", 1) - 1
+            # Restore the saved depth rather than decrementing whatever is there
+            # now: `reset()` inside the block sets it to 0, and decrementing that
+            # would leave -1, which suppresses nothing and never recovers because
+            # thread-locals outlive the call.
+            self._suppressed.depth = depth
 
     def _on_compile_start(self, args: Any) -> None:
         """Classify and report one compile. Runs inside Dynamo, so it stays cheap and
@@ -257,6 +279,8 @@ class _CompileGuard:
             return CompileKind.UNKNOWN, "<unknown frame>"
         with self._lock:
             label = self._watched.get(code)
+            if label is None:
+                label = self._resume_label(code)
         if label is not None:
             return CompileKind.WATCHED, label
         # Normalised so the match holds on Windows-style separators too.
@@ -264,17 +288,46 @@ class _CompileGuard:
             return CompileKind.EAGER_OP, "torch-spyre eager op"
         return CompileKind.UNKNOWN, f"{code.co_filename}:{code.co_name}"
 
+    def _resume_label(self, code: CodeType) -> str | None:
+        """The watched label owning ``code``, when it is a resume frame of one.
+
+        A watched kernel compiled without ``fullgraph`` splits at every graph break
+        into ``torch_dynamo_resume_in_<parent>_at_<lineno>`` code objects that Dynamo
+        synthesizes, so ``watch`` cannot have registered them. Left unresolved they
+        classify as ``UNKNOWN``, which is never fatal -- so a post-warmup recompile
+        confined to the resume half of a watched kernel would slip past ``error``.
+
+        Unwraps repeatedly: resuming a resume frame nests the prefix again.
+
+        Caller holds the lock.
+        """
+        name = code.co_name
+        # Bounded by the nesting actually present in the name, and each turn strips
+        # at least the prefix, so this cannot spin.
+        while name.startswith(_RESUME_PREFIX):
+            # One separator underscore, then the parent name, then "_at_<lineno>";
+            # rpartition so a parent whose own name contains "_at_" survives.
+            name, _, _ = name[len(_RESUME_PREFIX) + 1 :].rpartition("_at_")
+            if not name:
+                return None
+            label = self._watched_names.get((code.co_filename, name))
+            if label is not None:
+                return label
+        return None
+
 
 def _is_recompile(compile_id: str) -> bool:
-    """True when Dynamo's ``"<frame>/<sub>"`` id has a non-zero sub-index.
+    """True when Dynamo's compile id says the frame had already been compiled.
 
-    Ids also appear as ``"-/0"`` or with a third component; anything unparsable is
-    treated as a first compile, which only ever under-reports severity.
+    ``CompileId.__str__`` emits ``"<frame>/<frame_compile>"``, or
+    ``"!<autograd>/<frame>/<frame_compile>"`` when compiling a compiled-autograd
+    graph, so the *last* component is the per-frame compile count. Anything
+    unparsable is treated as a first compile, which only ever under-reports
+    severity.
     """
-    _, _, sub = compile_id.partition("/")
-    head, _, _ = sub.partition("/")
+    body = compile_id[1:].partition("/")[2] if compile_id.startswith("!") else compile_id
     try:
-        return int(head) > 0
+        return int(body.rpartition("/")[2]) > 0
     except ValueError:
         return False
 

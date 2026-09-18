@@ -404,6 +404,28 @@ class TestAllowCompile:
 
         assert len(violations()) == 1
 
+    def test_a_reset_inside_the_block_does_not_break_later_suppression(self, guard):
+        """The depth must be restored, not decremented from whatever is there now.
+
+        ``reset()`` zeroes the counter, so decrementing would leave -1 -- suppressing
+        nothing, and never recovering, because thread-locals outlive the call. The
+        repo-wide autouse fixture in tests/conftest.py calls ``reset()``, so this is
+        reachable from any test that suspends the guard.
+        """
+
+        def fn(x):
+            return x * 2
+
+        with guard.allow_compile("phase that resets"):
+            guard.reset()
+
+        assert getattr(guard._guard._suppressed, "depth", 0) == 0
+
+        guard.watch(fn, "fn")
+        guard.arm(CompileGuardLevel.ERROR)
+        with guard.allow_compile("recorder"):
+            _compiled(fn)(torch.randn(4))
+
 
 class TestWatch:
     def test_a_plain_function_is_registered(self, guard):
@@ -499,14 +521,98 @@ class TestRecompileIdParsing:
             ("1/0", False),
             ("1/1", True),
             ("12/7", True),
-            ("2/1/0", True),
-            ("-/0", False),
             ("?", False),
             ("", False),
         ],
     )
-    def test_a_nonzero_sub_index_means_a_recompile(self, compile_id, expected):
+    def test_a_nonzero_frame_compile_id_means_a_recompile(self, compile_id, expected):
         assert compile_guard._is_recompile(compile_id) is expected
+
+    @pytest.mark.parametrize(
+        ("kwargs", "expected"),
+        [
+            ({"frame_id": 5, "frame_compile_id": 0}, False),
+            ({"frame_id": 0, "frame_compile_id": 1}, True),
+            # Compiled autograd prefixes the id, which moved the frame compile count
+            # to the last component; reading the first one inverted both of these.
+            ({"frame_id": 5, "frame_compile_id": 0, "compiled_autograd_id": 0}, False),
+            ({"frame_id": 0, "frame_compile_id": 1, "compiled_autograd_id": 0}, True),
+        ],
+    )
+    def test_it_reads_the_ids_torch_actually_emits(self, kwargs, expected):
+        """Built from torch's own CompileId, so a format change fails here."""
+        from torch._guards import CompileId
+
+        assert compile_guard._is_recompile(str(CompileId(**kwargs))) is expected
+
+
+class TestGraphBreakResumeFrames:
+    """A watched kernel compiled without ``fullgraph`` splits at each graph break.
+
+    Dynamo synthesizes the resume frames at compile time, so ``watch`` never saw
+    them. Unresolved they classify as UNKNOWN, which is never fatal -- so a recompile
+    confined to the resume half of a watched kernel would slip past ``error``, and at
+    ``warn`` every graph break added a second, unattributed "violation".
+    """
+
+    @staticmethod
+    def _kernel(x):
+        y = x + 1
+        torch._dynamo.graph_break()
+        return y * 2
+
+    def test_a_resume_frame_is_attributed_to_its_watched_kernel(self, guard, violations):
+        """Both halves report under the kernel's label, so dedup collapses them.
+
+        Previously the resume half was named by its synthesized code object, which
+        read as a second, separate violation for one graph break.
+        """
+        guard.watch(self._kernel, "page attention kernel")
+        guard.arm(CompileGuardLevel.WARN)
+
+        torch.compile(self._kernel, backend="eager", dynamic=False)(torch.randn(4))
+
+        messages = violations()
+        assert len(messages) == 1
+        assert "page attention kernel compiled unexpectedly" in messages[0]
+        assert not any("torch_dynamo_resume_in" in m for m in messages)
+
+    def test_the_resume_frame_itself_classifies_as_watched(self, guard):
+        """Directly: the dedup above would hide a resume frame still landing in
+        UNKNOWN, which is the class that never raises at ``error``."""
+        guard.watch(self._kernel, "page attention kernel")
+        resume = _fake_resume_code(
+            self._kernel.__code__.co_name, path=self._kernel.__code__.co_filename
+        )
+
+        assert guard._guard._classify(resume) == (
+            CompileKind.WATCHED,
+            "page attention kernel",
+        )
+
+    def test_a_resume_frame_compile_is_fatal_at_error_level(self, guard):
+        """The hole this closes: only the resume half recompiling still has to raise."""
+        compiled = torch.compile(self._kernel, backend="eager", dynamic=False)
+        compiled(torch.randn(4))
+        guard.watch(self._kernel, "page attention kernel")
+        guard.arm(CompileGuardLevel.ERROR)
+
+        with pytest.raises(UnexpectedCompileError, match="page attention kernel"):
+            compiled(torch.randn(5))
+
+    def test_an_unwatched_kernels_resume_frame_stays_unknown(self, guard):
+        kind, label = guard._guard._classify(_fake_resume_code("unwatched_kernel"))
+
+        assert kind is CompileKind.UNKNOWN
+        assert "torch_dynamo_resume_in" in label
+
+    def test_a_parent_name_containing_at_is_still_resolved(self, guard):
+        """`rpartition` on the `_at_<offset>` suffix, so a kernel whose own name
+        contains `_at_` resolves to itself rather than to a truncated prefix."""
+        code = _fake_resume_code("kern_at_tail")
+        guard._guard._watched_names[(code.co_filename, "kern_at_tail")] = "tail kernel"
+
+        assert guard._guard._classify(code) == (CompileKind.WATCHED, "tail kernel")
 
 
 def _fake_eager_op_code():
@@ -516,3 +622,11 @@ def _fake_eager_op_code():
     path = "/some/prefix/torch/_dynamo/external_utils.py"
     exec(compile(source, path, "exec"), namespace)
     return namespace["inner"].__code__
+
+
+def _fake_resume_code(parent: str, path: str = "/some/module.py"):
+    """A stand-in for the resume frame Dynamo synthesizes for ``parent``."""
+    name = f"torch_dynamo_resume_in_{parent}_at_12"
+    namespace: dict = {}
+    exec(compile(f"def {name}(*args, **kwargs):\n    return None\n", path, "exec"), namespace)
+    return namespace[name].__code__
