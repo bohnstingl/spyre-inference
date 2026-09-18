@@ -32,9 +32,6 @@ from .lazy_compile import CompileOutermost, compile_when_outermost
 class SpyreGemmaRMSNorm(CompileOutermost, GemmaRMSNorm):
     """Out-of-tree (OOT) GemmaRMSNorm implementation for IBM's Spyre."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     @compile_when_outermost(force_compile=True)
     def forward_oot(
         self,
