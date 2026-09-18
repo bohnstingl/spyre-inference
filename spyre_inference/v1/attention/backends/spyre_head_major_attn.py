@@ -309,6 +309,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 out,
             )
 
+    def dynamic_block_tables(self, index_table, mask_index_table) -> tuple[torch.Tensor, ...]:
+        """None: both head-major kernels slice their tables at a static `num_blocks`,
+        so marking either dynamic would only add a guard."""
+        return ()
+
     def _run_page_attn(
         self,
         query: torch.Tensor,
@@ -316,12 +321,15 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         index_table: torch.Tensor,
+        mask_index_table: torch.Tensor,
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
         alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
+        # `mask_index_table` is unused: both kernels slice `mask_stack` at `num_blocks`
+        # directly, and walked row i is mask row i there.
         # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch
         # at trace time — see the base's `_run_page_attn`, which this replaces rather than
         # extends.

@@ -26,6 +26,7 @@ def page_attn_kernel(
     k_pages,
     v_pages,
     page_index_table,
+    mask_index_table,
     mask_stack,
     scale,
     num_blocks,
@@ -52,8 +53,12 @@ def page_attn_kernel(
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
             tensor, row i holding the i-th active block's page index at
             column 0.
-        mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
-        alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size],
+        mask_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
+            tensor, row i holding the mask pool row at column 0.
+        mask_stack: [max_num_blocks, padded_query_len, block_size] additive
+            mask pool, gathered through mask_index_table.
+        alibi_stack: [max_num_blocks, num_kv_heads, num_queries_per_kv, 1,
+            block_size], gathered like mask_stack,
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
             per-query-row constants — see the derivation at the bias-tile
             construction site in _online_softmax_attention.
@@ -76,24 +81,27 @@ def page_attn_kernel(
 
     # Both walks tile tensor axes, so every per-block operand arrives stacked on dim 0.
     operands = [
-        page_index_table[:num_blocks],
+        page_index_table,
+        mask_index_table,
         k_pages,
         v_pages,
-        mask_stack[:num_blocks],
+        mask_stack,
         q,
     ]
-    dims: list[int | None] = [0, None, None, 0, None]
+    dims: list[int | None] = [0, 0, None, None, None, None]
     if alibi_stack is not None:
-        operands.append(alibi_stack[:num_blocks])
-        dims.append(0)
+        operands.append(alibi_stack)
+        dims.append(None)
 
     def block_body(carry, tiles):
-        page_index, k_pages, v_pages, mask_tile, q, *rest = tiles
+        page_index, mask_index, k_pages, v_pages, mask_pool, q, *rest = tiles
         page_idx = page_index[0, 0:1]
+        mask_idx = mask_index[0, 0:1]
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
+        mask_tile = mask_pool.index_select(0, mask_idx)
         # Token-major page to head-major for the matmuls; permutes on device.
         k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
         v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
@@ -108,7 +116,7 @@ def page_attn_kernel(
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
-            scores = scores + rest[0][0]
+            scores = scores + rest[0].index_select(0, mask_idx)[0]
         scores = scores + mask_tile[0]
 
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
