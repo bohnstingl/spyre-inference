@@ -63,10 +63,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
     # compiling each variant lazily on first use.
     "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
-    # When "1", the paged-attention kernels walk their KV pages with torch-spyre's
-    # `for_each_tile`, so the traced graph holds one block body instead of one copy
-    # per page. Off by default: the same body then runs under a plain Python loop,
-    # which is the long-standing path.
+    # When "1", paged attention walks KV pages and batched decode walks logical
+    # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
+    # one loop body. Off by default: the same bodies run under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "0"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.

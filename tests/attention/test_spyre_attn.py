@@ -1617,9 +1617,6 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
     # One chunk covering both blocks, so entries = num_seqs * 2.
     bpc = num_blocks
-    num_chunks = num_blocks // bpc
-    entries = num_seqs * bpc
-
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
@@ -1627,15 +1624,11 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
     # int64 here, not the production int32: this runs eager on CPU, where
     # advanced indexing needs int64.
-    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat_interleave(bpc)
-    # [num_blocks, num_seqs] transposed to entry order (seq major, slot minor).
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat(bpc)
+    # [num_blocks, num_seqs] is already block-slot-major, sequence-minor.
     block_ids = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
-    chunk_page_ids = [
-        block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
-        for c in range(num_chunks)
-    ]
     mask_by_chunk = torch.zeros(
-        num_chunks, entries * num_kv_heads, 1, block_size, dtype=torch.float32
+        num_blocks, num_seqs, num_kv_heads, qpk, block_size, dtype=torch.float32
     )
 
     def run(cap: float):
@@ -1644,7 +1637,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
             rep_row_ids,
             k_pages,
             v_pages,
-            chunk_page_ids,
+            block_ids,
             mask_by_chunk,
             1.0,
             num_seqs,
@@ -1735,8 +1728,13 @@ def test_batched_decode_chunking_covers_every_block(
         # The mask carries the same axis, so a mismatch here is the reshape that
         # would have raised inside build().
         assert md.mask_by_chunk_cpu is not None
-        num_chunks = md.mask_by_chunk_cpu.shape[0]
-        assert num_chunks * bpc == padded
+        assert md.mask_by_chunk_cpu.shape == (
+            padded,
+            md.padded_num_seqs,
+            2,
+            1,
+            block_size,
+        )
 
 
 def _decode_reference_fp32(
@@ -1804,8 +1802,6 @@ def test_batched_decode_matches_fp32_reference(
     block_size, head_size = 16, 8
     num_heads = num_kv_heads * qpk
     padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
-    num_chunks = padded_blocks // bpc
-    entries = b_seqs * bpc
     scale = 0.5
 
     n_pages = padded_blocks * b_seqs + 1
@@ -1833,17 +1829,13 @@ def test_batched_decode_matches_fp32_reference(
     mask[num_seqs:, 0] = torch.finfo(torch.float16).min
 
     rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
-    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
-    chunk_page_ids = [
-        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
-        for c in range(num_chunks)
-    ]
+    rep_row_ids = rep_row_ids.repeat(bpc)
+    chunk_page_ids = page_ids.t().contiguous()
     mask_by_chunk = (
-        mask.reshape(b_seqs, num_chunks, bpc, block_size)
-        .permute(1, 0, 2, 3)
+        mask.transpose(0, 1)
+        .unsqueeze(2)
         .unsqueeze(3)
-        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
-        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .expand(padded_blocks, b_seqs, num_kv_heads, qpk, block_size)
         .contiguous()
     )
 
@@ -1990,15 +1982,7 @@ def test_bucketed_block_ids_match_scalar_fill(
     assert metadata.blocks_per_chunk is not None
     assert metadata.padded_num_seqs is not None
 
-    # Unpack the per-chunk [entries, 1] index tensors back into the
-    # [padded_batch_blocks, b_seqs] fill they were built from. Entry order is
-    # (s, j) with s major, so each chunk transposes back.
-    bpc = metadata.blocks_per_chunk
-    b_seqs = metadata.padded_num_seqs
-    chunks = metadata.chunk_page_ids_cpu
-    got = torch.zeros(len(chunks) * bpc, b_seqs, dtype=torch.int32)
-    for c, chunk in enumerate(chunks):
-        got[c * bpc : (c + 1) * bpc] = chunk.reshape(b_seqs, bpc).t()
+    got = metadata.chunk_page_ids_cpu
     assert got.shape[0] == metadata.padded_batch_blocks
     bt = metadata.block_table
     active = metadata.active_block_indices

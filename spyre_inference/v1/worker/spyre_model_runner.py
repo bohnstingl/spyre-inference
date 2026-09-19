@@ -41,7 +41,7 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import contextmanager
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -570,7 +570,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
+        block_table._compute_slot_mapping_kernel = cast(Any, _compute_slot_mapping_kernel)
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""

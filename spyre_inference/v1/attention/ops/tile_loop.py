@@ -31,12 +31,13 @@ USE_FOR_EACH_TILE = envs.SPYRE_ATTN_FOR_EACH_TILE
 
 
 def walk_tiles(
-    body: Callable[[tuple, tuple], tuple[tuple, Any]],
+    body: Callable[[tuple | None, tuple], tuple[tuple, Any]],
     operands: Sequence[torch.Tensor],
     *,
     dims: Sequence[int | None],
     tile_size: int = 1,
     init: tuple,
+    use_init_in_fallback: bool = False,
 ) -> tuple[tuple, Any]:
     """Run `body` once per tile of `operands`, threading `init` through as carry.
 
@@ -46,23 +47,18 @@ def walk_tiles(
     `for_each_tile` existed -- so a regression in the tiled op or in the
     torch-spyre pin can be isolated by unsetting one variable.
 
-    The loop path hands `body` a `None` carry on the first trip instead of `init`,
-    and `body` must then build the carry from that tile alone. This is not a
-    convenience: a materialized init constant and a computed tile stickify
-    differently for the same logical shape, and the pointwise that would combine
-    them has no legal device layout (`no mechanism to resolve stick
-    incompatibility` at ``q=1``). Starting from the first tile is also what the
-    kernels did before `for_each_tile`, so `init` describes the tiled path only.
-
     Args:
         body: called as ``body(carry, tiles)`` and returning
             ``(carry, per_tile_output)``. `tiles` holds one entry per operand, in
             order: the tile for a tiled operand, the whole tensor otherwise. Must
-            accept ``carry=None``, meaning "this is the first tile".
+            accept the supplied carry structure.
         operands: the tensors to walk.
         dims: per operand, the axis to tile, or None to pass it through whole.
         tile_size: elements of the tiled axis per trip.
-        init: the initial carry, used by the tiled path only.
+        init: the initial carry for `for_each_tile`.
+        use_init_in_fallback: also seed the Python loop with `init`. Existing
+            page-attention bodies peel their first trip; batched decode uses the
+            uniform recurrence required by the rolled loop.
 
     Returns:
         ``(carry, per_tile_outputs)``, the tiled op's own return shape. The loop
@@ -98,8 +94,7 @@ def walk_tiles(
     if extent % tile_size:
         raise ValueError(f"extent {extent} is not a whole number of {tile_size}-wide tiles")
 
-    # None, not `init`: the body builds the carry from the first tile. See above.
-    carry = None
+    carry: tuple | None = init if use_init_in_fallback else None
     out = None
     for t in range(extent // tile_size):
         # narrow, not select: the tile keeps its leading axis, so `body` indexes a
@@ -109,4 +104,5 @@ def walk_tiles(
             for operand, dim in zip(operands, dims, strict=True)
         )
         carry, out = body(carry, tiles)
+    assert carry is not None
     return carry, out

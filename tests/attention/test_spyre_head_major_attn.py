@@ -918,8 +918,6 @@ def test_head_major_batched_decode_matches_fp32_reference(
     block_size, head_size = 16, 8
     num_heads = num_kv_heads * qpk
     padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
-    num_chunks = padded_blocks // bpc
-    entries = b_seqs * bpc
     scale = 0.5
 
     n_pages = padded_blocks * b_seqs + 1
@@ -940,18 +938,14 @@ def test_head_major_batched_decode_matches_fp32_reference(
     mask[num_seqs:, 0] = torch.finfo(torch.float16).min
 
     rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
-    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
+    rep_row_ids = rep_row_ids.repeat(bpc)
     # One index row per page, in int64 for eager CPU indexing.
-    chunk_page_ids = [
-        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
-        for c in range(num_chunks)
-    ]
+    chunk_page_ids = page_ids.t().contiguous()
     mask_by_chunk = (
-        mask.reshape(b_seqs, num_chunks, bpc, block_size)
-        .permute(1, 0, 2, 3)
+        mask.transpose(0, 1)
+        .unsqueeze(2)
         .unsqueeze(3)
-        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
-        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .expand(padded_blocks, b_seqs, num_kv_heads, qpk, block_size)
         .contiguous()
     )
 
@@ -1037,13 +1031,12 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     assert attn_metadata.chunk_page_ids_cpu is not None
     assert attn_metadata.padded_num_seqs is not None
     assert attn_metadata.blocks_per_chunk is not None
-    entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
-
-    tables = impl.build_chunk_index_tables(attn_metadata, torch.device("cpu"))
-    assert len(tables) == len(attn_metadata.chunk_page_ids_cpu)
-    for pages, table in zip(attn_metadata.chunk_page_ids_cpu, tables, strict=True):
-        assert table.shape == (entries, 1)
-        torch.testing.assert_close(table, pages)
+    table = attn_metadata.chunk_page_ids_cpu
+    assert table.shape == (
+        attn_metadata.padded_batch_blocks,
+        attn_metadata.padded_num_seqs,
+    )
+    assert table.dtype == torch.int32
 
 
 @pytest.fixture()

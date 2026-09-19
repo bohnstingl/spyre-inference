@@ -71,7 +71,9 @@ _page_attn_prefill_compiled = torch.compile(
     page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
-_batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
+_batched_decode_compiled = torch.compile(
+    batched_decode_head_major_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+)
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
@@ -200,7 +202,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
     # The base publishes one table per sequence; this layout needs two, so the pair travels
     # together and `_run_page_attn` picks the one its kernel reads.
-    def build_index_tables(  # ty: ignore[invalid-method-override]
+    def build_index_tables(
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
     ) -> list[tuple[list[torch.Tensor], torch.Tensor | None]]:
         """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,
@@ -236,7 +238,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         rep_row_ids: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
-        chunk_index_tables: list[torch.Tensor],
+        chunk_index_tables: torch.Tensor,
         mask_by_chunk: torch.Tensor,
         b_seqs: int,
         blocks_per_chunk: int,

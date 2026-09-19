@@ -41,7 +41,7 @@ repos:
   hooks:
     - id: ty
       name: ty check
-      entry: uvx ty@0.0.16 check spyre_inference
+      entry: uvx ty@0.0.16 check --python /scratch/virtualenv/dt-inductor5/bin/python --extra-search-path ../torch-spyre --extra-search-path ../vllm spyre_inference
       # `system` here instead of python so that we avoid running inside an isolated venv created by
       # prek, and instead have access to the .venv created by uv for the project
       language: system
