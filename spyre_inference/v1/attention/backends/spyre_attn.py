@@ -895,9 +895,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         page_index_tables_cpu = []
         for s, n in enumerate(num_active):
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
-            table = torch.zeros(
-                _walked_block_count(n), INT32_ELEMS_PER_STICK, dtype=torch.int32
-            )
+            table = torch.zeros(_walked_block_count(n), INT32_ELEMS_PER_STICK, dtype=torch.int32)
             if n:
                 table[:n, 0] = block_table[s, blocks_s]
             if n == 1:
@@ -1298,6 +1296,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The batched kernel doesn't implement ALiBi.
         return self.alibi_slopes is None
 
+    def requires_compiled_attention_warmup(self) -> bool:
+        """Whether this impl's kernels compile even under ``CompilationMode.NONE``.
+
+        False here: the token-major impl reads the mode and runs the kernels eagerly,
+        so there is nothing for the recorder to pre-compile. An impl whose kernels are
+        compiled objects regardless of the mode returns True, so that warmup records
+        them rather than leaving every variant to a mid-serving Inductor compile that
+        ``--enforce-eager`` was meant to rule out.
+        """
+        return False
+
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
         if not self._batched_decode_supported():
             return False
@@ -1391,7 +1400,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         raised, so it cannot take down engine startup; dispatch then compiles it on
         first use.
         """
-        if not self._compile_attn:
+        # Not `self._compile_attn` alone: an impl whose kernels stay compiled objects
+        # under CompilationMode.NONE has the same variants to record, and skipping them
+        # only moves the compiles into serving.
+        if not self._compile_attn and not self.requires_compiled_attention_warmup():
             return 0
 
         num_pages = kv_cache[0].shape[0]
@@ -1894,6 +1906,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         factor). Dropping it leaves the output bit-identical and keeps each tile 1D
         over KV (block_size floats per head) rather than 2D.
 
+        Positions are built and subtracted in int32, and the product is formed in
+        fp32 before the finished tile is cast to the model dtype. Positions are
+        absolute, so in fp16 they stop being exact at 2048 and space out to 32 apart
+        by 32768: a block's 128 positions would collapse onto ~5 distinct values and
+        the near-diagonal ``rel``, the part the bias exists to express, would round
+        to a constant. int32 keeps ``rel`` exact, and the cast happens last because
+        the kernel's scores carry ``q.dtype`` -- an fp32 tile would promote the
+        accumulation around it.
+
         Padded blocks get a tile too; their values stay finite (slopes are small
         negative powers of two) and saturate under the mask's finfo.min, so they
         stay inert. The stack is padded to the mask pool's height because the kernel
@@ -1928,18 +1949,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if cached is not None:
             return cached
 
+        slopes = self.alibi_slopes.to(torch.float32)
         bias_tiles = []
         for b in active_bs:
             kv_pos = torch.arange(
                 b * block_size,
                 (b + 1) * block_size,
-                dtype=torch.float16,
+                dtype=torch.int32,
             )
             rel = (kv_pos - context_len).view(1, 1, 1, block_size)
-            bias_tiles.append(self.alibi_slopes * rel)
+            bias_tiles.append(slopes * rel)
         zero_bias = torch.zeros_like(bias_tiles[0])
         bias_tiles.extend([zero_bias] * (attn_metadata.mask_pool_height - len(bias_tiles)))
-        stack = convert(torch.stack(bias_tiles), device=device)
+        stack = convert(torch.stack(bias_tiles), device=device, dtype=self.model_dtype)
         stacks[seq_idx] = stack
         return stack
 

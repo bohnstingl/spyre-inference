@@ -555,6 +555,88 @@ class TestRecordGraphs:
         assert _record(impl, kv_cache, builder) == 0
         assert compiles() == snapshot
 
+    def test_mode_none_records_the_impl_whose_kernels_stay_compiled(
+        self, kv_cache, builder, monkeypatch
+    ):
+        """``--enforce-eager`` does not reach the head-major kernels -- they are
+        compiled objects whatever the mode -- so they have the same variants to
+        record, while the token-major impl has none.
+
+        Head-major graphs need a Spyre device, so ``_record_all`` stands in and what
+        this pins is the gate in front of it.
+        """
+        config = get_current_vllm_config()
+        config.compilation_config.mode = CompilationMode.NONE
+        config.cache_config.block_size = BLOCK_SIZE
+        builder._attn_bucketer = make_bucketer()
+        kwargs = dict(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=1.0 / (HEAD_SIZE**0.5),
+            num_kv_heads=NUM_KV_HEADS,
+            alibi_slopes=None,
+            sliding_window=None,
+        )
+        token_major = SpyreAttentionImpl(**kwargs)
+        head_major = SpyreHeadMajorAttentionImpl(**kwargs)
+        assert not token_major._compile_attn and not head_major._compile_attn, (
+            "mode NONE did not reach the impls"
+        )
+
+        requested: list[SpyreAttnBucket] = []
+
+        def record_all(variants, *args):
+            requested.extend(variants)
+            return len(variants)
+
+        monkeypatch.setattr(head_major, "_record_all", record_all)
+
+        assert _record(head_major, kv_cache, builder) == len(requested) > 0
+        assert _record(token_major, kv_cache, builder) == 0
+
+    def test_mode_none_warmup_passes_over_only_the_layers_with_nothing_to_record(
+        self, kv_cache, builder, monkeypatch
+    ):
+        """The runner's half of the same gate, which the impl's cannot reach: under
+        mode NONE the pass has to run for a head-major layer and skip a token-major
+        one. Returning early instead leaves every head-major variant to compile
+        mid-serving, one at a time."""
+        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+        config = get_current_vllm_config()
+        config.compilation_config.mode = CompilationMode.NONE
+        config.cache_config.block_size = BLOCK_SIZE
+        kwargs = dict(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=1.0 / (HEAD_SIZE**0.5),
+            num_kv_heads=NUM_KV_HEADS,
+            alibi_slopes=None,
+            sliding_window=None,
+        )
+        impls = {
+            "layers.0.self_attn": SpyreHeadMajorAttentionImpl(**kwargs),
+            "layers.1.self_attn": SpyreAttentionImpl(**kwargs),
+        }
+        for impl in impls.values():
+            monkeypatch.setattr(impl, "record_graphs", MagicMock(return_value=1))
+        # The pass ends by arming the late-compile warning, a module global.
+        monkeypatch.setattr(spyre_attn, "_warmup_complete", False)
+
+        config.compilation_config.static_forward_context = {
+            name: MagicMock(impl=impl) for name, impl in impls.items()
+        }
+        runner = MagicMock()
+        runner.vllm_config = config
+        runner.compilation_config = config.compilation_config
+        runner._spyre_kv_caches = dict.fromkeys(impls, kv_cache)
+        runner._attn_metadata_builders.return_value = dict.fromkeys(impls, builder)
+
+        TorchSpyreModelRunner._record_attention_graphs(runner)
+
+        assert impls["layers.0.self_attn"].record_graphs.call_count == 1
+        assert impls["layers.1.self_attn"].record_graphs.call_count == 0
+
     def test_a_failing_variant_does_not_abort_the_pass(self, impl, kv_cache, builder, monkeypatch):
         """One bad variant must not take down engine startup."""
         bucketer = builder._attn_bucketer = make_bucketer()

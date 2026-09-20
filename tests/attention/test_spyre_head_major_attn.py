@@ -903,7 +903,10 @@ def test_decode_fold_matches_unrolled():
 # production cap of 50 the same swap is numerically invisible here.
 @pytest.mark.parametrize("soft_cap", [0.0, 2.0], ids=["no_soft_cap", "soft_cap"])
 @pytest.mark.parametrize("query_len", [1, 4], ids=["one_query_row", "four_query_rows"])
-def test_every_non_batched_page_walk_agrees(soft_cap: float, query_len: int, monkeypatch) -> None:
+@pytest.mark.parametrize("count_one", [False, True], ids=["three_blocks", "count_one_sentinel"])
+def test_every_non_batched_page_walk_agrees(
+    soft_cap: float, query_len: int, count_one: bool, monkeypatch
+) -> None:
     """One logical input through every non-batched page walk, in all three layouts.
 
     The kernels share `online_softmax_step` but each builds its own scores, so the
@@ -914,6 +917,11 @@ def test_every_non_batched_page_walk_agrees(soft_cap: float, query_len: int, mon
     The token-major walk is the base; at a single query row the head-major decode
     pair joins it. Run under the Python walk, which is the body `for_each_tile`
     tiles, so this compares the bodies and not the driver.
+
+    ``count_one`` is the dispatch a ``kv_len <= block_size`` sequence gets: one real
+    block, then the sentinel the walk is padded to because Dynamo specializes a
+    count of 1. It repeats the real page, so every kernel has to cancel it through
+    its mask row alone -- a fully masked tile, which the other case never produces.
     """
     from spyre_inference.v1.attention.ops import tile_loop
     from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
@@ -926,7 +934,8 @@ def test_every_non_batched_page_walk_agrees(soft_cap: float, query_len: int, mon
     torch.set_default_device("cpu")
     set_random_seed(0)
 
-    kv, qpk, d, block, blocks = 2, 2, 64, 16, 3
+    kv, qpk, d, block = 2, 2, 64, 16
+    blocks = 2 if count_one else 3
     heads = kv * qpk
     scale = d**-0.5
     pages = blocks + 1
@@ -947,11 +956,18 @@ def test_every_non_batched_page_walk_agrees(soft_cap: float, query_len: int, mon
     row_index = torch.zeros(INT32_ELEMS_PER_STICK, dtype=torch.int32)
     row_index[:query_len] = torch.arange(1, query_len + 1, dtype=torch.int32)
 
-    page_ids = list(range(1, blocks + 1))
-    # Only the last tile is masked: a fully masked tile has no finite max, which the
-    # builder guarantees against rather than the kernels handling it.
-    masks = [torch.zeros(query_len, block) for _ in range(blocks)]
-    masks[-1][:, block // 2 :] = torch.finfo(torch.float32).min
+    if count_one:
+        page_ids = [1, 1]
+        masks = [
+            torch.zeros(query_len, block),
+            torch.full((query_len, block), torch.finfo(torch.float32).min),
+        ]
+    else:
+        page_ids = list(range(1, blocks + 1))
+        # Only the last tile is masked: a fully masked tile has no finite max, which
+        # the builder emits only as the count-one sentinel.
+        masks = [torch.zeros(query_len, block) for _ in range(blocks)]
+        masks[-1][:, block // 2 :] = torch.finfo(torch.float32).min
     mask_pool = torch.stack(masks)
 
     page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
@@ -976,6 +992,26 @@ def test_every_non_batched_page_walk_agrees(soft_cap: float, query_len: int, mon
         d,
         soft_cap,
     )
+    if count_one:
+        # The page is walked twice, so anything short of full cancellation counts
+        # its keys twice -- a plausible-looking output an eval would have to catch.
+        one_block = page_attn_kernel(
+            query,
+            row_index,
+            k_tm,
+            v_tm,
+            page_table[:1],
+            mask_table[:1],
+            mask_pool,
+            scale,
+            query_len,
+            heads,
+            kv,
+            d,
+            soft_cap,
+        )
+        torch.testing.assert_close(token_major, one_block, atol=1e-5, rtol=1e-5)
+
     prefill = page_attn_head_major_prefill_kernel(
         query,
         row_index,

@@ -290,6 +290,12 @@ def _is_decoder_attention_like(module: nn.Module) -> bool:
     )
 
 
+def _compiles_when_eager(layer: nn.Module) -> bool:
+    """Whether this layer's attention kernels compile under ``CompilationMode.NONE``."""
+    impl = getattr(layer, "impl", None)
+    return isinstance(impl, SpyreAttentionImpl) and impl.requires_compiled_attention_warmup()
+
+
 _VISION_TOWER_NAME_PARTS = frozenset(("vision_encoder", "vision_tower", "vision_model", "visual"))
 
 
@@ -907,7 +913,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if not envs.SPYRE_ATTN_RECORD:
             logger.info("Attention graph recording disabled (SPYRE_ATTN_RECORD=0)")
             return
-        if self.compilation_config.mode is CompilationMode.NONE:
+        eager = self.compilation_config.mode is CompilationMode.NONE
+        if eager and not any(
+            _compiles_when_eager(layer)
+            for layer in self.compilation_config.static_forward_context.values()
+        ):
             logger.info("Attention graph recording disabled (CompilationMode.NONE)")
             return
         assert self._spyre_kv_caches, (
@@ -927,6 +937,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 layer = static_ctx.get(layer_name)
                 impl = getattr(layer, "impl", None)
                 if not isinstance(impl, SpyreAttentionImpl):
+                    continue
+                # An eager run leaves most impls nothing to record. One whose kernels
+                # are compiled objects whatever the mode still pays a compile per
+                # variant -- during serving, if warmup passes it over.
+                if eager and not impl.requires_compiled_attention_warmup():
                     continue
                 builder = builders.get(layer_name)
                 # A KV-cache layer on this impl is always in an attention group whose

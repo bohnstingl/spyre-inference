@@ -1275,7 +1275,19 @@ def test_mirror_mask_stacks_none_for_empty_sequence(default_vllm_config):
     assert _mirror_mask_stacks([[]], torch.device("cpu")) == [None]
 
 
-def test_count_one_mask_sentinel_lands_on_a_masked_pool_row(default_vllm_config):
+@pytest.mark.parametrize(
+    "query_len,kv_len,block_size",
+    [
+        pytest.param(1, 64, 64, id="decode_q1_kv64_block64"),
+        pytest.param(1, 128, 128, id="decode_q1_kv128_block128"),
+        pytest.param(33, 96, 128, id="prefill_q33_kv96_block128"),
+        pytest.param(32, 65, 128, id="kv_padded_prefill_q32_kv65_block128"),
+        pytest.param(64, 64, 128, id="prefill_q64_kv64_block128"),
+    ],
+)
+def test_count_one_mask_sentinel_lands_on_a_masked_pool_row(
+    default_vllm_config, query_len: int, kv_len: int, block_size: int
+):
     """A one-active-block sequence is dispatched at two blocks, and the second must
     contribute nothing.
 
@@ -1284,9 +1296,13 @@ def test_count_one_mask_sentinel_lands_on_a_masked_pool_row(default_vllm_config)
     fills that second row by repeating block 0, so the only thing keeping the block
     from being counted twice is the mask row the sentinel names -- which must exist
     in the pool and be fully masked.
+
+    The shapes are the ones the device suites reach this dispatch through (core,
+    block_sizes, and the head-major core). A count-one shape only stays count-one
+    while ``_pad_num_blocks`` leaves it at one block, so widening the num_blocks
+    bucket ladder would otherwise retire the on-device coverage in silence.
     """
     torch.set_default_device("cpu")
-    block_size = 64
     device = torch.device("cpu")
 
     metadata = _build_metadata(
@@ -1294,10 +1310,10 @@ def test_count_one_mask_sentinel_lands_on_a_masked_pool_row(default_vllm_config)
         num_kv_heads=8,
         head_size=128,
         block_size=block_size,
-        seq_lens=torch.tensor([block_size], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
         block_table=torch.tensor([[3]], dtype=torch.int32),
-        slot_mapping=torch.tensor([block_size - 1], dtype=torch.int64),
+        slot_mapping=torch.arange(kv_len - query_len, kv_len, dtype=torch.int64),
         sliding_window=None,
     )
     assert metadata.attention_mask_tiles is not None
@@ -1378,6 +1394,71 @@ def test_a_per_head_constant_alibi_bias_leaves_the_output_unchanged(soft_cap, mo
     shifted = page_attn_kernel(*args, alibi_pool)
 
     torch.testing.assert_close(shifted, baseline, atol=1e-5, rtol=1e-5)
+
+
+def test_alibi_bias_resolves_single_kv_positions_far_into_a_sequence(default_vllm_config):
+    """At a 32768-token offset the bias must still tell KV positions apart.
+
+    Positions are absolute, and fp16 spaces them 32 apart that far out: a block's
+    128 positions would round onto a handful of values and the near-diagonal
+    ``rel``, which is all the bias says, would flatten into a per-block constant
+    that softmax then ignores. int32 positions and an fp32 product keep it exact;
+    only the finished tile is narrowed, so the residual error is one rounding of
+    the bias -- worth a couple of percent of a probability, against the O(1) shift
+    a collapsed position axis causes.
+    """
+    torch.set_default_device("cpu")
+    block_size = 128
+    num_kv_heads, num_queries_per_kv, head_size = 8, 4, 128
+    num_heads = num_kv_heads * num_queries_per_kv
+    far_block = 32768 // block_size
+    kv_len = (far_block + 1) * block_size
+
+    metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([block_size], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        slot_mapping=torch.tensor([block_size - 1], dtype=torch.int64),
+        sliding_window=None,
+    )
+    metadata.mask_pool_height = 2
+
+    slopes = _alibi_slopes(num_heads)
+    impl = SpyreAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=1.0,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=slopes,
+    )
+    # Positions come from the arguments, not the metadata: this asks for the block
+    # a 32k-token sequence decodes in, without building 256 mask tiles to get there.
+    stack = impl._alibi_bias_stack(
+        metadata, 0, [far_block], kv_len - 1, block_size, torch.device("cpu")
+    )
+
+    assert stack.dtype == impl.model_dtype
+    tile = stack[0].reshape(num_heads, block_size)
+    for head in range(num_heads):
+        distinct = tile[head].unique().numel()
+        assert distinct == block_size, (
+            f"head {head} resolves only {distinct} of {block_size} KV positions"
+        )
+
+    rel = torch.arange(far_block * block_size, kv_len, dtype=torch.float64) - (kv_len - 1)
+    reference = torch.tensor(slopes, dtype=torch.float64).unsqueeze(1) * rel
+    set_random_seed(0)
+    scores = torch.randn(num_heads, block_size, dtype=torch.float64)
+    torch.testing.assert_close(
+        torch.softmax(scores + tile.double(), dim=-1),
+        torch.softmax(scores + reference, dim=-1),
+        atol=0.02,
+        rtol=0.0,
+    )
 
 
 # ---------------------------------------------------------------------------

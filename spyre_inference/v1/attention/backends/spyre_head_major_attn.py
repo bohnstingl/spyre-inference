@@ -246,6 +246,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         record every one the bucketer enumerates."""
         return False
 
+    def requires_compiled_attention_warmup(self) -> bool:
+        """True: these kernels are module-level compiled objects, taken whatever the
+        compilation mode, because the page gather fails eager. Under
+        ``CompilationMode.NONE`` skipping the recorder would not save the compiles,
+        only move them into serving, one per variant."""
+        return True
+
     def _run_batched_decode(
         self,
         query_dev: torch.Tensor,
