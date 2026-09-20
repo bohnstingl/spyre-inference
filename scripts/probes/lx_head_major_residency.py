@@ -56,10 +56,14 @@ torch.zeros(1, dtype=torch.float16).to("spyre")
 
 from torch_spyre._inductor import config as ts_config  # noqa: E402
 
-from spyre_inference.v1.attention.ops.layout import head_major_kv_layout  # noqa: E402
+from spyre_inference.v1.attention.ops.layout import (  # noqa: E402
+    INT32_ELEMS_PER_STICK,
+    head_major_kv_layout,
+)
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (  # noqa: E402
     page_attn_head_major_decode_kernel,
 )
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE  # noqa: E402
 
 
 def _int(name, default):
@@ -132,15 +136,17 @@ for i in range(NUM_BLOCKS):
     tile[~allow] = FP16_MIN
     masks.append(tile.contiguous())
 
-head_ids = torch.arange(KV, dtype=torch.int32).reshape(KV, 1)
-kv_tables = [(int(pages_used[i]) * KV + head_ids).contiguous() for i in range(NUM_BLOCKS)]
+page_table = torch.zeros(NUM_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+page_table[:, 0] = pages_used
+kv_rows = torch.arange(NUM_PAGES * KV, dtype=torch.int32).reshape(NUM_PAGES, KV, 1)
 args = (
     query.to("spyre"),
     row_index.to("spyre"),
     k_dev.view(NUM_PAGES * KV, B, D),
     v_dev.view(NUM_PAGES * KV, B, D),
-    [t.to("spyre") for t in kv_tables],
-    [m.to("spyre") for m in masks],
+    page_table.to("spyre"),
+    kv_rows.to("spyre"),
+    torch.stack(masks).to("spyre"),
     SCALE,
     NUM_BLOCKS,
     Q_LEN,
@@ -154,7 +160,10 @@ prev_cores = ts_config.sencores
 if MAX_CORES:
     ts_config.sencores = MAX_CORES
 try:
-    got = torch.compile(KERNEL, dynamic=False)(*args).cpu()[:Q_LEN]
+    # fullgraph mirrors the backend's: a tiled page walk needs it, see for_each_tile's
+    # DataDependentOutputException.
+    compiled = torch.compile(KERNEL, dynamic=False, fullgraph=USE_FOR_EACH_TILE)
+    got = compiled(*args).cpu()[:Q_LEN]
 finally:
     ts_config.sencores = prev_cores
 
@@ -175,7 +184,9 @@ verdicts = re.findall(r"lx_pinning: (\S+) \(([^)]+)\) . ([^\n]+)", text)
 # what this probe is about.
 gathers = [(op, kind, why.strip()) for op, kind, why in verdicts if kind == "index"]
 pinned = [op for op, _, why in gathers if why == "lx"]
-page_gathers = 2 * NUM_BLOCKS
+# With the tiled walk gated on the graph holds one block body, so residency has to hold
+# for 2 gathers rather than 2 per block.
+page_gathers = 2 if USE_FOR_EACH_TILE else 2 * NUM_BLOCKS
 query_gathers = 1
 print(f"\ngathers: {len(gathers)} ops, {len(pinned)} pinned LX")
 print(f"  K/V page gathers expected: {page_gathers} (K and V per block)")

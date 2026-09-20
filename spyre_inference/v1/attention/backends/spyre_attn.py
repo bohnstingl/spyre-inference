@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
@@ -49,7 +50,6 @@ from spyre_inference.v1.attention.ops.layout import (
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
-from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
     SpyreAttnBatchedDecodeBucket,
@@ -172,9 +172,11 @@ def _build_query_row_tables(
 # hold the per-sequence Python loop around these.
 #
 # page_attn needs fullgraph because of ``for_each_tile``.
-_page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE)
+_page_attn_compiled = torch.compile(
+    page_attn_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
+)
 _batched_decode_compiled = torch.compile(
-    batched_decode_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+    batched_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
 
 compile_guard.watch(page_attn_kernel, "page attention kernel")
@@ -922,8 +924,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # The query-group axis stays 1 and broadcasts in the kernel's mask add;
                 # the KV axis only has to be materialized for the tiled walk, whose body
                 # cannot propagate a broadcast window's layout through a trip. The plain
-                # walk broadcasts KV too, so it keeps the narrower transfer.
-                kv_extent = self.num_kv_heads if USE_FOR_EACH_TILE else 1
+                # walk broadcasts KV too, so it keeps the narrower transfer. Read per
+                # build, as `walk_tiles` reads it, so the mask and the walk cannot
+                # disagree about which of the two is running.
+                kv_extent = self.num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1
                 mask_by_chunk_cpu = (
                     mask_bs_bb.transpose(0, 1)
                     .unsqueeze(2)
