@@ -303,6 +303,19 @@ def test_head_major_kv_cache_shape():
     assert SpyreHeadMajorAttentionBackend.get_kv_cache_block_dim(128, 8, 64) == 0
 
 
+def test_head_major_page_attn_matches_the_dispatch_signature():
+    """The base dispatch and this override must stay arity-compatible.
+
+    The base publishes the argument list; an override that misses one raises only
+    once a request reaches the kernel, which no CPU test does.
+    """
+    import inspect
+
+    base = inspect.signature(SpyreAttentionImpl._run_page_attn)
+    override = inspect.signature(SpyreHeadMajorAttentionImpl._run_page_attn)
+    assert list(override.parameters) == list(base.parameters)
+
+
 def test_head_major_write_index(default_vllm_config):
     """kv_write_index maps a slot to the row holding each of that token's heads."""
     from vllm.config import get_current_vllm_config
@@ -882,6 +895,141 @@ def test_decode_fold_matches_unrolled():
         folded = page_attn_head_major_decode_kernel(*args[:5], *args[6:])
         assert folded.shape == unrolled.shape
         torch.testing.assert_close(folded, unrolled, atol=1e-5, rtol=1e-5)
+
+
+# A cap this small is what makes the mask ordering observable: capping after the mask
+# add turns a masked lane into -cap, and only at a cap of a few units does exp(-cap)
+# survive the softmax far enough to move the output past these tolerances. At a
+# production cap of 50 the same swap is numerically invisible here.
+@pytest.mark.parametrize("soft_cap", [0.0, 2.0], ids=["no_soft_cap", "soft_cap"])
+@pytest.mark.parametrize("query_len", [1, 4], ids=["one_query_row", "four_query_rows"])
+def test_every_non_batched_page_walk_agrees(soft_cap: float, query_len: int, monkeypatch) -> None:
+    """One logical input through every non-batched page walk, in all three layouts.
+
+    The kernels share `online_softmax_step` but each builds its own scores, so the
+    ordering the accumulation depends on -- scale, then soft cap, then the mask add
+    -- is written out once per kernel and can drift. A drift produces slightly wrong
+    logits, which only an eval would otherwise notice.
+
+    The token-major walk is the base; at a single query row the head-major decode
+    pair joins it. Run under the Python walk, which is the body `for_each_tile`
+    tiles, so this compares the bodies and not the driver.
+    """
+    from spyre_inference.v1.attention.ops import tile_loop
+    from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
+    from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+    from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+        page_attn_head_major_prefill_kernel,
+    )
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    kv, qpk, d, block, blocks = 2, 2, 64, 16, 3
+    heads = kv * qpk
+    scale = d**-0.5
+    pages = blocks + 1
+
+    k_tm = torch.randn(pages, block, kv, d)
+    v_tm = torch.randn(pages, block, kv, d)
+    # The same cache in the two head-major layouts: unfolded for prefill, then folded
+    # onto (page, kv_head) rows for the decode pair.
+    k_hm = k_tm.permute(0, 2, 1, 3).contiguous()
+    v_hm = v_tm.permute(0, 2, 1, 3).contiguous()
+    k_fold = k_hm.reshape(pages * kv, block, d)
+    v_fold = v_hm.reshape(pages * kv, block, d)
+
+    query = torch.randn(query_len + 2, heads, d)
+    # Not starting at row 0, and page 0 left out below: both are what the builder
+    # reserves for padding, and a table naming them would pass even for a kernel
+    # that ignored the table.
+    row_index = torch.zeros(INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    row_index[:query_len] = torch.arange(1, query_len + 1, dtype=torch.int32)
+
+    page_ids = list(range(1, blocks + 1))
+    # Only the last tile is masked: a fully masked tile has no finite max, which the
+    # builder guarantees against rather than the kernels handling it.
+    masks = [torch.zeros(query_len, block) for _ in range(blocks)]
+    masks[-1][:, block // 2 :] = torch.finfo(torch.float32).min
+    mask_pool = torch.stack(masks)
+
+    page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    page_table[:, 0] = torch.tensor(page_ids, dtype=torch.int32)
+    mask_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    mask_table[:, 0] = torch.arange(blocks, dtype=torch.int32)
+
+    # The block count is the tables' own dim 0 here; the token-major kernel takes it
+    # no other way.
+    token_major = page_attn_kernel(
+        query,
+        row_index,
+        k_tm,
+        v_tm,
+        page_table,
+        mask_table,
+        mask_pool,
+        scale,
+        query_len,
+        heads,
+        kv,
+        d,
+        soft_cap,
+    )
+    prefill = page_attn_head_major_prefill_kernel(
+        query,
+        row_index,
+        k_hm,
+        v_hm,
+        page_table,
+        mask_pool,
+        scale,
+        blocks,
+        query_len,
+        heads,
+        kv,
+        d,
+        block,
+        soft_cap,
+    )
+    assert prefill.shape == token_major.shape
+    torch.testing.assert_close(prefill, token_major, atol=1e-5, rtol=1e-5)
+
+    if query_len != 1:
+        return
+
+    kv_tables = [
+        torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in page_ids
+    ]
+    head_tables = [
+        torch.tensor([h * qpk + g for h in range(kv)], dtype=torch.int32) for g in range(qpk)
+    ]
+    args = (
+        query,
+        row_index,
+        k_fold,
+        v_fold,
+        kv_tables,
+        head_tables,
+        masks,
+        scale,
+        blocks,
+        query_len,
+        heads,
+        kv,
+        d,
+        block,
+        soft_cap,
+    )
+    torch.testing.assert_close(
+        page_attn_head_major_kernel(*args), token_major, atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        page_attn_head_major_decode_kernel(*args[:5], *args[6:]),
+        token_major,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 @pytest.mark.parametrize(

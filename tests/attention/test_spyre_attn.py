@@ -37,6 +37,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
+    _mask_pool_height,
     _mirror_mask_stacks,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
@@ -1274,6 +1275,111 @@ def test_mirror_mask_stacks_none_for_empty_sequence(default_vllm_config):
     assert _mirror_mask_stacks([[]], torch.device("cpu")) == [None]
 
 
+def test_count_one_mask_sentinel_lands_on_a_masked_pool_row(default_vllm_config):
+    """A one-active-block sequence is dispatched at two blocks, and the second must
+    contribute nothing.
+
+    Dynamo specializes a dimension whose value is 1, so the symbolic block count
+    never takes it and the walk is always at least two blocks long. The page table
+    fills that second row by repeating block 0, so the only thing keeping the block
+    from being counted twice is the mask row the sentinel names -- which must exist
+    in the pool and be fully masked.
+    """
+    torch.set_default_device("cpu")
+    block_size = 64
+    device = torch.device("cpu")
+
+    metadata = _build_metadata(
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=block_size,
+        seq_lens=torch.tensor([block_size], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.tensor([[3]], dtype=torch.int32),
+        slot_mapping=torch.tensor([block_size - 1], dtype=torch.int64),
+        sliding_window=None,
+    )
+    assert metadata.attention_mask_tiles is not None
+    assert len(metadata.attention_mask_tiles[0]) == 1, "need a single active block"
+
+    metadata.attention_mask_stacks_device = _mirror_mask_stacks(
+        metadata.attention_mask_tiles, device, metadata.max_num_blocks
+    )
+    metadata.mask_pool_height = _mask_pool_height(metadata.attention_mask_stacks_device)
+
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=1.0, num_kv_heads=8)
+    mask_table = impl.mask_index_tables(metadata, device)[0]
+    page_table = impl.index_tables(metadata, device)[0]
+    pool = metadata.attention_mask_stacks_device[0]
+    assert pool is not None
+
+    assert mask_table.shape[0] == 2, "the walk must be padded to two blocks"
+    # Repeating the page is what makes the mask row load-bearing.
+    assert int(page_table[1, 0]) == int(page_table[0, 0])
+    sentinel = int(mask_table[1, 0])
+    assert sentinel < pool.shape[0], f"sentinel row {sentinel} is past the pool"
+    assert torch.all(pool[sentinel] == torch.finfo(pool.dtype).min)
+
+
+@pytest.mark.parametrize("soft_cap", [0.0, 30.0], ids=["no_soft_cap", "soft_cap"])
+def test_a_per_head_constant_alibi_bias_leaves_the_output_unchanged(soft_cap, monkeypatch):
+    """Softmax is invariant under a per-row constant, so such a bias must be inert.
+
+    That invariance is what lets the bias tiles drop their query axis, and it holds
+    only while the bias is added *after* the soft cap: capping a shifted logit does
+    not shift the capped logit, so the same construction also pins the ordering the
+    kernel documents.
+    """
+    from spyre_inference.v1.attention.ops import tile_loop
+    from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
+    from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+
+    # The tiled walk runs this same body but only on device; the bias enters the body.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    kv, qpk, d, block, blocks, query_len = 2, 2, 64, 16, 3, 4
+    heads = kv * qpk
+    k_pages = torch.randn(blocks + 1, block, kv, d)
+    v_pages = torch.randn(blocks + 1, block, kv, d)
+    query = torch.randn(query_len, heads, d)
+    row_index = torch.zeros(INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    row_index[:query_len] = torch.arange(query_len, dtype=torch.int32)
+
+    mask_pool = torch.zeros(blocks, query_len, block)
+    mask_pool[-1, :, block // 2 :] = torch.finfo(torch.float32).min
+    page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    page_table[:, 0] = torch.arange(1, blocks + 1, dtype=torch.int32)
+    mask_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    mask_table[:, 0] = torch.arange(blocks, dtype=torch.int32)
+
+    # Constant over KV positions and blocks, so every score of a head shifts alike.
+    per_head = torch.tensor([-0.5, 0.25, 1.5, -2.0]).reshape(1, kv, qpk, 1, 1)
+    alibi_pool = per_head.expand(blocks, kv, qpk, 1, block).contiguous()
+
+    args = (
+        query,
+        row_index,
+        k_pages,
+        v_pages,
+        page_table,
+        mask_table,
+        mask_pool,
+        d**-0.5,
+        query_len,
+        heads,
+        kv,
+        d,
+        soft_cap,
+    )
+    baseline = page_attn_kernel(*args)
+    shifted = page_attn_kernel(*args, alibi_pool)
+
+    torch.testing.assert_close(shifted, baseline, atol=1e-5, rtol=1e-5)
+
+
 # ---------------------------------------------------------------------------
 # KV write-back (reshape_and_cache scatter)
 # ---------------------------------------------------------------------------
@@ -2313,6 +2419,41 @@ def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_tiles[0] == []
     assert metadata.padded_num_blocks[1] == 2
+
+
+def test_zero_active_blocks_dispatch_zeros_without_a_kernel(default_vllm_config, monkeypatch):
+    """The dispatch half of the zero-block contract; the builder half is above.
+
+    Attention over the empty set is undefined and no kernel declines it: a fully
+    masked tile leaves ``scores - scores_max == 0``, so every one of them would
+    return a confident mean of page 0 rather than fail. The branch writing zeros
+    is therefore the only thing standing between this state and a silently wrong
+    answer, so it is locked here by both of its effects -- zeros out, and no
+    kernel entered at all.
+    """
+    torch.set_default_device("cpu")
+    device = torch.device("cpu")
+    metadata = _padded_mask_metadata([(1, 0)], max_num_blocks=_num_blocks_buckets()[-1])
+    assert metadata.padded_num_blocks == [0]
+
+    metadata.attention_mask_stacks_device = _mirror_mask_stacks(
+        metadata.attention_mask_tiles, device, metadata.max_num_blocks
+    )
+    metadata.mask_pool_height = _mask_pool_height(metadata.attention_mask_stacks_device)
+
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=1.0, num_kv_heads=8)
+    monkeypatch.setattr(
+        impl, "_run_page_attn", Mock(side_effect=AssertionError("a kernel was dispatched"))
+    )
+
+    query = torch.randn(1, 32, 128, dtype=torch.float16)
+    pages = torch.randn(4, 64, 8, 128, dtype=torch.float16)
+    # Nonzero, so writing zeros is observable rather than the buffer's initial state.
+    output = torch.full((1, 32, 128), 7.0, dtype=torch.float16)
+
+    impl._online_softmax_attention(query, pages, pages, metadata, output, device)
+
+    assert torch.equal(output, torch.zeros_like(output))
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):

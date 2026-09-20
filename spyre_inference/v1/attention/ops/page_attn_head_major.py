@@ -24,6 +24,11 @@ does not have (torch-spyre#4123).
 
 import torch
 
+from spyre_inference.v1.attention.ops.online_softmax import (
+    OnlineSoftmaxCarry,
+    online_softmax_step,
+)
+
 
 def page_attn_head_major_kernel(
     query,
@@ -44,6 +49,11 @@ def page_attn_head_major_kernel(
     out=None,
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
+
+    The unrolled reference for `page_attn_head_major_decode_kernel`, which folds the
+    query groups into the row axis instead. Not dispatched to: the impl wires the
+    folded kernel, and this one is the equivalence baseline its tests compare
+    against, plus the LX residency probe. Keep the two in step.
 
     Under `dynamic=False` Dynamo specializes on every non-tensor argument, so the page
     loop is unrolled per variant.
@@ -76,9 +86,8 @@ def page_attn_head_major_kernel(
         for g in range(num_queries_per_kv)
     ]
 
-    tile_max: list[torch.Tensor] = []
-    tile_sum: list[torch.Tensor] = []
-    tile_out: list[torch.Tensor] = []
+    # One carry per query group; None until that group's first block folds in.
+    carries: list[OnlineSoftmaxCarry | None] = [None] * num_queries_per_kv
 
     for i in range(num_blocks):
         # Subscripting, not index_select, which takes only a 1-D index: that puts the
@@ -97,24 +106,14 @@ def page_attn_head_major_kernel(
                 # after it would un-mask the padded lanes.
                 scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
             scores = scores + mask_tile
-            scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-            if i == 0:
-                probs = torch.exp(scores - scores_max)
-                tile_max.append(scores_max)
-                tile_out.append(torch.matmul(probs, v_page))
-                tile_sum.append(probs.sum(dim=-1, keepdim=True))
-            else:
-                new_max = torch.maximum(tile_max[g], scores_max)
-                rescale = torch.exp(tile_max[g] - new_max)
-                tile_out[g] = tile_out[g] * rescale
-                tile_sum[g] = tile_sum[g] * rescale
-                probs = torch.exp(scores - new_max)
-                tile_out[g] = tile_out[g] + torch.matmul(probs, v_page)
-                tile_sum[g] = tile_sum[g] + probs.sum(dim=-1, keepdim=True)
-                tile_max[g] = new_max
+            carries[g] = online_softmax_step(carries[g], scores, v_page)
 
-    groups = [tile_out[g] / tile_sum[g] for g in range(num_queries_per_kv)]
+    groups = []
+    for carry in carries:
+        assert carry is not None, "num_blocks must be at least 1"
+        _, group_sum, group_out = carry
+        groups.append(group_out / group_sum)
     attn = torch.stack(groups, dim=1)
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
     attn = attn.reshape(padded_query_len, num_heads, head_size)
@@ -151,14 +150,23 @@ def page_attn_head_major_decode_kernel(
     passing them costs argument marshalling per call for tensors the graph never reads.
     """
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
+    # The dispatch walks max(2, active blocks) so the token-major kernel's symbolic
+    # count never takes the value Dynamo specializes; the pools must cover that,
+    # not just the active count. Both sides are static here, so this is free.
+    assert len(kv_index_tables) >= num_blocks, (
+        f"{len(kv_index_tables)} index tables for a {num_blocks}-block walk"
+    )
+    # `len`, not `.shape[0]`: the pool is a stack from the impl and a list of tiles
+    # from the equivalence tests.
+    assert len(mask_tiles) >= num_blocks, (
+        f"mask pool of height {len(mask_tiles)} for a {num_blocks}-block walk"
+    )
     num_queries_per_kv = num_heads // num_kv_heads
 
     row = query_row_index[:1]
     q = query.index_select(0, row).reshape(num_kv_heads, num_queries_per_kv, head_size)
 
-    tile_max = None
-    tile_sum = None
-    tile_out = None
+    carry: OnlineSoftmaxCarry | None = None
 
     for i in range(num_blocks):
         kv_rows = kv_index_tables[i]
@@ -171,27 +179,11 @@ def page_attn_head_major_decode_kernel(
         # At one query row the mask is head-independent, so its [1, block_size] tile
         # broadcasts across the folded group axis.
         scores = scores + mask_tiles[i]
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
-            probs = torch.exp(scores - scores_max)
-            tile_max = scores_max
-            tile_out = torch.matmul(probs, v_page)
-            tile_sum = probs.sum(dim=-1, keepdim=True)
-        else:
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_out is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_out = tile_out * rescale
-            tile_sum = tile_sum * rescale
-            probs = torch.exp(scores - new_max)
-            tile_out = tile_out + torch.matmul(probs, v_page)
-            tile_sum = tile_sum + probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
+        carry = online_softmax_step(carry, scores, v_page)
 
-    assert tile_out is not None and tile_sum is not None
+    assert carry is not None, "num_blocks must be at least 1"
+    _, tile_sum, tile_out = carry
     attn = (tile_out / tile_sum).reshape(1, num_heads, head_size)
     if out is not None:
         out.index_copy_(0, row, attn)

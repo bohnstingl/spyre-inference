@@ -41,6 +41,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _build_query_row_tables,
 )
+from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+    SpyreHeadMajorAttentionImpl,
+)
+from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.layout import (
     stick_aligned_len,
 )
@@ -73,6 +77,22 @@ def impl(default_vllm_config):
     # eager. __init__ reads the mode to pick its kernel, so set it before building.
     get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     return SpyreAttentionImpl(
+        num_heads=NUM_HEADS,
+        head_size=HEAD_SIZE,
+        scale=1.0 / (HEAD_SIZE**0.5),
+        num_kv_heads=NUM_KV_HEADS,
+        alibi_slopes=None,
+        sliding_window=None,
+    )
+
+
+@pytest.fixture()
+def head_major_impl(default_vllm_config):
+    """A head-major impl, built the way the recorder's own ``impl`` fixture is."""
+    torch._dynamo.reset()
+    get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    get_current_vllm_config().cache_config.block_size = BLOCK_SIZE
+    return SpyreHeadMajorAttentionImpl(
         num_heads=NUM_HEADS,
         head_size=HEAD_SIZE,
         scale=1.0 / (HEAD_SIZE**0.5),
@@ -147,6 +167,16 @@ def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
     return [v for v in bucketer.variants() if v.num_blocks <= pages]
 
 
+def _selected(impl, bucketer, builder, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
+    """The per-seq variants `impl` will actually record.
+
+    `_recordable` is the enumeration a small page allocation leaves reachable; an
+    impl whose kernel reuses one trace across block counts then collapses that
+    further, so an expected count has to come from the impl, not the bucketer alone.
+    """
+    return impl._per_seq_recording_variants(bucketer.variants(), builder, pages)
+
+
 def _record(impl, kv_cache, builder) -> int:
     """``record_graphs`` as the runner calls it; ``forward`` ignores the layer."""
     return impl.record_graphs(MagicMock(), kv_cache, builder)
@@ -184,7 +214,7 @@ class TestRecordGraphs:
 
         recorded = _record(impl, kv_cache, builder)
 
-        assert recorded == len(_recordable(bucketer)) > 0
+        assert recorded == len(_selected(impl, bucketer, builder)) > 0
 
     def test_for_each_tile_records_one_frontend_graph_per_query_bucket(
         self, impl, kv_cache, builder, monkeypatch
@@ -219,6 +249,58 @@ class TestRecordGraphs:
         )
 
         assert selected == _recordable(bucketer)
+
+    def test_for_each_tile_keeps_block_variants_for_head_major(
+        self, impl, head_major_impl, builder, monkeypatch
+    ):
+        """Collapsing onto one graph per query width is the token-major kernel's
+        property, not the environment's: the head-major kernels still unroll the
+        page loop, so every block count they can be asked for must be recorded."""
+        bucketer = builder._attn_bucketer = make_bucketer()
+        monkeypatch.setattr(spyre_attn, "USE_FOR_EACH_TILE", True)
+        variants = list(bucketer.variants())
+
+        head_major = head_major_impl._per_seq_recording_variants(variants, builder, NUM_PAGES)
+        token_major = impl._per_seq_recording_variants(variants, builder, NUM_PAGES)
+
+        assert head_major == _recordable(bucketer)
+        assert len(token_major) < len(head_major), "token-major did not collapse; test is blind"
+
+    def test_head_major_hands_mark_dynamic_nothing_under_the_flag(
+        self, head_major_impl, monkeypatch
+    ):
+        """The dispatch marks whatever this hook returns dynamic, and for head-major
+        `build_index_tables` publishes a (list, tensor | None) pair that `mark_dynamic`
+        cannot take. The flag must not reach it."""
+        monkeypatch.setattr(spyre_attn, "USE_FOR_EACH_TILE", True)
+        index_table = ([torch.zeros(NUM_KV_HEADS, 1, dtype=torch.int32)], None)
+
+        tables = head_major_impl.dynamic_block_tables(
+            index_table, torch.zeros(2, 32, dtype=torch.int32)
+        )
+
+        assert tables == ()
+
+    @pytest.mark.skipif(
+        not tile_loop.USE_FOR_EACH_TILE,
+        reason="the symbolic walk is what reuses the trace; unset, the loop is unrolled",
+    )
+    def test_one_frontend_graph_serves_every_block_count(self, impl, kv_cache, builder):
+        """The feature's headline claim, measured rather than assumed.
+
+        Dispatching a second block count through a symbolic walk must reuse the first
+        one's graph; a guard on the count would show up here as another compile.
+        """
+        bucketer = builder._attn_bucketer = make_bucketer()
+        counts = sorted({variant.num_blocks for variant in _recordable(bucketer)})
+        assert len(counts) > 1, "only one recordable block count; nothing under test"
+
+        _dispatch(impl, builder, kv_cache, counts[0], 1)
+
+        snapshot = compiles()
+        for count in counts[1:]:
+            _dispatch(impl, builder, kv_cache, count, 1)
+        assert compiles() == snapshot, f"block counts {counts} did not share one graph"
 
     def test_dispatch_after_recording_compiles_nothing(self, impl, kv_cache, builder):
         """The acceptance criterion: no request compiles a new variant.
@@ -282,7 +364,10 @@ class TestRecordGraphs:
     ):
         """Without a window every bucket must realize onto itself; drift is a bug."""
         builder._attn_bucketer = make_bucketer()
-        monkeypatch.setattr(builder, "_pad_num_blocks", lambda n: min(n * 2, NUM_PAGES) if n else 0)
+        # Drifts downwards, so it drifts for the largest bucket too: a symbolic page walk
+        # records only that one, and no realistic upward drift can move it (padding is
+        # bounded by the bucket ladder, which the engine's block table is allocated to).
+        monkeypatch.setattr(builder, "_pad_num_blocks", lambda n: max(1, n // 2) if n else 0)
 
         with caplog.at_level(logging.WARNING):
             _record(impl, kv_cache, builder)
@@ -305,7 +390,7 @@ class TestRecordGraphs:
 
         recorded = _record(impl, kv_cache, builder)
 
-        assert 0 < recorded == len(_recordable(bucketer)) < len(bucketer.variants())
+        assert 0 < recorded == len(_selected(impl, bucketer, builder)) < len(bucketer.variants())
 
     def test_real_metadata_dispatch_compiles_nothing(self, impl, kv_cache, builder):
         """The acceptance criterion, driven from real builder metadata.
@@ -485,7 +570,7 @@ class TestRecordGraphs:
         monkeypatch.setattr(impl, "_record_one", flaky)
         recorded = _record(impl, kv_cache, builder)
 
-        assert recorded == calls["n"] - 1 == len(_recordable(bucketer)) - 1
+        assert recorded == calls["n"] - 1 == len(_selected(impl, bucketer, builder)) - 1
 
     def test_recording_nothing_warns(self, impl, kv_cache, builder, monkeypatch, caplog):
         """A pass that records nothing degrades to first-use compiles; say so loudly."""
@@ -620,8 +705,9 @@ class TestRecordBatchedDecode:
             v for v in bucketer.batched_decode_variants() if v.num_seqs * v.blocks_per_chunk < pages
         ]
 
-    def _expected(self, bucketer, batched: int) -> int:
-        return len(_recordable(bucketer, self.PAGES)) + batched
+    def _expected(self, impl, bucketer, builder, batched: int) -> int:
+        """Total recordings: the per-seq pass this impl selects, plus the batched ones."""
+        return len(_selected(impl, bucketer, builder, self.PAGES)) + batched
 
     def test_records_every_enumerated_batched_variant(self, impl, wide_cache, builder):
         bucketer = builder._attn_bucketer = make_bucketer()
@@ -632,7 +718,7 @@ class TestRecordBatchedDecode:
         assert len(batched) == len(bucketer.batched_decode_variants()), (
             "the cache is too small to record the whole enumeration, so this would not cover it"
         )
-        assert recorded == self._expected(bucketer, len(batched))
+        assert recorded == self._expected(impl, bucketer, builder, len(batched))
 
     def test_records_nothing_batched_when_the_flag_is_off(
         self, impl, wide_cache, builder, monkeypatch
@@ -641,7 +727,7 @@ class TestRecordBatchedDecode:
         envs.clear_env_cache()
         bucketer = builder._attn_bucketer = make_bucketer()
 
-        assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
+        assert _record(impl, wide_cache, builder) == self._expected(impl, bucketer, builder, 0)
 
     def test_alibi_layer_records_nothing_batched(self, default_vllm_config, wide_cache, builder):
         """The batched kernel doesn't implement ALiBi, so those layers never dispatch to it."""
@@ -657,7 +743,9 @@ class TestRecordBatchedDecode:
         )
         bucketer = builder._attn_bucketer = make_bucketer()
 
-        assert _record(alibi_impl, wide_cache, builder) == self._expected(bucketer, 0)
+        assert _record(alibi_impl, wide_cache, builder) == self._expected(
+            alibi_impl, bucketer, builder, 0
+        )
 
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """The gather's entry axis, not the block count, is what a small cache bounds."""
@@ -667,7 +755,7 @@ class TestRecordBatchedDecode:
 
         batched = self._recordable_batched(bucketer, pages=NUM_PAGES)
         assert len(batched) < len(bucketer.batched_decode_variants())
-        assert recorded == len(_recordable(bucketer)) + len(batched)
+        assert recorded == len(_selected(impl, bucketer, builder)) + len(batched)
 
     def test_window_variants_over_the_requested_budget_still_record(
         self, impl, kv_cache, sliding_window_builder
@@ -714,7 +802,7 @@ class TestRecordBatchedDecode:
         recorded = _record(impl, wide_cache, sliding_window_builder)
         # The window collapses both axes, so the total is below what either
         # enumeration asks for on its own.
-        assert recorded < self._expected(bucketer, len(requested)), (
+        assert recorded < self._expected(impl, bucketer, sliding_window_builder, len(requested)), (
             "nothing collapsed; the dedupe path is untested"
         )
 

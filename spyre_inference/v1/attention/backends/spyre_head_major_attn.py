@@ -40,6 +40,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
+    SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _call_kernel,
 )
@@ -230,6 +231,21 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             for s, pages in enumerate(tables_cpu)
         ]
 
+    def dynamic_block_tables(self, index_table, mask_index_table) -> tuple[torch.Tensor, ...]:
+        """None: neither head-major kernel walks a symbolic block count.
+
+        The prefill kernel slices its table at a static `num_blocks` and the decode
+        kernel indexes a Python list, so marking either dynamic would only add a
+        guard -- and `build_index_tables` hands this impl a tuple, which
+        `mark_dynamic` cannot take.
+        """
+        return ()
+
+    def reuses_trace_across_block_counts(self, builder: SpyreAttentionMetadataBuilder) -> bool:
+        """False: both kernels specialize on the block count, so warmup must
+        record every one the bucketer enumerates."""
+        return False
+
     def _run_batched_decode(
         self,
         query_dev: torch.Tensor,
@@ -271,12 +287,17 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         index_table,
+        mask_index_table: torch.Tensor,
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
         alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Accepts `mask_index_table` and ignores it: both kernels here read the
+        mask pool positionally -- prefill slices it, decode subscripts it -- so
+        there is no index table to gather it with."""
+        del mask_index_table
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
         kv_row_table, page_table = index_table
         # Beyond one query token the page transfer LX residency saves is amortised over every
