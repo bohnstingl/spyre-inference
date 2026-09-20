@@ -56,6 +56,7 @@ from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
@@ -63,9 +64,15 @@ logger = init_logger(__name__)
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
-_page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
+#
+# The prefill kernel needs fullgraph because of ``for_each_tile``.
+_page_attn_prefill_compiled = torch.compile(
+    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+)
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
-_batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
+_batched_decode_compiled = torch.compile(
+    batched_decode_head_major_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+)
 
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
 compile_guard.watch(
@@ -208,7 +215,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
     ) -> list[tuple[list[torch.Tensor], torch.Tensor | None]]:
         """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,
-        paired with the page ids alone for the wide-query kernel.
+        paired with the base's stacked page-id table for the wide-query kernel.
 
         The folded rows are one [KV, 1] tensor per block, not rows of one table: an int32
         argument's nonzero storage offset is still read as 0, so every block would gather
@@ -217,6 +224,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         float16 only; strict xfails pin both int32 cases on the pinned stack --
         test_spyre_compile_input_honors_storage_offset (its int32 parametrization) and
         test_spyre_in_graph_slice_of_stacked_kv_row_index.
+
+        The wide-query kernel is the exception: it walks its table a row at a time, and
+        the row it reads is the walk's own tile rather than a slice of a graph input, so
+        the whole [num_blocks, INT32_ELEMS_PER_STICK] table travels as one offset-0
+        tensor -- no per-block narrowing, and no host copy to narrow it with.
         """
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
@@ -229,8 +241,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     for b in range(pages.shape[0])
                 ],
                 # Only a wide query reads this, and building it for a decode step would add
-                # an H2D transfer to the path this layout exists to speed up.
-                convert(pages[:, 0:1].contiguous(), device=device) if query_lens[s] > 1 else None,
+                # an H2D transfer to the path this layout exists to speed up. Whole, not
+                # narrowed to column 0: the walk picks the column out in-graph, and one
+                # transfer costs the same either way while `.contiguous()` costs a copy.
+                convert(pages, device=device) if query_lens[s] > 1 else None,
             )
             for s, pages in enumerate(tables_cpu)
         ]
@@ -241,7 +255,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         rep_row_ids: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
-        chunk_index_tables: list[torch.Tensor],
+        chunk_index_tables: torch.Tensor,
         mask_by_chunk: torch.Tensor,
         b_seqs: int,
         blocks_per_chunk: int,
@@ -279,7 +293,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        alibi_bias_tiles: list[torch.Tensor] | None,
+        alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch
