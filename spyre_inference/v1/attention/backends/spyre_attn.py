@@ -165,6 +165,27 @@ def _mirror_mask_stack(
     return stack_device
 
 
+def _walked_block_count(num_active: int) -> int:
+    """The block count every kernel walks for a sequence with `num_active` active blocks.
+
+    Dynamo specializes a dimension whose value is 1, so a symbolic block count has to
+    start its range at 2: a single-active-block sequence walks one real block plus one
+    fully masked padding block. That is a property of upstream `mark_dynamic`, not
+    something a kernel can opt out of, so the padded count is what the dispatch
+    launches at and what every table and pool the walk indexes is built to cover.
+
+    Args:
+        num_active: Active blocks this sequence has, already padded onto the
+            recorder's buckets where the path does that.
+
+    Returns:
+        The count to walk. A sequence with no active blocks never walks -- the
+        dispatch writes zeros for it -- so its tables are sized here too rather
+        than through a second, emptier allocation path.
+    """
+    return max(2, num_active)
+
+
 def _build_query_row_tables(
     attn_metadata: "SpyreAttentionMetadata", device: torch.device
 ) -> list[torch.Tensor]:
@@ -334,7 +355,17 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Device mirror of attention_mask_stacks, filled lazily per sequence by the first
     # layer whose per-sequence kernel reads it. None entries have not been mirrored yet.
+    # Every mirrored pool is padded to max_num_blocks rows and never narrowed, since
+    # mask_index_tables' sentinel row indexes its last entry.
     attention_mask_stacks_device: list[torch.Tensor | None] | None = None
+
+    # ALiBi bias stacks, built lazily and shared by every layer in the step.
+    # The tiles depend only on (slopes, block, context_len), so the one thing that
+    # varies across layers is the slopes tensor -- and every layer of an ALiBi
+    # model shares one. Paired with that tensor and matched by identity rather than
+    # keyed by a hash, so a second slopes tensor gets its own stacks instead of
+    # silently reading the first one's. See _alibi_bias_stack.
+    alibi_bias_stacks: list[tuple[torch.Tensor, dict[int, torch.Tensor]]] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
@@ -910,7 +941,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         page_index_tables_cpu = []
         for s, n in enumerate(num_active):
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
-            table = torch.zeros(max(2, n), INT32_ELEMS_PER_STICK, dtype=torch.int32)
+            table = torch.zeros(_walked_block_count(n), INT32_ELEMS_PER_STICK, dtype=torch.int32)
             if n:
                 table[:n, 0] = block_table[s, blocks_s]
             if n == 1:
@@ -1048,7 +1079,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         kv_len = bucket.num_blocks * self.block_size
         assert query_len <= kv_len, f"{bucket} pairs a query length no sequence can reach"
         query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
-        # Every block points at page 0, vLLM's null block: nothing real is read.
+        # Width is the engine's, not the bucket's: build() indexes the table at the
+        # padded block count, so a table cut to the requested count turns a
+        # bucketer/build() divergence into an index error before the recorder can
+        # warn about it. Every block points at page 0, vLLM's null block, so the
+        # extra columns read nothing.
+        table_width = max(bucket.num_blocks, self._attn_bucketer.num_blocks_buckets[-1])
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=CommonAttentionMetadata(
@@ -1059,7 +1095,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 num_actual_tokens=query_len,
                 max_query_len=query_len,
                 max_seq_len=kv_len,
-                block_table_tensor=torch.zeros(1, bucket.num_blocks, dtype=torch.int32),
+                block_table_tensor=torch.zeros(1, table_width, dtype=torch.int32),
                 slot_mapping=torch.zeros(query_len, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.tensor([query_len > 1]),
@@ -1486,8 +1522,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return len(recorded)
 
-    @staticmethod
     def _per_seq_recording_variants(
+        self,
         variants: "list[SpyreAttnBucket]",
         builder: "SpyreAttentionMetadataBuilder",
         num_pages: int,
@@ -1498,12 +1534,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         so retain only the first (largest) recordable count for each query-width
         bucket. Tracing the maximum first also prepares the largest backend
         variant; the dynamic ``max=`` comes independently from metadata's full
-        configured capacity. Other paths still specialize on block count and
-        keep the full enumeration. Sliding-window attention is excluded until
-        its compact active-block count uses the same symbolic contract.
+        configured capacity.
+
+        Whether that reuse holds is the kernel's property, not the environment's:
+        an impl whose kernel still specializes on the block count keeps the full
+        enumeration, or every count it skips compiles on first use mid-serving.
+        See `reuses_trace_across_block_counts`.
         """
         recordable = [variant for variant in variants if variant.num_blocks <= num_pages]
-        if not USE_FOR_EACH_TILE or builder.sliding_window is not None:
+        if not self.reuses_trace_across_block_counts(builder):
             return recordable
 
         selected = []
@@ -1829,14 +1868,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata.kernel_mask_index_tables is None:
             assert attn_metadata.attention_mask_stacks is not None
             tables = []
-            max_blocks = attn_metadata.max_num_blocks
+            # The height `_mirror_mask_stack` pads every pool to; the dispatch asserts
+            # each gathered pool against it, so the two cannot drift apart.
+            pool_height = attn_metadata.max_num_blocks
             for mask_stack in attn_metadata.attention_mask_stacks:
                 logical_count = int(mask_stack.shape[0])
-                count = max(2, logical_count)
+                count = _walked_block_count(logical_count)
                 table = torch.zeros(count, INT32_ELEMS_PER_STICK, dtype=torch.int32)
                 table[:logical_count, 0] = torch.arange(logical_count, dtype=torch.int32)
                 if logical_count == 1:
-                    table[1, 0] = max_blocks - 1
+                    # The padding row the count-1 policy walks.
+                    assert pool_height >= 2, (
+                        f"mask pool of height {pool_height} has no padding row for the "
+                        "count-1 policy; it must be mirrored at max_num_blocks first"
+                    )
+                    table[1, 0] = pool_height - 1
                 tables.append(convert(table, device=device))
             attn_metadata.kernel_mask_index_tables = tables
         return attn_metadata.kernel_mask_index_tables
@@ -1844,18 +1890,104 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def dynamic_block_tables(self, index_table, mask_index_table) -> tuple[torch.Tensor, ...]:
         """The tables whose block axis this impl's kernel walks symbolically.
 
-        Empty when the kernel specializes on the block count instead, in which case
-        `mark_dynamic` must not be called on them.
+        Empty when the kernel specializes on the block count instead, in which
+        case `mark_dynamic` must not be called: a symbolic count there would only
+        add a guard.
+
+        Args:
+            index_table: This sequence's entry from `index_tables`.
+            mask_index_table: This sequence's entry from `mask_index_tables`.
+
+        Returns:
+            The tensors to mark dynamic on dim 0, in any order.
         """
         if not tile_loop.USE_FOR_EACH_TILE:
             return ()
         return (index_table, mask_index_table)
+
+    def reuses_trace_across_block_counts(self, builder: "SpyreAttentionMetadataBuilder") -> bool:
+        """Whether one frontend trace of this impl's kernel serves every block count.
+
+        True only when the kernel walks a `mark_dynamic`'d table, which is what
+        lets warmup record one trace per query width instead of the full
+        enumeration. Sliding window is excluded until its compact active-block
+        count uses the same symbolic contract.
+        """
+        return tile_loop.USE_FOR_EACH_TILE and builder.sliding_window is None
 
     def index_tables(self, attn_metadata: "SpyreAttentionMetadata", device: torch.device) -> list:
         """`build_index_tables`, memoized so only the step's first layer pays for it."""
         if attn_metadata.kernel_index_tables is None:
             attn_metadata.kernel_index_tables = self.build_index_tables(attn_metadata, device)
         return attn_metadata.kernel_index_tables
+
+    def _alibi_bias_stack(
+        self,
+        attn_metadata: "SpyreAttentionMetadata",
+        seq_idx: int,
+        active_bs: list[int],
+        context_len: int,
+        block_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """This sequence's ALiBi bias tiles, built once per step for all layers.
+
+        The bias is ``slope[h] * (kv_pos - context_len)``, one tile per block. The
+        full form is ``slope[h] * (kv_pos - (context_len + q_rel))``, which varies
+        over both query and KV positions; the ``(context_len + q_rel)`` term is a
+        per-query-row constant and softmax is invariant under adding any per-row
+        constant to its input (numerator and denominator pick up the same exp()
+        factor). Dropping it leaves the output bit-identical and keeps each tile 1D
+        over KV (block_size floats per head) rather than 2D.
+
+        Padded blocks get a tile too; their values stay finite (slopes are small
+        negative powers of two) and saturate under the mask's finfo.min, so they
+        stay inert. The stack is padded to the mask pool's height because the kernel
+        gathers both with the same `mask_index_table` row.
+
+        Built on the host and transferred whole, because the kernel tiles the block
+        axis rather than indexing a list. Cached on the metadata: the tiles depend
+        only on the slopes and the sequence, so the step's first layer pays for them
+        and the rest read the same device tensor.
+
+        Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
+        (alibi_offset = seq_offset - context_len) -- the production Triton path.
+
+        Args:
+            active_bs: This sequence's active block indices.
+            context_len: ``kv_len - query_len`` for this sequence.
+            device: Where the stack is transferred to.
+
+        Returns:
+            [max_num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size].
+        """
+        if attn_metadata.alibi_bias_stacks is None:
+            attn_metadata.alibi_bias_stacks = []
+        for slopes, stacks in attn_metadata.alibi_bias_stacks:
+            if slopes is self.alibi_slopes:
+                break
+        else:
+            stacks = {}
+            attn_metadata.alibi_bias_stacks.append((self.alibi_slopes, stacks))
+
+        cached = stacks.get(seq_idx)
+        if cached is not None:
+            return cached
+
+        bias_tiles = []
+        for b in active_bs:
+            kv_pos = torch.arange(
+                b * block_size,
+                (b + 1) * block_size,
+                dtype=torch.float16,
+            )
+            rel = (kv_pos - context_len).view(1, 1, 1, block_size)
+            bias_tiles.append(self.alibi_slopes * rel)
+        zero_bias = torch.zeros_like(bias_tiles[0])
+        bias_tiles.extend([zero_bias] * (attn_metadata.max_num_blocks - len(bias_tiles)))
+        stack = convert(torch.stack(bias_tiles), device=device)
+        stacks[seq_idx] = stack
+        return stack
 
     def _run_page_attn(
         self,
@@ -1878,6 +2010,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert row_table.shape == (padded_query_len,), (
             f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
         )
+        # num_blocks is not forwarded: the walk takes its extent from the tables,
+        # whose block axis is dynamic here, so passing the count would only invite
+        # an in-kernel comparison against it and a guard that re-specializes the
+        # graph. The count reaches the backend as the walk's own trip count.
+        del num_blocks
         return _call_kernel(
             "page attention",
             self._attn_fn,
@@ -1889,7 +2026,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             mask_index_table,
             mask_stack,
             self.scale,
-            num_blocks,
             padded_query_len,
             self.num_heads,
             self.num_kv_heads,
@@ -2014,50 +2150,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     min=2,
                     max=attn_metadata.max_num_blocks,
                 )
-            # Passed at full pool height, never narrowed to len(active_bs): its height
-            # is a static shape of the symbolic walk, which reaches rows through
-            # mask_index_table.
+            # Passed at full pool height, never narrowed to len(active_bs): the walk
+            # is `_walked_block_count` rows, so a single-active-block sequence reads
+            # the padding row, and the token-major kernel indexes the pool by
+            # mask_index_table rather than by position within active_bs.
             mask_stack = _mirror_mask_stack(attn_metadata, seq_idx, _target_device)
             assert mask_stack.shape[0] == attn_metadata.max_num_blocks
             if isinstance(index_table, torch.Tensor):
-                assert index_table.shape[0] == max(2, len(active_bs))
+                assert index_table.shape[0] == _walked_block_count(len(active_bs))
 
-            # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
-            #
-            # The full ALiBi form is slope[h] * (kv_pos - (context_len + q_rel)),
-            # which varies over both query and KV positions. The (context_len + q_rel)
-            # term is a per-query-row constant, and softmax is invariant under adding
-            # any per-row constant to its input (numerator and denominator both pick
-            # up the same exp() factor). We therefore drop it and keep only the
-            # kv-dependent term — the softmax output is bit-identical to the full
-            # form, and each tile stays 1D over KV (block_size floats per head)
-            # instead of 2D (aligned_query_len * block_size).
-            #
-            # Padded blocks get a tile too (the loop iterates active_bs); their
-            # values stay finite (slopes are small negative powers of two) and
-            # saturate under the mask's finfo.min, so they stay inert.
-            #
-            # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
-            # (alibi_offset = seq_offset - context_len) — the production Triton path.
-            #
-            # Stacked block-major on the host, then one transfer, because the
-            # kernel tiles the block axis rather than indexing a list.
             alibi_stack: torch.Tensor | None = None
             if self.alibi_slopes is not None:
-                context_len = kv_len - query_len
-                bias_tiles = []
-                for b in active_bs:
-                    kv_pos = torch.arange(
-                        b * block_size,
-                        (b + 1) * block_size,
-                        dtype=self.model_dtype,
-                    )
-                    rel = (kv_pos - context_len).view(1, 1, 1, block_size)
-                    bias_tiles.append(self.alibi_slopes * rel)
-                zero_bias = torch.zeros_like(bias_tiles[0])
-                bias_tiles.extend([zero_bias] * (attn_metadata.max_num_blocks - len(bias_tiles)))
-                alibi_stack = convert(torch.stack(bias_tiles), device=_target_device)
-                assert alibi_stack.shape[0] == attn_metadata.max_num_blocks
+                alibi_stack = self._alibi_bias_stack(
+                    attn_metadata,
+                    seq_idx,
+                    active_bs,
+                    kv_len - query_len,
+                    block_size,
+                    _target_device,
+                )
 
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(
@@ -2065,7 +2176,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
             row_table = attn_metadata.query_row_tables[seq_idx]
 
-            # Run attention on target device
+            # See `_walked_block_count` for why this is not len(active_bs). The two
+            # heights the base owns are checked here, at the launch boundary: both
+            # sides are Python ints outside any traced region, so this installs no
+            # guard, where the same comparison inside the token-major kernel would
+            # pin its symbolic count. The index table is the impl's own shape, so
+            # its coverage is asserted kernel-side instead.
+            num_blocks = _walked_block_count(len(active_bs))
+            assert mask_index_table.shape[0] >= num_blocks, (
+                f"mask index table of height {mask_index_table.shape[0]} for a "
+                f"{num_blocks}-block walk"
+            )
+            assert mask_stack.shape[0] >= num_blocks, (
+                f"mask pool of height {mask_stack.shape[0]} for a {num_blocks}-block walk"
+            )
+
             result = self._run_page_attn(
                 q_staging,
                 row_table,
@@ -2074,7 +2199,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 index_table,
                 mask_index_table,
                 mask_stack,
-                max(2, len(active_bs)),
+                num_blocks,
                 aligned_query_lens[seq_idx],
                 alibi_stack,
                 out_staging if store_out else None,

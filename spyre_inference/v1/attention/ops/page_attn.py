@@ -16,7 +16,7 @@
 
 import torch
 
-from spyre_inference.v1.attention.ops import tile_loop
+from spyre_inference.v1.attention.ops.online_softmax import online_softmax_step
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -29,7 +29,6 @@ def page_attn_kernel(
     mask_index_table,
     mask_stack,
     scale,
-    num_blocks,
     padded_query_len,
     num_heads,
     num_kv_heads,
@@ -38,11 +37,16 @@ def page_attn_kernel(
     alibi_stack=None,
     out=None,
 ):
-    """Online softmax attention over ``num_blocks`` KV pages.
+    """Online softmax attention over the KV pages the index tables name.
 
     Under `dynamic=False` Dynamo specializes on every non-tensor argument, so a Python
     page loop is unrolled per variant. `walk_tiles` holds one block body instead when
     SPYRE_ATTN_FOR_EACH_TILE is set.
+
+    The block count is deliberately not an argument: it is the tables' dim 0, which
+    the caller marks dynamic, and comparing it here against a Python int would
+    install the very guard that makes one trace serve every count. The launch
+    boundary cross-checks the two instead.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
@@ -119,29 +123,7 @@ def page_attn_kernel(
             scores = scores + rest[0].index_select(0, mask_idx)[0]
         scores = scores + mask_tile[0]
 
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
-
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
-        if carry is None:
-            tile_probs = torch.exp(scores - scores_max)
-            return (
-                scores_max,
-                tile_probs.sum(dim=-1, keepdim=True),
-                torch.matmul(tile_probs, v_page_4d),
-            ), None
-
-        tile_max, tile_sum, tile_output = carry
-        new_max = torch.maximum(tile_max, scores_max)
-        if tile_loop.USE_FOR_EACH_TILE:
-            # Read tile_max before the maximum that supersedes it, or the tiled
-            # lowering copies the whole carry every trip.
-            rescale = torch.exp(-torch.relu(scores_max - tile_max))
-        else:
-            rescale = torch.exp(tile_max - new_max)
-        tile_probs = torch.exp(scores - new_max)
-        new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
-        new_output = tile_output * rescale + torch.matmul(tile_probs, v_page_4d)
-        return (new_max, new_sum, new_output), None
+        return online_softmax_step(carry, scores, v_page_4d), None
 
     state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}

@@ -24,6 +24,7 @@ does not have (torch-spyre#4123).
 
 import torch
 
+from spyre_inference.v1.attention.ops.online_softmax import online_softmax_step
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -70,6 +71,15 @@ def page_attn_head_major_decode_kernel(
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
+    # The dispatch walks max(2, active blocks) so the token-major kernel's symbolic count
+    # never takes the value Dynamo specializes; both operands sliced below must cover that,
+    # not just the active count. Both sides are static here, so this is free.
+    assert len(page_index_table) >= num_blocks, (
+        f"page table of height {len(page_index_table)} for a {num_blocks}-block walk"
+    )
+    assert len(mask_stack) >= num_blocks, (
+        f"mask pool of height {len(mask_stack)} for a {num_blocks}-block walk"
+    )
     num_queries_per_kv = num_heads // num_kv_heads
 
     q = query.index_select(0, query_row_index).reshape(num_kv_heads, num_queries_per_kv, head_size)
@@ -94,28 +104,8 @@ def page_attn_head_major_decode_kernel(
         # At one query row the mask is head-independent, so its [1, block_size] tile
         # broadcasts across the folded group axis.
         scores = scores + mask_tile[0]
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
-        if carry is None:
-            probs = torch.exp(scores - scores_max)
-            return (
-                scores_max,
-                probs.sum(dim=-1, keepdim=True),
-                torch.matmul(probs, v_page),
-            ), None
-
-        tile_max, tile_sum, tile_output = carry
-        # Read tile_max before the maximum that supersedes it, or the tiled lowering
-        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
-        rescale = torch.exp(-torch.relu(scores_max - tile_max))
-        new_max = torch.maximum(tile_max, scores_max)
-        probs = torch.exp(scores - new_max)
-        return (
-            new_max,
-            tile_sum * rescale + probs.sum(dim=-1, keepdim=True),
-            tile_output * rescale + torch.matmul(probs, v_page),
-        ), None
+        return online_softmax_step(carry, scores, v_page), None
 
     state_shape = (num_kv_heads, num_queries_per_kv, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}

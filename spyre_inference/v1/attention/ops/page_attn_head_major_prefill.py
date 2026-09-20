@@ -22,6 +22,7 @@ every query row, so this kernel spends it instead: batched GQA over
 
 import torch
 
+from spyre_inference.v1.attention.ops.online_softmax import online_softmax_step
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -51,6 +52,15 @@ def page_attn_head_major_prefill_kernel(
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
     """
+    # The dispatch walks max(2, active blocks) so the token-major kernel's symbolic count
+    # never takes the value Dynamo specializes; both operands sliced below must cover that,
+    # not just the active count. Both sides are static here, so this is free.
+    assert len(page_index_table) >= num_blocks, (
+        f"page table of height {len(page_index_table)} for a {num_blocks}-block walk"
+    )
+    assert len(mask_stack) >= num_blocks, (
+        f"mask pool of height {len(mask_stack)} for a {num_blocks}-block walk"
+    )
     num_queries_per_kv = num_heads // num_kv_heads
 
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
@@ -84,26 +94,8 @@ def page_attn_head_major_prefill_kernel(
             # would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         scores = scores + mask_tile[0]
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
-        if carry is None:
-            tile_probs = torch.exp(scores - scores_max)
-            return (
-                scores_max,
-                tile_probs.sum(dim=-1, keepdim=True),
-                torch.matmul(tile_probs, v_page),
-            ), None
-
-        tile_max, tile_sum, tile_output = carry
-        # Read tile_max before the maximum that supersedes it, or the tiled lowering
-        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
-        rescale = torch.exp(-torch.relu(scores_max - tile_max))
-        new_max = torch.maximum(tile_max, scores_max)
-        tile_probs = torch.exp(scores - new_max)
-        new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
-        new_output = tile_output * rescale + torch.matmul(tile_probs, v_page)
-        return (new_max, new_sum, new_output), None
+        return online_softmax_step(carry, scores, v_page), None
 
     state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}

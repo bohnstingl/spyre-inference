@@ -40,6 +40,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
+    SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _call_kernel,
 )
@@ -275,6 +276,19 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             device=device,
         )
 
+    def dynamic_block_tables(self, index_table, mask_index_table) -> tuple[torch.Tensor, ...]:
+        """None: neither head-major kernel walks a symbolic block count.
+
+        Both kernels slice their tables at a static `num_blocks`, so marking either
+        dynamic would only add a guard.
+        """
+        return ()
+
+    def reuses_trace_across_block_counts(self, builder: SpyreAttentionMetadataBuilder) -> bool:
+        """False: both kernels specialize on the block count, so warmup must
+        record every one the bucketer enumerates."""
+        return False
+
     def _run_batched_decode(
         self,
         query_dev: torch.Tensor,
@@ -309,11 +323,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 out,
             )
 
-    def dynamic_block_tables(self, index_table, mask_index_table) -> tuple[torch.Tensor, ...]:
-        """None: both head-major kernels slice their tables at a static `num_blocks`,
-        so marking either dynamic would only add a guard."""
-        return ()
-
     def _run_page_attn(
         self,
         query: torch.Tensor,
@@ -330,6 +339,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     ) -> torch.Tensor:
         # `mask_index_table` is unused: both kernels slice `mask_stack` at `num_blocks`
         # directly, and walked row i is mask row i there.
+        del mask_index_table
         # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch
         # at trace time — see the base's `_run_page_attn`, which this replaces rather than
         # extends.
