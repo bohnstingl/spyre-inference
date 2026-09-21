@@ -157,7 +157,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None
-        self._kv_rows_dev: torch.Tensor | None = None
+        self._kv_row_pool_device: torch.Tensor | None = None
 
         logger.info_once(
             "Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache, "
@@ -186,7 +186,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
         One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: an int32 view's
         storage offset is still dropped on the way to the device (torch-spyre#3770 is
-        closed, but its fix covers float16 only -- see ``_kv_rows``). That corruption is
+        closed, but its fix covers float16 only -- see ``_kv_row_pool``). That corruption is
         shape-dependent — correct while a row fits one int32 stick, every head past it
         silently wrong — so a short-token test passes while long prefill corrupts.
         """
@@ -211,7 +211,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             self._folded = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._folded
 
-    def _kv_rows(self, num_pages: int, device: torch.device) -> torch.Tensor:
+    def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
 
         A page's rows are ``page * num_kv_heads + kv``, which the kernel cannot compute
@@ -228,12 +228,12 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         Pure cache geometry, so it is built once rather than per step, unlike the index
         tables -- which retires one H2D transfer per active block per sequence per step.
         """
-        if self._kv_rows_dev is None:
+        if self._kv_row_pool_device is None:
             rows = torch.arange(num_pages * self.num_kv_heads, dtype=torch.int32)
-            self._kv_rows_dev = convert(
+            self._kv_row_pool_device = convert(
                 rows.reshape(num_pages, self.num_kv_heads, 1), device=device
             )
-        return self._kv_rows_dev
+        return self._kv_row_pool_device
 
     def _run_batched_decode(
         self,
@@ -316,9 +316,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     out,
                 )
 
+        kv_row_pool = self._kv_row_pool(k_pages.shape[0], query.device)
         # The folded kernel carries num_heads output units; lifting the cap for it
         # measured no difference, so it is left as is.
-        kv_rows = self._kv_rows(k_pages.shape[0], query.device)
         with _capped_cores(self.num_kv_heads * padded_query_len):
             return _call_kernel(
                 "page attention",
@@ -328,7 +328,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 k_folded,
                 v_folded,
                 index_table,
-                kv_rows,
+                kv_row_pool,
                 mask_stack,
                 self.scale,
                 num_blocks,

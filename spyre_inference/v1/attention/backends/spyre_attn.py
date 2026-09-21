@@ -171,7 +171,7 @@ def _build_query_row_tables(
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these.
 #
-# page_attn needs fullgraph because of ``for_each_tile``.
+# Both kernels need fullgraph because of ``for_each_tile``.
 _page_attn_compiled = torch.compile(
     page_attn_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
@@ -878,6 +878,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 query_row_ids[:num_decode_seqs] = query_start_loc[:num_decode_seqs].to(torch.int32)
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_row_ids[:num_decode_seqs].tolist() == list(range(num_decode_seqs))
+                # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
                 rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
 
                 block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
@@ -896,17 +897,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         n_use = min(len(abs_blocks), b_blocks)
                         for b, abs_b in enumerate(abs_blocks[:n_use]):
                             block_ids_padded[b, s] = bt[s, abs_b]
-                # The logical block axis stays dim 0 and the whole table travels as one
-                # offset-0 tensor: both walks take their chunk off dim 0, and neither
-                # reads a nonzero-offset int32 argument (torch-spyre#3770, whose fix
-                # covers float16 only) -- the tiled walk advances the operand itself,
-                # and the plain walk narrows a graph input that starts at offset 0.
-                # One transfer rather than one per chunk, and no per-chunk host copy.
-                chunk_page_ids_cpu = block_ids_padded.contiguous()
+                # Keep the logical block axis intact: both walks narrow this offset-zero
+                # tensor by blocks_per_chunk inside the compiled loop, and the body then
+                # keeps the compact (block-slot, sequence) order. One transfer for the
+                # step rather than one per chunk, and no per-chunk host copy.
+                chunk_page_ids_cpu = block_ids_padded
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
-                # valid positions, block-major so each blocks_per_chunk tile is compact.
-
+                # valid positions. Reshaped to the kernel input shape
+                # [padded_blocks, B_seqs, KV or 1, 1, block_size], block-major so each
+                # blocks_per_chunk tile is compact.
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
                     float("-inf"),
@@ -1600,9 +1600,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> None:
         # Spyre-lowering shapes drive several structural choices here: K/V/q keep
         # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
-        # each chunk block-major to avoid an int32 index relayout; and the result scatter is a
-        # single contiguous copy_ at offset 0, valid because the decode prefix's
-        # query rows are range(num_decode_seqs) (asserted in the builder).
+        # each chunk block-major to avoid an int32 index relayout; and the result
+        # scatter is a single contiguous copy_ at offset 0, valid because the decode
+        # prefix's query rows are range(num_decode_seqs) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
         num_decode_seqs = attn_metadata.num_decode_seqs

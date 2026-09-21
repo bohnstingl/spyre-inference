@@ -239,8 +239,8 @@ layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot
 
 #### LX-resident pages
 
-The head-major per-sequence kernel keeps a gathered page in the LX scratchpad from its
-gather to its last use instead of round-tripping through HBM. Two shape choices get it
+The head-major per-sequence decode kernel keeps a gathered page in the LX scratchpad from
+its gather to its last use instead of round-tripping through HBM. Two shape choices get it
 there. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
 gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query

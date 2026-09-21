@@ -68,8 +68,7 @@ def page_attn_head_major_prefill_kernel(
     )
 
     # Both walks tile tensor axes, so what an unrolled walk read per block arrives
-    # stacked on dim 0. The page gather, score calculation, and online-softmax update
-    # otherwise follow the unrolled loop body directly.
+    # stacked on dim 0.
     operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q)
     dims: tuple[int | None, ...] = (0, None, None, 0, None)
 
@@ -90,7 +89,7 @@ def page_attn_head_major_prefill_kernel(
         scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=1
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
         if carry is None:
             tile_probs = torch.exp(scores - scores_max)
             return (
@@ -100,6 +99,8 @@ def page_attn_head_major_prefill_kernel(
             ), None
 
         tile_max, tile_sum, tile_output = carry
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
         rescale = torch.exp(-torch.relu(scores_max - tile_max))
         new_max = torch.maximum(tile_max, scores_max)
         tile_probs = torch.exp(scores - new_max)

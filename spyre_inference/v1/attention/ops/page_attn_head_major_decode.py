@@ -117,9 +117,8 @@ def page_attn_head_major_decode_kernel(
             ), None
 
         tile_max, tile_sum, tile_output = carry
-        # Read tile_max *before* the maximum that supersedes it, or the tiled lowering
-        # copies the whole carry every trip; see `page_attn_kernel` for the full why.
-        # Identical to exp(tile_max - new_max), since m - max(m, s) == -relu(s - m).
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
         rescale = torch.exp(-torch.relu(scores_max - tile_max))
         new_max = torch.maximum(tile_max, scores_max)
         probs = torch.exp(scores - new_max)

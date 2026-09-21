@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""K/V page LX residency of the head-major per-sequence attention kernel.
+"""K/V page LX residency of the head-major per-sequence decode kernel.
 
 Runs the kernel over a head-major paged KV cache, checks it against SDPA over the same
 pages, then reports the layout planner's residency verdict for every op in the gathered
@@ -138,14 +138,14 @@ for i in range(NUM_BLOCKS):
 
 page_table = torch.zeros(NUM_BLOCKS, INT32_ELEMS_PER_STICK, dtype=torch.int32)
 page_table[:, 0] = pages_used
-kv_rows = torch.arange(NUM_PAGES * KV, dtype=torch.int32).reshape(NUM_PAGES, KV, 1)
+kv_row_pool = torch.arange(NUM_PAGES * KV, dtype=torch.int32).reshape(NUM_PAGES, KV, 1)
 args = (
     query.to("spyre"),
     row_index.to("spyre"),
     k_dev.view(NUM_PAGES * KV, B, D),
     v_dev.view(NUM_PAGES * KV, B, D),
     page_table.to("spyre"),
-    kv_rows.to("spyre"),
+    kv_row_pool.to("spyre"),
     torch.stack(masks).to("spyre"),
     SCALE,
     NUM_BLOCKS,
@@ -180,17 +180,17 @@ check("attention vs SDPA", got, want, 2e-2)
 text = PLANNER_LOG.read_text(errors="replace") if PLANNER_LOG.is_file() else ""
 verdicts = re.findall(r"lx_pinning: (\S+) \(([^)]+)\) . ([^\n]+)", text)
 
-# The K/V page gathers are 2 per block; the rest is the query-row gather, tiny and not
-# what this probe is about.
+# The K/V page gathers are 2 per block; the rest gather the query row and, per block, the
+# page's kv rows, tiny and not what this probe is about.
 gathers = [(op, kind, why.strip()) for op, kind, why in verdicts if kind == "index"]
 pinned = [op for op, _, why in gathers if why == "lx"]
-# With the tiled walk gated on the graph holds one block body, so residency has to hold
-# for 2 gathers rather than 2 per block.
+# The kernel walks the pages with `for_each_tile` when it is gated on, and the graph then
+# holds one block body, so residency has to hold for 2 gathers rather than 2 per block.
 page_gathers = 2 if USE_FOR_EACH_TILE else 2 * NUM_BLOCKS
-query_gathers = 1
+other_gathers = 1 + (1 if USE_FOR_EACH_TILE else NUM_BLOCKS)
 print(f"\ngathers: {len(gathers)} ops, {len(pinned)} pinned LX")
 print(f"  K/V page gathers expected: {page_gathers} (K and V per block)")
-print(f"  query-side gathers expected: {query_gathers} (not page residency)")
+print(f"  other gathers expected: {other_gathers} (query row, kv rows; not page residency)")
 refused = Counter(why for _, _, why in gathers if why != "lx")
 for why, n in refused.most_common():
     print(f"  refused x{n}: {why}")

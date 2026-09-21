@@ -867,7 +867,7 @@ def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile)
     # The base's page table: stick-wide rows, page id in column 0.
     page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
     page_table[:, 0] = torch.arange(blocks, dtype=torch.int32)
-    kv_rows = torch.arange(blocks * kv, dtype=torch.int32).reshape(blocks, kv, 1)
+    kv_row_pool = torch.arange(blocks * kv, dtype=torch.int32).reshape(blocks, kv, 1)
     # Causal: query row q sits at absolute position kv_len - query_len + q.
     q_abs = kv_len - query_len + torch.arange(query_len).unsqueeze(1)
     pos = torch.arange(blocks * block).reshape(blocks, 1, block)
@@ -881,7 +881,7 @@ def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile)
             k,
             v,
             page_table,
-            kv_rows,
+            kv_row_pool,
             masks,
             d**-0.5,
             blocks,

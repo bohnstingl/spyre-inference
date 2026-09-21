@@ -45,12 +45,13 @@ def batched_decode_kernel(
 
     k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
     chunk_page_ids: [padded_blocks, num_seqs] int32, row b holding each sequence's
-    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1,
-    block_size]; both walks tile blocks_per_chunk-wide chunks off those logical
-    block axes, and the trailing extent-1 axes broadcast over the query groups in
-    the mask add. rep_row_ids: [entries] int32, all query rows repeated as one
-    block-major group per block slot. ``out`` None returns the result instead of
-    storing it.
+    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1, block_size]
+    -- the query-group axis broadcasts here rather than being transferred
+    num_queries_per_kv times, and the KV axis broadcasts too on the plain walk, which
+    unlike the tiled one can carry a broadcast window through a trip. Both walks form
+    blocks_per_chunk-wide chunks from those logical block axes. rep_row_ids: [entries]
+    int32, all query rows repeated as one block-major group per block slot. ``out``
+    None returns the result instead of storing it.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -62,10 +63,26 @@ def batched_decode_kernel(
         head_size,
     )
 
+    def reduce_chunk(probs, v_page):
+        """Sum the chunk's blocks; its slots share one max, so this needs no rescale."""
+        chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
+        chunk_out = torch.sum(
+            torch.matmul(
+                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                v_page,
+            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            dim=0,
+            keepdim=True,
+        )
+        return chunk_sum, chunk_out
+
     def chunk_body(carry, tiles):
         page_ids, mask_rows, k_pages, v_pages, q = tiles
-        # Keep the real [block-slot, sequence] tile through the indirect read.
-        # Flattening it first forces an unsupported int32 staging layout.
+        # Advanced indexing on the [block-slot, sequence] tile, not index_select on a
+        # 1-D one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
+        # so a narrow gather gets one core. It costs the eager path, which
+        # _batched_decode_preconditions_met gives up. Flattening the tile first also
+        # forces an unsupported int32 staging layout.
         # Token-major cache page to head-major; a view, so do not add
         # .contiguous() -- merging these axes is what materializes the page.
         k_page = (
@@ -89,37 +106,29 @@ def batched_decode_kernel(
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        # Restore the tile coordinates before adding the mask. Keeping the mask
-        # in [K, B, KV, S] avoids flattening its advancing read window.
+        # Leading-axis split only: merging a permuted axis pair is what torch-spyre
+        # rejects. Restoring the tile coordinates before the mask add also keeps the
+        # mask's advancing read window unflattened.
         sc = scores.reshape(
             blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
         )
         sc = sc + mask_rows
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=1
+        # The running max drives exp(), not the chunk's own: a chunk wholly past
+        # a sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
+        # Every row has a valid block 0, so the chunk-0 max is finite.
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
         if carry is None:
-            new_max = chunk_max
-        else:
-            tile_max, tile_sum, tile_output = carry
-            rescale = torch.exp(-torch.relu(chunk_max - tile_max))
-            new_max = torch.maximum(tile_max, chunk_max)
-        probs = torch.exp(sc - new_max)
-        # The chunk's slots share one max, so summing them needs no rescale.
-        chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
-        chunk_out = torch.sum(
-            torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
-                v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
-            dim=0,
-            keepdim=True,
-        )
+            chunk_sum, chunk_out = reduce_chunk(torch.exp(sc - chunk_max), v_page)
+            return (chunk_max, chunk_sum, chunk_out), None
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=1
-        if carry is None:
-            return (new_max, chunk_sum, chunk_out), None
-
+        tile_max, tile_sum, tile_output = carry
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
+        rescale = torch.exp(-torch.relu(chunk_max - tile_max))
+        new_max = torch.maximum(tile_max, chunk_max)
+        chunk_sum, chunk_out = reduce_chunk(torch.exp(sc - new_max), v_page)
         return (
             new_max,
             tile_sum * rescale + chunk_sum,

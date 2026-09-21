@@ -65,11 +65,24 @@ def batched_decode_head_major_kernel(
         head_size,
     )
 
+    def reduce_chunk(probs, v_page):
+        """Sum the chunk's blocks; its slots share one max, so this needs no rescale."""
+        chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
+        chunk_out = torch.sum(
+            torch.matmul(
+                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                v_page,
+            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
+            dim=0,
+            keepdim=True,
+        )
+        return chunk_sum, chunk_out
+
     def chunk_body(carry, tiles):
         page_ids, mask_rows, k_pages, v_pages, q = tiles
-        # Preserve the real [block-slot, sequence] tile through the indirect
-        # page read; flattening the int32 tile first requires an unsupported
-        # staging layout.
+        # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
+        # whole 32-entry sticks. Costs the eager path, which the preconditions decline.
+        # Flattening the int32 tile first also requires an unsupported staging layout.
         k_page = k_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
         v_page = v_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
         scores = (
@@ -83,37 +96,27 @@ def batched_decode_head_major_kernel(
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        # Back to tile coordinates for the mask add, which keeps the split on the leading
-        # axis: torch-spyre rejects merging a permuted axis pair, and a flattened mask
-        # would lose its advancing read window.
+        # Leading-axis split only: torch-spyre rejects merging a permuted axis pair, and
+        # a flattened mask would lose its advancing read window.
         sc = scores.reshape(
             blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
         )
         sc = sc + mask_rows
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=0, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=1
+        # The running max drives exp(), not the chunk's own: a chunk wholly past a
+        # sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
         if carry is None:
-            new_max = chunk_max
-        else:
-            tile_max, tile_sum, tile_output = carry
-            rescale = torch.exp(-torch.relu(chunk_max - tile_max))
-            new_max = torch.maximum(tile_max, chunk_max)
-        probs = torch.exp(sc - new_max)
-        # The chunk's slots share one max, so summing them needs no rescale.
-        chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=0, keepdim=True)
-        chunk_out = torch.sum(
-            torch.matmul(
-                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
-                v_page,
-            ).reshape(blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, head_size),
-            dim=0,
-            keepdim=True,
-        )
+            chunk_sum, chunk_out = reduce_chunk(torch.exp(sc - chunk_max), v_page)
+            return (chunk_max, chunk_sum, chunk_out), None
 
-        if carry is None:
-            return (new_max, chunk_sum, chunk_out), None
-
+        tile_max, tile_sum, tile_output = carry
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
+        rescale = torch.exp(-torch.relu(chunk_max - tile_max))
+        new_max = torch.maximum(tile_max, chunk_max)
+        chunk_sum, chunk_out = reduce_chunk(torch.exp(sc - new_max), v_page)
         return (
             new_max,
             tile_sum * rescale + chunk_sum,

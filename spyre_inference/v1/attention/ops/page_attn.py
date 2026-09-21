@@ -57,7 +57,7 @@ def page_attn_kernel(
             take the block axis from a tensor instead of a Python list.
         alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
-            per-query-row constants; see the derivation at the bias-tile
+            per-query-row constants — see the derivation at the bias-tile
             construction site in _online_softmax_attention.
         out: buffer to store into, or None to return the result instead.
 
@@ -76,9 +76,7 @@ def page_attn_kernel(
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
 
-    # Both walks tile tensor axes, so every per-block operand arrives stacked on
-    # dim 0. The table, page gather, score calculation, and online-softmax update
-    # otherwise follow the baseline loop body directly.
+    # Both walks tile tensor axes, so every per-block operand arrives stacked on dim 0.
     operands = [
         page_index_table[:num_blocks],
         k_pages,
@@ -98,8 +96,11 @@ def page_attn_kernel(
             page_index, k_pages, v_pages, mask_tile, q = tiles
 
         page_idx = page_index[0, 0:1]
+        # index_select, not `k_pages[page_idx]`: subscripting lowers to
+        # aten.index, which upcasts the int32 index to int64 and fails eager.
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
+        # Token-major page to head-major for the matmuls; permutes on device.
         k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
         v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
@@ -118,7 +119,7 @@ def page_attn_kernel(
 
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=1
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
         if carry is None:
             tile_probs = torch.exp(scores - scores_max)
             return (
@@ -128,6 +129,8 @@ def page_attn_kernel(
             ), None
 
         tile_max, tile_sum, tile_output = carry
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
         rescale = torch.exp(-torch.relu(scores_max - tile_max))
         new_max = torch.maximum(tile_max, scores_max)
         tile_probs = torch.exp(scores - new_max)
