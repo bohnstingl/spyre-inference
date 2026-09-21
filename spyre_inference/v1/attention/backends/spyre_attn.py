@@ -1231,14 +1231,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         _target_device = k_pages.device
 
-        if attn_metadata.attention_mask_stacks_device is None:
-            stacks_cpu = attn_metadata.attention_mask_stacks
-            assert stacks_cpu is not None, (
-                "attention_mask_stacks must be precomputed by the metadata builder"
-            )
-            attn_metadata.attention_mask_stacks_device = _mirror_mask_stacks(
-                stacks_cpu, _target_device
-            )
+        # The mask stacks are mirrored lazily, by the only code that reads them: when
+        # the batched kernel covers every decode sequence the per-sequence loop never
+        # runs, and transferring for it would be pure waste.
 
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
         # and upstream's own unified_kv_cache_update op covers the rest.
@@ -1748,16 +1743,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        mask_stacks_all = attn_metadata.attention_mask_stacks_device
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
         index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
-        assert mask_stacks_all is not None, (
-            "attention_mask_stacks_device must be mirrored by forward()"
-        )
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
@@ -1766,6 +1757,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if num_decode_seqs == num_seqs:
                 return output
             batched_done = True
+
+        # Past the early return, so a step the batched kernel fully served pays nothing.
+        # Still once per step: the first layer to get here fills the cache for the rest.
+        mask_stacks_all = attn_metadata.attention_mask_stacks_device
+        if mask_stacks_all is None:
+            stacks_cpu = attn_metadata.attention_mask_stacks
+            assert stacks_cpu is not None, (
+                "attention_mask_stacks must be precomputed by the metadata builder"
+            )
+            mask_stacks_all = _mirror_mask_stacks(stacks_cpu, _target_device)
+            attn_metadata.attention_mask_stacks_device = mask_stacks_all
 
         # Mirrors the batch layout row for row, so the absolute query_start_loc
         # offsets in the row tables still apply.
