@@ -123,8 +123,12 @@ class SpyrePagedKVCache(NamedTuple):
 
 
 def _mirror_mask_stacks(stacks_cpu: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
-    # A window can leave a sequence with no active block, and a zero-row transfer has
-    # no layout; forward() writes zeros for it without reading the stack.
+    """Mirror each sequence's mask stack onto the device, one transfer per sequence.
+
+    The `numel()` guard leaves empty stacks on the host: a sliding window can leave a
+    sequence with no active block at all, and `_online_softmax_attention` writes zeros
+    for such a sequence before it reads any stack, so the transfer would be pure waste.
+    """
     return [convert(stack, device=device) if stack.numel() else stack for stack in stacks_cpu]
 
 
@@ -240,10 +244,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Number of query heads.
     num_heads: int = 0
 
-    # Pre-tiled additive attention mask, one CPU tensor per sequence, shaped
-    # [num_active, aligned_query_lens[seq_idx], block_size]. Row i is the i-th ACTIVE
-    # block -- a position within active_block_indices[seq_idx], not an absolute block
-    # index, though the two coincide when sliding_window is None.
+    # Additive attention mask, one CPU tensor per sequence: that sequence's per-block
+    # mask *tiles* stacked along dim 0, shaped
+    # [num_active, aligned_query_lens[seq_idx], block_size]. Row i is the tile for the
+    # i-th ACTIVE block -- a position within active_block_indices[seq_idx], not an
+    # absolute block index, though the two coincide when sliding_window is None.
+    # The stack is the unit of transfer (one H2D per sequence); the tile is what a
+    # kernel adds to one block's scores, sliced back out in-graph as `mask_stack[i]`.
     attention_mask_stacks: list[torch.Tensor] | None = None
 
     # For each sequence: absolute block indices whose mask is not fully

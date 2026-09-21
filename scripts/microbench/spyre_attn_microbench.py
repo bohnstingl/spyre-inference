@@ -627,6 +627,8 @@ def unreachable_reason(query_lens) -> str:
 
 def record_padding(row, attn_metadata, query_lens, seq_lens, block_size):
     """Record the shape the kernel got, and flag it when that is not the one asked for."""
+    # A mask stack holds one [aligned_query_len, block_size] mask tile per active block,
+    # so shape[0] is the number of blocks the kernel iterated for that sequence.
     realized_blocks = [int(m.shape[0]) for m in attn_metadata.attention_mask_stacks]
     realized_query = list(attn_metadata.aligned_query_lens)
     row["num_kv_blocks_iterated"] = max(realized_blocks)

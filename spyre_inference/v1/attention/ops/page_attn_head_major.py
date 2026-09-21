@@ -55,9 +55,9 @@ def page_attn_head_major_kernel(
         k_pages / v_pages: [num_pages_total * num_kv_heads, block_size, head_size]
         kv_index_tables: per active block, a [num_kv_heads, 1] int32 device tensor of that
             block's ``page * num_kv_heads + kv`` rows. One real tensor per block, not a
-            slice of a table: an int32 argument's nonzero storage offset is dropped
-            (torch-spyre#3770), and an in-graph slice of a stacked one silently gathers the
-            wrong rows at this shape.
+            slice of a table: an int32 argument's nonzero storage offset is still read as 0
+            (torch-spyre#3770 is closed, but its fix covers float16 only), and an in-graph
+            slice of a stacked one silently gathers the wrong rows at this shape.
         head_index_tables: per query group, a [num_kv_heads] int32 device tensor of that
             group's head ids (``kv * num_queries_per_kv + g``).
         mask_stack: [num_blocks, padded_query_len, block_size], sliced per block in-graph.
@@ -67,8 +67,9 @@ def page_attn_head_major_kernel(
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
-    # Gathered, not sliced outside: a view's storage_offset is a Dynamo graph guard
-    # (torch-spyre#4449) and q_start varies, so a slice compiles one kernel per batch layout.
+    # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
+    # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
+    # layout -- test_spyre_compile_input_offset_specialises_the_graph.
     q_rows = query.index_select(0, query_row_index[:padded_query_len])
     # Rows before heads: selecting heads first keeps every staging row, so each group
     # would build a full-height intermediate and gather one row back out of it.

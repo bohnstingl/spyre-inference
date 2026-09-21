@@ -166,8 +166,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """Head h of the token at ``block * block_size + offset`` lives at row
         ``(block * num_kv_heads + h) * block_size + offset``.
 
-        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: a view's storage
-        offset is dropped on the way to the device (torch-spyre#3770). That corruption is
+        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: an int32 view's
+        storage offset is still dropped on the way to the device (torch-spyre#3770 is
+        closed, but its fix covers float16 only -- see build_index_tables). That corruption is
         shape-dependent — correct while a row fits one int32 stick, every head past it
         silently wrong — so a short-token test passes while long prefill corrupts.
         """
@@ -201,9 +202,12 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         paired with the page ids alone for the wide-query kernel.
 
         The folded rows are one [KV, 1] tensor per block, not rows of one table: an int32
-        argument's nonzero storage offset is dropped (torch-spyre#3770), so every block
-        would gather block 0, and an in-graph slice of a stacked table is silently wrong at
-        this shape -- test_spyre_in_graph_slice_of_stacked_kv_row_index.
+        argument's nonzero storage offset is still read as 0, so every block would gather
+        block 0, and an in-graph slice of a stacked table still gathers the wrong rows at
+        this shape. torch-spyre#3770 is closed, but the fix (torch-spyre#4449) landed for
+        float16 only; strict xfails pin both int32 cases on the pinned stack --
+        test_spyre_compile_input_honors_storage_offset (its int32 parametrization) and
+        test_spyre_in_graph_slice_of_stacked_kv_row_index.
         """
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"

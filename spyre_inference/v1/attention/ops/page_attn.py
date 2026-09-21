@@ -59,8 +59,9 @@ def page_attn_kernel(
     kernel stored the result itself.
     """
     num_queries_per_kv = num_heads // num_kv_heads
-    # Gathered, not sliced outside: a view's storage_offset is a Dynamo graph guard
-    # (torch-spyre#4449) and q_start varies, so a slice compiles one kernel per batch layout.
+    # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
+    # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
+    # layout -- test_spyre_compile_input_offset_specialises_the_graph.
     q_rows = query.index_select(0, query_row_index[:padded_query_len])
     q = (
         q_rows.unsqueeze(0)
