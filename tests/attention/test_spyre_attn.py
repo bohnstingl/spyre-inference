@@ -1332,6 +1332,7 @@ def test_mirror_mask_stacks_one_transfer_per_sequence(default_vllm_config, monke
     assert torch.equal(stacks_device[0], stacks_cpu[0])
 
 
+
 # ---------------------------------------------------------------------------
 # KV write-back (reshape_and_cache scatter)
 # ---------------------------------------------------------------------------
@@ -1692,9 +1693,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
         block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
         for c in range(num_chunks)
     ]
-    mask_by_chunk = torch.zeros(
-        num_chunks, entries * num_kv_heads, 1, block_size, dtype=torch.float32
-    )
+    mask_by_chunk = torch.zeros(num_chunks, entries, 1, block_size, dtype=torch.float32)
 
     def run(cap: float):
         return batched_decode_kernel(
@@ -1845,12 +1844,11 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     assert md.blocks_per_chunk is not None, "batched decode declined this batch"
     assert md.mask_by_chunk_cpu is not None
     entries = md.padded_num_seqs * md.blocks_per_chunk
-    assert md.mask_by_chunk_cpu.shape[1] == entries * num_kv_heads, (
-        f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; the kernel reshapes it to "
-        f"{entries} x {num_kv_heads}"
+    assert md.mask_by_chunk_cpu.shape[1] == entries, (
+        f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; expected one row per sequence/block entry"
     )
-    # The shape the kernel actually asks for.
-    md.mask_by_chunk_cpu[0].reshape(entries, num_kv_heads, 1, block_size)
+    # Both token- and head-major kernels broadcast this over KV heads.
+    md.mask_by_chunk_cpu[0].reshape(num_seqs, md.blocks_per_chunk, 1, 1, block_size)
 
 
 def _decode_reference_fp32(
@@ -1955,9 +1953,7 @@ def test_batched_decode_matches_fp32_reference(
     mask_by_chunk = (
         mask.reshape(b_seqs, num_chunks, bpc, block_size)
         .permute(1, 0, 2, 3)
-        .unsqueeze(3)
-        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
-        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .reshape(num_chunks, entries, 1, block_size)
         .contiguous()
     )
 

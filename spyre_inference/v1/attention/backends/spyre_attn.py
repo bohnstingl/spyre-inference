@@ -297,7 +297,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     chunk_page_ids_cpu: list[torch.Tensor] | None = None  # num_chunks x [entries, 1] int32
     # Built by build_chunk_index_tables, so the shape is the kernel's (as above).
     chunk_page_ids_dev: list[torch.Tensor] | None = None
-    mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
+    mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
 
     # Encoder scatter dest ``[T]`` (int32 on Spyre) and gather unpack.
@@ -881,8 +881,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 ]
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
-                # valid positions. Broadcast to KV heads and reshape to the
-                # kernel input shape [num_chunks, entries * KV, 1, block_size].
+                # valid positions. The kernel broadcasts the mask to KV heads.
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
                     float("-inf"),
@@ -902,9 +901,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 mask_by_chunk_cpu = (
                     mask_bs_bb.reshape(b_seqs, num_chunks, blocks_per_chunk, block_size)
                     .permute(1, 0, 2, 3)
-                    .unsqueeze(3)
-                    .expand(num_chunks, b_seqs, blocks_per_chunk, self.num_kv_heads, block_size)
-                    .reshape(num_chunks, entries * self.num_kv_heads, 1, block_size)
+                    .reshape(num_chunks, entries, 1, block_size)
                     .contiguous()
                 )
 
