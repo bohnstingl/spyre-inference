@@ -17,9 +17,13 @@
 from __future__ import annotations
 
 import gc
+import os
 
 import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
+from spyre_testing_plugin.vfio_reaper import wait_until_card_free
+
+from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 
 
 @pytest.mark.uses_subprocess
@@ -47,29 +51,37 @@ def test_tp2_llm_construction() -> None:
 
 
 def _generate(
+    model: str,
     tp: int,
     enforce_eager: bool,
     compilation_config: dict | None = None,
+    hf_overrides=None,
 ) -> list[list[int]]:
     from vllm import LLM, SamplingParams
 
     llm = LLM(
-        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        model=model,
         tensor_parallel_size=tp,
         dtype="float16",
         enforce_eager=enforce_eager,
         max_model_len=128,
         max_num_seqs=2,
         **({"compilation_config": compilation_config} if compilation_config is not None else {}),
+        **({"hf_overrides": hf_overrides} if hf_overrides is not None else {}),
     )
-    outs = llm.generate(
-        ["Hello, world!", "The capital of France is"],
-        SamplingParams(max_tokens=8, temperature=0.0),
-    )
-    result = [list(o.outputs[0].token_ids) for o in outs]
-    # vllm has no explicit LLM.shutdown(); rely on GC + child-process reaping.
-    del llm
-    gc.collect()
+    try:
+        outs = llm.generate(
+            ["Hello, world!", "The capital of France is"],
+            SamplingParams(max_tokens=8, temperature=0.0),
+        )
+        result = [list(o.outputs[0].token_ids) for o in outs]
+    finally:
+        llm.llm_engine.engine_core.shutdown(timeout=60)
+        del llm
+        gc.collect()
+        freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
+    # Outside the finally, where a generate failure would mask this check's own.
+    assert freed, "Spyre devices were not released after LLM shutdown"
     return result
 
 
@@ -101,7 +113,11 @@ def _assert_matches_tp1(tp1: list[list[int]], tp2: list[list[int]]) -> None:
 )
 def test_tp2_llm_generate_matches_tp1() -> None:
     """TP=1 vs TP=2 greedy-decode prefix match, eager."""
-    _assert_matches_tp1(_generate(tp=1, enforce_eager=True), _generate(tp=2, enforce_eager=True))
+    model = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
+    _assert_matches_tp1(
+        _generate(model, tp=1, enforce_eager=True),
+        _generate(model, tp=2, enforce_eager=True),
+    )
 
 
 @pytest.mark.uses_subprocess
@@ -110,7 +126,18 @@ def test_tp2_llm_generate_matches_tp1() -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
-def test_tp2_compiled_llm_generate_matches_tp1() -> None:
+@pytest.mark.parametrize(
+    "model,hf_overrides",
+    [
+        ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", None),
+        # gemma-4 vision checkpoints resolve the multimodal architecture, so this row
+        # pins the text-only backbone -- the decoder is what TP splits anyway, and the
+        # tower's weights and warmup would be paid for nothing.
+        ("google/gemma-4-26B-A4B", GEMMA4_TEXT_BACKBONE_OVERRIDE),
+    ],
+    ids=["micro-g3.3", "gemma-4-26B-A4B-text"],
+)
+def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides) -> None:
     """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.
 
     compile_sizes is pinned to the reachable token counts: 1 (one sequence
@@ -118,6 +145,10 @@ def test_tp2_compiled_llm_generate_matches_tp1() -> None:
     """
     _cc = {"compile_sizes": [1, 2, 16]}
     _assert_matches_tp1(
-        _generate(tp=1, enforce_eager=False, compilation_config=_cc),
-        _generate(tp=2, enforce_eager=False, compilation_config=_cc),
+        _generate(
+            model, tp=1, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
+        ),
+        _generate(
+            model, tp=2, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
+        ),
     )

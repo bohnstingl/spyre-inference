@@ -59,7 +59,12 @@ def test_wrapper_converts_ints_to_int64(monkeypatch):
         def forward(self, input_ids=None, positions=None, **kwargs):
             return {"input_ids": input_ids, "positions": positions}
 
-    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("cpu"), keep_outputs_on_device=True)
+    wrapper = mr._SpyreModelWrapper(
+        _Capture(),
+        torch.device("cpu"),
+        keep_outputs_on_device=True,
+        model_dtype=torch.float16,
+    )
     out = wrapper(
         input_ids=torch.tensor([1, 2], dtype=torch.int32),
         positions=torch.tensor([0, 1], dtype=torch.int32),
@@ -83,7 +88,9 @@ def test_wrapper_recursively_converts_integer_inputs(monkeypatch):
         def forward(self, nested):
             return nested
 
-    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("cpu"), keep_outputs_on_device=True)
+    wrapper = mr._SpyreModelWrapper(
+        _Capture(), torch.device("cpu"), keep_outputs_on_device=True, model_dtype=torch.float16
+    )
     out = wrapper(nested={"positions": [torch.tensor([1], dtype=torch.int32)]})
 
     assert seen == [torch.int64]
@@ -104,7 +111,48 @@ def test_wrapper_recursively_converts_outputs_to_cpu(monkeypatch):
         def forward(self, input_ids):
             return {"nested": [input_ids]}
 
-    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("spyre"))
+    wrapper = mr._SpyreModelWrapper(
+        _Capture(), torch.device("spyre"), model_dtype=torch.float16
+    )
     wrapper(input_ids=torch.tensor([1], dtype=torch.int64))
 
     assert seen == [torch.device("spyre"), "cpu"]
+
+
+def test_wrapper_casts_multimodal_floats_to_the_model_dtype(monkeypatch):
+    """A bfloat16 checkpoint's pixel values must not be narrowed to float16 going in."""
+    seen: list[torch.dtype | None] = []
+
+    def fake_convert(t, device=None, dtype=None):
+        seen.append(dtype)
+        return t if dtype is None else t.to(dtype)
+
+    monkeypatch.setattr(mr, "convert", fake_convert)
+
+    class _Vision(nn.Module):
+        def embed_multimodal(self, pixel_values=None, **kwargs):
+            return pixel_values
+
+    wrapper = mr._SpyreModelWrapper(_Vision(), torch.device("cpu"), model_dtype=torch.bfloat16)
+    out = wrapper.embed_multimodal(pixel_values=torch.zeros(2, 3, dtype=torch.float32))
+
+    assert seen == [torch.bfloat16]
+    assert out.dtype == torch.bfloat16
+
+
+def test_setattr_keeps_the_wrappers_own_state_off_the_model():
+    """``__setattr__`` forwards to the wrapped model, so a write to one of the wrapper's
+    own fields (``_model_dtype``) would land on the wrong object."""
+
+    class _Plain(nn.Module):
+        pass
+
+    model = _Plain()
+    wrapper = mr._SpyreModelWrapper(model, torch.device("cpu"), model_dtype=torch.float16)
+
+    wrapper._model_dtype = torch.bfloat16
+    assert wrapper._model_dtype == torch.bfloat16
+    assert not hasattr(model, "_model_dtype")
+
+    wrapper.some_model_flag = 7
+    assert model.some_model_flag == 7
