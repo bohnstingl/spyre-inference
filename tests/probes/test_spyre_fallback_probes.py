@@ -873,8 +873,7 @@ def test_spyre_for_each_tile_consumes_transferred_mask_stack(spyre_device, dtype
         return total
 
     expected = sum(
-        torch.exp(host_view[b]).sum(dim=-1).expand(kv_heads, qpk, query_len)
-        for b in range(blocks)
+        torch.exp(host_view[b]).sum(dim=-1).expand(kv_heads, qpk, query_len) for b in range(blocks)
     )
     torch.testing.assert_close(fn(stack).cpu(), expected, atol=0.02, rtol=0.02)
 

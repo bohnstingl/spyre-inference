@@ -288,13 +288,14 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         assert row_table.shape == (padded_query_len,), (
             f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
         )
-        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
-        kv_row_table, page_table = index_table
-        assert len(kv_row_table) == num_blocks
+        # Both kernels tile `index_table` on dim 0, so a short table is a trip-count
+        # mismatch rather than a shape error.
+        assert index_table.shape[0] == num_blocks, (
+            f"index table has {index_table.shape[0]} rows for {num_blocks} blocks"
+        )
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
-            assert page_table is not None and page_table.shape[0] == num_blocks
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
@@ -316,6 +317,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     out,
                 )
 
+        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
         kv_row_pool = self._kv_row_pool(k_pages.shape[0], query.device)
         # The folded kernel carries num_heads output units; lifting the cap for it
         # measured no difference, so it is left as is.

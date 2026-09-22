@@ -1324,8 +1324,7 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
     # Equivalent to a mixed batch reading only its per-sequence suffix. A later
     # layer taking the same path reuses both mirrors.
     suffix = {
-        seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu"))
-        for seq_idx in (2, 3)
+        seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (2, 3)
     }
     assert calls == [stacks_cpu[2], stacks_cpu[3]]
     assert sum(t.numel() * t.element_size() for t in calls) == sum(
@@ -1337,8 +1336,7 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
 
     # A later layer that cannot use batched decode fills only the missing prefix.
     prefix = {
-        seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu"))
-        for seq_idx in (0, 1)
+        seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (0, 1)
     }
     assert calls == [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]]
     assert metadata.attention_mask_stacks_device is not None
