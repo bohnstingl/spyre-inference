@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -111,9 +112,7 @@ def test_wrapper_recursively_converts_outputs_to_cpu(monkeypatch):
         def forward(self, input_ids):
             return {"nested": [input_ids]}
 
-    wrapper = mr._SpyreModelWrapper(
-        _Capture(), torch.device("spyre"), model_dtype=torch.float16
-    )
+    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("spyre"), model_dtype=torch.float16)
     wrapper(input_ids=torch.tensor([1], dtype=torch.int64))
 
     assert seen == [torch.device("spyre"), "cpu"]
@@ -138,6 +137,36 @@ def test_wrapper_casts_multimodal_floats_to_the_model_dtype(monkeypatch):
 
     assert seen == [torch.bfloat16]
     assert out.dtype == torch.bfloat16
+
+
+def test_wrapper_rejects_oov_multimodal_tokens_before_device_transfer(monkeypatch):
+    """OOV placeholders need a Spyre-unsupported masked_fill before text embedding."""
+
+    def fail_convert(*args, **kwargs):
+        raise AssertionError("OOV multimodal tokens must fail before device transfer")
+
+    monkeypatch.setattr(mr, "convert", fail_convert)
+
+    class _Vision(nn.Module):
+        _has_oov_mm_tokens = True
+
+    wrapper = mr._SpyreModelWrapper(_Vision(), torch.device("spyre"), model_dtype=torch.float16)
+
+    with pytest.raises(NotImplementedError, match="out-of-vocabulary multimodal tokens"):
+        wrapper.embed_input_ids(
+            torch.tensor([32000]),
+            multimodal_embeddings=[torch.zeros(1, 4)],
+            is_multimodal=torch.tensor([True]),
+        )
+
+
+def test_wrapper_requires_a_mask_for_multimodal_embeddings():
+    """A multimodal embedding list without its placement mask cannot be merged."""
+
+    wrapper = mr._SpyreModelWrapper(nn.Module(), torch.device("spyre"), model_dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="without is_multimodal"):
+        wrapper.embed_input_ids(torch.tensor([1]), multimodal_embeddings=[torch.zeros(1, 4)])
 
 
 def test_setattr_keeps_the_wrappers_own_state_off_the_model():

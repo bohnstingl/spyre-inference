@@ -103,7 +103,7 @@ def _convert_op_fake(
     return torch.empty(tensor.shape, dtype=target_dtype, device=target_device)
 
 
-def convert(tensor, device=None, dtype=None, row_major=False, device_layout=None):
+def convert(tensor, device=None, dtype=None, device_layout=None, *, row_major=False):
     """Convert tensor device and/or dtype. No-op when both are None.
 
     Normal transfers route through the opaque custom op
@@ -117,9 +117,9 @@ def convert(tensor, device=None, dtype=None, row_major=False, device_layout=None
         tensor: Input tensor, or None (passed through as None).
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
+        device_layout: Optional physical Spyre tensor layout to place the result in.
         row_major: Place dim 0 outermost on device (see `_row_outermost_layout`).
             Ignored if the tensor is already on the target device with this dtype.
-        device_layout: Optional physical Spyre tensor layout to place the result in.
 
     Returns:
         Converted tensor, or None if input is None.

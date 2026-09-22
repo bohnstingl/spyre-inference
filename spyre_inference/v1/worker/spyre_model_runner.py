@@ -486,6 +486,16 @@ class _SpyreModelWrapper:
         decode step and every text-only prompt served by a multimodal model.
         """
         has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        if has_mm and is_multimodal is None:
+            raise ValueError(
+                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
+                "multimodal merge needs the mask."
+            )
+        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
+            raise NotImplementedError(
+                "SpyreModelWrapper.embed_input_ids does not support models with "
+                "out-of-vocabulary multimodal tokens."
+            )
         num_tokens = input_ids.shape[0]
         bucketer = self._shape_bucketer
         padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
