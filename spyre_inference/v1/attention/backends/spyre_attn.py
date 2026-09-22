@@ -140,7 +140,7 @@ def _mirror_mask_stack(
     stack_device = stacks_device[seq_idx]
     if stack_device is None:
         # `convert` copies, so even a nonzero-offset host view arrives contiguous at
-        # offset 0, ready for an in-graph dim-0 tile.
+        # offset 0, ready for an in-graph dim-0 slice.
         stack_device = convert(stack_cpu, device=device)
         stacks_device[seq_idx] = stack_device
     return stack_device
@@ -169,9 +169,7 @@ def _build_query_row_tables(
 
 
 # Attention compiles separately from the model's fullgraph capture, which can't
-# hold the per-sequence Python loop around these.
-#
-# Both kernels need fullgraph because of ``for_each_tile``.
+# hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
 _page_attn_compiled = torch.compile(
     page_attn_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
@@ -861,17 +859,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            max_decode_blocks = max(decode_blocks)
-            b_blocks = (
-                self._attn_bucketer.find_blocks_bucket(max_decode_blocks)
-                if max_decode_blocks
-                else None
-            )
+            b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
 
             if b_seqs is not None and b_blocks is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
                 # bucket round-up (which padding the denser ladder addresses instead).
-                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max_decode_blocks
+                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 padded_num_seqs = b_seqs
                 # Padding columns gather page 0 under an all--inf mask and
                 # contribute zero; chunk 0 still holds every real row's block 0,
@@ -902,31 +895,29 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         n_use = min(len(abs_blocks), b_blocks)
                         for b, abs_b in enumerate(abs_blocks[:n_use]):
                             block_ids_padded[b, s] = bt[s, abs_b]
-                # Keep the logical block axis intact: both walks narrow this offset-zero
-                # tensor by blocks_per_chunk inside the compiled loop, and the body then
-                # keeps the compact (block-slot, sequence) order. One transfer for the
-                # step rather than one per chunk, and no per-chunk host copy.
+                # Kept whole at offset 0: both walks narrow the block axis in-graph, so
+                # this is one transfer per step rather than one per chunk.
                 chunk_page_ids_cpu = block_ids_padded
 
-                # finfo.min on padded rows/blocks and past-kv-len positions; 0 on
-                # valid positions. Reshaped to the kernel input shape
-                # [padded_blocks, B_seqs, KV or 1, 1, block_size], block-major so each
-                # blocks_per_chunk tile is compact.
+                # -inf on padded rows/blocks and past-kv-len positions; 0 on
+                # valid positions. The kernel broadcasts the mask to KV heads.
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
-                    torch.finfo(self.model_dtype).min,
+                    float("-inf"),
                     dtype=self.model_dtype,
                 )
                 for s in range(num_decode_seqs):
                     n_use = min(blocks_per_seq[s], b_blocks)
                     if n_use:
                         mask_bs_bb[s, :n_use] = attention_mask_stacks[s][:n_use, 0]
-                # The query-group axis stays 1 and broadcasts in the kernel's mask add;
-                # the KV axis only has to be materialized for the tiled walk, whose body
-                # cannot propagate a broadcast window's layout through a trip. The plain
-                # walk broadcasts KV too, so it keeps the narrower transfer. Read per
-                # build, as `walk_tiles` reads it, so the mask and the walk cannot
-                # disagree about which of the two is running.
+                # A row past the batch is -inf in every block, so its softmax is NaN and
+                # the in-graph store would publish it. A real row always has a valid
+                # block 0, so its padded blocks can stay -inf and contribute zero.
+                # Holds under a window too: first_active <= num_blocks - 1.
+                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(self.model_dtype).min
+                # Block-major, so each blocks_per_chunk tile is contiguous. The KV axis
+                # is only materialized for the tiled walk, whose body cannot propagate a
+                # broadcast window's layout through a trip.
                 kv_extent = self.num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1
                 mask_by_chunk_cpu = (
                     mask_bs_bb.transpose(0, 1)

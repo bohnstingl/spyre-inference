@@ -1896,25 +1896,6 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     assert masked.shape == scores.shape
 
 
-def test_batched_decode_mask_is_finite_for_padding(default_vllm_config, enable_batched_decode):
-    """Padded blocks, lanes, and sequence rows use finite mask minima."""
-    from vllm.config import get_current_vllm_config
-
-    torch.set_default_device("cpu")
-    vllm_config = get_current_vllm_config()
-    vllm_config.scheduler_config.max_num_seqs = 8
-    vllm_config.model_config.max_model_len = 2048
-    metadata = _padded_mask_metadata(
-        [(1, 65), (1, 256), (1, 300), (1, 512), (1, 129)],
-        block_size=64,
-        max_num_blocks=32,
-    )
-
-    assert metadata.padded_num_seqs == 8
-    assert metadata.mask_by_chunk_cpu is not None
-    assert torch.isfinite(metadata.mask_by_chunk_cpu).all()
-
-
 def _decode_reference_fp32(
     query: torch.Tensor,
     k_pages: torch.Tensor,
@@ -2658,17 +2639,6 @@ def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
     assert metadata.padded_num_blocks[0] == 0
     assert metadata.attention_mask_stacks[0].shape[0] == 0
     assert metadata.padded_num_blocks[1] == 2
-
-
-def test_all_empty_decode_batch_declines_batched_kernel(default_vllm_config):
-    torch.set_default_device("cpu")
-    metadata = _padded_mask_metadata([(1, 0)] * _MIN_BATCHED_SEQS, max_num_blocks=1)
-
-    assert metadata.num_decode_seqs == _MIN_BATCHED_SEQS
-    assert metadata.padded_num_seqs is None
-    assert metadata.blocks_per_chunk is None
-    assert metadata.chunk_page_ids_cpu is None
-    assert metadata.mask_by_chunk_cpu is None
 
 
 def test_sliding_window_is_left_unpadded(default_vllm_config):

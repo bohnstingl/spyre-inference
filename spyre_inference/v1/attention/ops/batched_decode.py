@@ -45,22 +45,16 @@ def batched_decode_kernel(
 
     k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
     chunk_page_ids: [padded_blocks, num_seqs] int32, row b holding each sequence's
-    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1, block_size]
-    -- the query-group axis broadcasts here rather than being transferred
-    num_queries_per_kv times, and the KV axis broadcasts too on the plain walk, which
-    unlike the tiled one can carry a broadcast window through a trip. Both walks form
-    blocks_per_chunk-wide chunks from those logical block axes. rep_row_ids: [entries]
-    int32, all query rows repeated as one block-major group per block slot. ``out``
-    None returns the result instead of storing it.
+    b-th active page. mask_by_chunk: [padded_blocks, num_seqs, KV or 1, 1,
+    block_size], broadcast across the query group in the kernel, and across KV heads
+    too unless the tiled walk materialized that axis. rep_row_ids: [entries] int32,
+    every query row repeated once per block slot. ``out`` None returns the result
+    instead of storing it.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
     q = query.index_select(0, rep_row_ids).reshape(
-        blocks_per_chunk,
-        num_seqs,
-        num_kv_heads,
-        num_queries_per_kv,
-        head_size,
+        entries, num_kv_heads, num_queries_per_kv, head_size
     )
 
     def reduce_chunk(probs, v_page):
@@ -80,9 +74,9 @@ def batched_decode_kernel(
         page_ids, mask_rows, k_pages, v_pages, q = tiles
         # Advanced indexing on the [block-slot, sequence] tile, not index_select on a
         # 1-D one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
-        # so a narrow gather gets one core. It costs the eager path, which
-        # _batched_decode_preconditions_met gives up. Flattening the tile first also
-        # forces an unsupported int32 staging layout.
+        # so a narrow gather gets one core, and flattening the tile first needs an
+        # unsupported int32 staging layout. It costs the eager path, which
+        # _batched_decode_preconditions_met gives up.
         # Token-major cache page to head-major; a view, so do not add
         # .contiguous() -- merging these axes is what materializes the page.
         k_page = (
@@ -95,20 +89,13 @@ def batched_decode_kernel(
             .reshape(entries, block_size, num_kv_heads, head_size)
             .permute(0, 2, 1, 3)
         )
-        scores = (
-            torch.matmul(
-                q.reshape(entries, num_kv_heads, num_queries_per_kv, head_size),
-                k_page.transpose(-2, -1),
-            )
-            * scale
-        )
+        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # Leading-axis split only: merging a permuted axis pair is what torch-spyre
-        # rejects. Restoring the tile coordinates before the mask add also keeps the
-        # mask's advancing read window unflattened.
+        # rejects, and the mask's advancing read window must stay unflattened.
         sc = scores.reshape(
             blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
         )

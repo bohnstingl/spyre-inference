@@ -47,11 +47,9 @@ def page_attn_head_major_decode_kernel(
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
-    Heads are kv-major, so the fold is a reshape, and it needs no head gather.
-
-    With SPYRE_ATTN_FOR_EACH_TILE set the page walk goes through `for_each_tile` and the
-    graph holds one block body rather than an unrolled copy per page; unset, the same body
-    runs under a plain Python loop. See `walk_tiles`.
+    Heads are kv-major, so the fold is a reshape, and it needs no head gather. The page
+    walk goes through `walk_tiles`, which holds one block body rather than an unrolled
+    copy per page when SPYRE_ATTN_FOR_EACH_TILE is set.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
@@ -61,15 +59,11 @@ def page_attn_head_major_decode_kernel(
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor whose
             row i holds the i-th active block's page id in column 0, the base's table
             unchanged.
-        kv_row_pool: [num_pages_total, num_kv_heads, 1] int32 device tensor holding every
-            page's rows in the folded cache, i.e. ``page * num_kv_heads + kv``. A page's
-            rows are *gathered* out of it, for two reasons: int32 arithmetic has no device
-            op mapping, so the kernel cannot compute them; and an int32 argument's nonzero
-            storage offset is still read as 0, so slicing them out of a stacked table would
-            gather page 0's rows for every block (torch-spyre#3770 is closed, but its fix
-            covers float16 only -- test_spyre_in_graph_slice_of_stacked_kv_row_index pins
-            the in-graph case). The pool is cache geometry, so it is built once, which also
-            retires the per-block index transfer the unrolled walk paid per step.
+        kv_row_pool: [num_pages_total, num_kv_heads, 1] int32 device tensor of every
+            page's folded-cache rows, ``page * num_kv_heads + kv``. Gathered rather than
+            computed (int32 arithmetic has no device op mapping) or sliced out of a
+            per-block table (an int32 argument's nonzero storage offset still reads as 0,
+            torch-spyre#3770). Pure cache geometry, so it is built once.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
         out: buffer to store into, or None to return the result instead.
 
@@ -82,11 +76,9 @@ def page_attn_head_major_decode_kernel(
 
     def block_body(carry, tiles):
         page_index, k_pages, v_pages, mask_tile, q, kv_row_pool = tiles
-        # Gathered from the pool rather than computed as `page * num_kv_heads + kv`: int32
-        # arithmetic has no op mapping on the device. Gathered rather than read as rows of a
-        # per-block table, because a tile is readable either whole or as the single element
-        # `page_index[0, 0:1]` is; a [num_kv_heads]-wide read of a wider row is neither, and
-        # its tile_dim_marker is gone by the time the lowering needs it.
+        # A tile is readable whole or as the single element `page_index[0, 0:1]` is; a
+        # [num_kv_heads]-wide read of a wider row is neither, so the rows come from the
+        # pool. See the `kv_row_pool` docstring.
         kv_rows = kv_row_pool.index_select(0, page_index[0, 0:1])
         # Subscripting, not index_select, which takes only a 1-D index: that puts the entry
         # axis on the index's own stick axis, splittable only in whole 32-entry sticks.
@@ -104,11 +96,8 @@ def page_attn_head_major_decode_kernel(
         scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
         if carry is None:
-            # First tile of the Python-loop path: the carry is built here rather than
-            # rescaled from an init constant. Equal to the tiled path's first trip against
-            # a -inf/0/0 carry, whose rescale is exp(-inf - max) = 0. See `walk_tiles` for
-            # why that constant cannot be materialized here.
             probs = torch.exp(scores - scores_max)
             return (
                 scores_max,

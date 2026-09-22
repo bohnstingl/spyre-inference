@@ -38,10 +38,9 @@ def page_attn_kernel(
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
 
-    Under `dynamic=False` Dynamo specializes on every non-tensor argument, so a
-    Python page loop is unrolled per variant. With SPYRE_ATTN_FOR_EACH_TILE set the
-    walk goes through `for_each_tile` instead and the graph holds one block body;
-    unset, the same body runs under a plain loop. See `walk_tiles`.
+    Under `dynamic=False` Dynamo specializes on every non-tensor argument, so a Python
+    page loop is unrolled per variant. `walk_tiles` holds one block body instead when
+    SPYRE_ATTN_FOR_EACH_TILE is set.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
@@ -53,8 +52,6 @@ def page_attn_kernel(
             tensor, row i holding the i-th active block's page index at
             column 0.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
-            The builder already stacks block-major, which is what lets either walk
-            take the block axis from a tensor instead of a Python list.
         alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
             per-query-row constants — see the derivation at the bias-tile
@@ -90,11 +87,7 @@ def page_attn_kernel(
         dims.append(0)
 
     def block_body(carry, tiles):
-        if alibi_stack is not None:
-            page_index, k_pages, v_pages, mask_tile, q, alibi_tile = tiles
-        else:
-            page_index, k_pages, v_pages, mask_tile, q = tiles
-
+        page_index, k_pages, v_pages, mask_tile, q, *rest = tiles
         page_idx = page_index[0, 0:1]
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
@@ -110,11 +103,11 @@ def page_attn_kernel(
             # positions still map cleanly to -inf. Applied before the ALiBi
             # bias so the positional term is not squashed by the tanh.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        if alibi_stack is not None:
+        if rest:
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
-            scores = scores + alibi_tile[0]
+            scores = scores + rest[0][0]
         scores = scores + mask_tile[0]
 
         scores_max = torch.amax(scores, dim=-1, keepdim=True)

@@ -44,15 +44,12 @@ def page_attn_head_major_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    With SPYRE_ATTN_FOR_EACH_TILE set the page walk goes through `for_each_tile` and the
-    graph holds one block body rather than an unrolled copy per page; unset, the same body
-    runs under a plain Python loop. See `walk_tiles`. Shapes are
+    The page walk goes through `walk_tiles`. Shapes are
     ``page_attn_head_major_decode``'s, except:
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor, row i
             holding the i-th active block's page index at column 0, indexing
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
-        mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0 -- the
-            builder's own stacking, so neither walk needs a per-block list.
+        mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 

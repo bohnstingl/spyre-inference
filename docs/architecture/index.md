@@ -239,8 +239,8 @@ layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot
 
 #### LX-resident pages
 
-The head-major per-sequence decode kernel keeps a gathered page in the LX scratchpad from
-its gather to its last use instead of round-tripping through HBM. Two shape choices get it
+The head-major per-sequence kernel keeps a gathered page in the LX scratchpad from its
+gather to its last use instead of round-tripping through HBM. Two shape choices get it
 there. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
 gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
@@ -263,10 +263,10 @@ at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries neithe
 pages from the unfolded cache) — both are available on the token-major layout.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
-planner's own verdicts by `scripts/probes/lx_head_major_residency.py`. K's residency
-needs torch-spyre#4153: `q @ Kᵀ` lowers the transpose to a restickify, whose cross-frame
-barrier bars an LX-resident input without that PR's local-read proof. V is read directly
-by `probs @ V` and stays resident either way.
+planner's own verdicts. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
+transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
+that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
+way.
 
 Key constraints:
 

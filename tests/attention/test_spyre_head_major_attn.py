@@ -496,8 +496,7 @@ _SHAPES = [
 
 # Spyre and compiled only: the kernel's page gather lowers to aten.index, which fails
 # eager, so the impl always compiles attention. Residency itself is a property of the
-# layout plan rather than a result, and is measured by
-# scripts/probes/lx_head_major_residency.py.
+# layout plan rather than a result, so it is not asserted here.
 @pytest.mark.parametrize("seq_lens", _SHAPES)
 @pytest.mark.parametrize(
     "configure_compilation",

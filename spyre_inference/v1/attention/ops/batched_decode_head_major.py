@@ -48,9 +48,6 @@ def batched_decode_head_major_kernel(
     """Shapes as in ``batched_decode_kernel``, except k/v_pages are the unfolded
     head-major cache, [num_pages_total, num_kv_heads, block_size, head_size].
 
-    chunk_page_ids and mask_by_chunk keep the same logical block-major
-    layout as ``batched_decode_kernel``; each walk tile is one chunk.
-
     One index row per page rather than per (page, kv_head): the gather then splits on the
     axis that stays the matmul's batch dim 0, as token-major's does, and the page still
     arrives head-major so there is no permute either.
@@ -58,11 +55,7 @@ def batched_decode_head_major_kernel(
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
     q = query.index_select(0, rep_row_ids).reshape(
-        blocks_per_chunk,
-        num_seqs,
-        num_kv_heads,
-        num_queries_per_kv,
-        head_size,
+        entries, num_kv_heads, num_queries_per_kv, head_size
     )
 
     def reduce_chunk(probs, v_page):
@@ -81,23 +74,17 @@ def batched_decode_head_major_kernel(
     def chunk_body(carry, tiles):
         page_ids, mask_rows, k_pages, v_pages, q = tiles
         # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
-        # whole 32-entry sticks. Costs the eager path, which the preconditions decline.
-        # Flattening the int32 tile first also requires an unsupported staging layout.
+        # whole 32-entry sticks, and flattening the int32 tile first needs an unsupported
+        # staging layout. Costs the eager path, which the preconditions decline.
         k_page = k_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
         v_page = v_pages[page_ids].reshape(entries, num_kv_heads, block_size, head_size)
-        scores = (
-            torch.matmul(
-                q.reshape(entries, num_kv_heads, num_queries_per_kv, head_size),
-                k_page.transpose(-2, -1),
-            )
-            * scale
-        )
+        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # Leading-axis split only: torch-spyre rejects merging a permuted axis pair, and
-        # a flattened mask would lose its advancing read window.
+        # the mask's advancing read window must stay unflattened.
         sc = scores.reshape(
             blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
         )

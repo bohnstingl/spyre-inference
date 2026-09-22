@@ -24,8 +24,8 @@ int for the model graph; a per-sequence attention variant is 2-D (kv_len and
 query_len buckets).
 
 The batched decode kernel specializes on its own key,
-``(num_seqs, blocks_per_chunk, num_chunks)``. Its tiled block extent is
-``blocks_per_chunk * num_chunks``, hence a second bucket type and enumerator.
+``(num_seqs, blocks_per_chunk, num_chunks)``, hence a second bucket type and
+enumerator.
 
 Vocabulary: a *bucket* is one padded size a runtime length rounds up onto; the
 sorted list of them for one axis is that axis's *buckets*; the spacing between
