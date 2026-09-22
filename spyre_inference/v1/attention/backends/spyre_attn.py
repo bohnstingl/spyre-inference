@@ -140,7 +140,7 @@ def _mirror_mask_stack(
     stack_device = stacks_device[seq_idx]
     if stack_device is None:
         # `convert` copies, so even a nonzero-offset host view arrives contiguous at
-        # offset 0, ready for an in-graph dim-0 slice.
+        # offset 0, ready for an in-graph dim-0 tile.
         stack_device = convert(stack_cpu, device=device)
         stacks_device[seq_idx] = stack_device
     return stack_device
@@ -861,12 +861,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
+            max_decode_blocks = max(decode_blocks)
+            b_blocks = (
+                self._attn_bucketer.find_blocks_bucket(max_decode_blocks)
+                if max_decode_blocks
+                else None
+            )
 
             if b_seqs is not None and b_blocks is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
                 # bucket round-up (which padding the denser ladder addresses instead).
-                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
+                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max_decode_blocks
                 padded_num_seqs = b_seqs
                 # Padding columns gather page 0 under an all--inf mask and
                 # contribute zero; chunk 0 still holds every real row's block 0,
@@ -903,24 +908,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # step rather than one per chunk, and no per-chunk host copy.
                 chunk_page_ids_cpu = block_ids_padded
 
-                # -inf on padded rows/blocks and past-kv-len positions; 0 on
+                # finfo.min on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Reshaped to the kernel input shape
                 # [padded_blocks, B_seqs, KV or 1, 1, block_size], block-major so each
                 # blocks_per_chunk tile is compact.
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
-                    float("-inf"),
+                    torch.finfo(self.model_dtype).min,
                     dtype=self.model_dtype,
                 )
                 for s in range(num_decode_seqs):
                     n_use = min(blocks_per_seq[s], b_blocks)
                     if n_use:
                         mask_bs_bb[s, :n_use] = attention_mask_stacks[s][:n_use, 0]
-                # A row past the batch is -inf in every block, so its softmax is NaN and
-                # the in-graph store would publish it. A real row always has a valid
-                # block 0, so its padded blocks can stay -inf and contribute zero.
-                # Holds under a window too: first_active <= num_blocks - 1.
-                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(self.model_dtype).min
                 # The query-group axis stays 1 and broadcasts in the kernel's mask add;
                 # the KV axis only has to be materialized for the tiled walk, whose body
                 # cannot propagate a broadcast window's layout through a trip. The plain
@@ -1881,6 +1881,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     rel = (kv_pos - context_len).view(1, 1, 1, block_size)
                     bias_tiles.append(self.alibi_slopes * rel)
                 alibi_stack = convert(torch.stack(bias_tiles), device=_target_device)
+                assert alibi_stack.shape[0] == len(active_bs)
 
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(

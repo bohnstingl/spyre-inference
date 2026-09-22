@@ -865,8 +865,9 @@ def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile)
     query = torch.randn(query_len + 2, heads, d)
     rows = (torch.arange(query_len, dtype=torch.int32) + 2) % (query_len + 2)
     # The base's page table: stick-wide rows, page id in column 0.
+    page_ids = torch.tensor([3, 1, 4, 0, 2], dtype=torch.int32)
     page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-    page_table[:, 0] = torch.arange(blocks, dtype=torch.int32)
+    page_table[:, 0] = page_ids
     kv_row_pool = torch.arange(blocks * kv, dtype=torch.int32).reshape(blocks, kv, 1)
     # Causal: query row q sits at absolute position kv_len - query_len + q.
     q_abs = kv_len - query_len + torch.arange(query_len).unsqueeze(1)
@@ -900,7 +901,7 @@ def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile)
             value_cache=v.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
             query_lens=[query_len],
             kv_lens=[kv_len],
-            block_tables=torch.arange(blocks, dtype=torch.int32).unsqueeze(0),
+            block_tables=page_ids.unsqueeze(0),
             block_size=block,
             scale=d**-0.5,
             soft_cap=soft_cap,
@@ -973,6 +974,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
             page_ids[s, b] = 1 + s * padded_blocks + b
             mask[s, b, : min(block_size, kv_len - b * block_size)] = 0.0
     mask[num_seqs:, 0] = torch.finfo(torch.float16).min
+    mask.masked_fill_(torch.isneginf(mask), torch.finfo(torch.float32).min)
 
     rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
     rep_row_ids = rep_row_ids.repeat(bpc)

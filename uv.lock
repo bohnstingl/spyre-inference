@@ -5212,7 +5212,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=1459ce293459a08ccb76eb5e4e2d219ae240336a#1459ce293459a08ccb76eb5e4e2d219ae240336a" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=f4ad475702ac85587027bd5596094957127f51d3#f4ad475702ac85587027bd5596094957127f51d3" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },

@@ -125,7 +125,7 @@ RESULTS_DIR ?= .
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-smoke-shard test-quality test-quality-shard \
         test-probes test-probes-shard \
-        test-attention test-attention-shard \
+        test-attention test-attention-shard test-attention-for-each-tile \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
         test-upstream-distributed \
         tests-single-card tests-multi-card
@@ -266,6 +266,17 @@ test-attention-shard: ## Run one decoder-attention shard (ATTN_SHARDS=N ATTN_SHA
 # ATTN_SHARD_ID. ATTN_SHARDS (the total) comes from its default above.
 test-attention-shard-%:
 	$(MAKE) test-attention-shard ATTN_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+test-attention-for-each-tile: ## Run compiled on-device attention with for_each_tile enabled before import.
+	SPYRE_ATTN_FOR_EACH_TILE=1 $(MAKE) run-one \
+	  MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) \
+	    "tests/attention/test_spyre_attn.py::test_spyre_attn_compiled_multi_seq[batch_prefill(2seqs)-compilation_STOCK-device_spyre]" \
+	    "tests/attention/test_spyre_attn.py::test_spyre_attn_compiled_multi_seq[batch_mixed(3seqs)-compilation_STOCK-device_spyre]" \
+	    "tests/attention/test_spyre_attn.py::test_spyre_attn_alibi[prefill(q=32,kv=256)-compilation_STOCK-device_spyre]" \
+	    "tests/attention/test_spyre_head_major_attn.py::test_head_major_attn_core[device_spyre-compiled-prefill_single]" \
+	    "tests/attention/test_spyre_head_major_attn.py::test_head_major_batched_decode_correctness[device_spyre-compiled-bucket_exact(N=8)]"' \
+	  JUNIT_XML=$(JUNIT_XML)
 
 test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
