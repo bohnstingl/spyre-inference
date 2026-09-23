@@ -183,6 +183,32 @@ class TestRecordGraphs:
 
         assert recorded == len(_recordable(bucketer)) > 0
 
+    def test_recorder_uses_single_page_decode_and_grouped_prefill(
+        self, impl, kv_cache, builder, monkeypatch
+    ):
+        """Recording must trace the same page_group each bucket dispatches at, or every
+        prefill compiles on first use."""
+        monkeypatch.setattr(impl, "_page_group", 2)
+        builder._attn_bucketer = make_bucketer()
+        groups = []
+        real = impl._attn_fn
+
+        def capture(*args):
+            # (num_blocks, padded_query_len, page_group) in page_attn_kernel's order.
+            groups.append((args[7], args[8], args[13]))
+            return real(*args)
+
+        monkeypatch.setattr(impl, "_attn_fn", capture)
+        _record(impl, kv_cache, builder)
+
+        assert groups
+        # Decode takes one page per update, and so does a bucket the width cannot tile.
+        assert all(
+            group == (1 if query_len == 1 or num_blocks % 2 else 2)
+            for num_blocks, query_len, group in groups
+        )
+        assert {group for *_, group in groups} == {1, 2}
+
     def test_dispatch_after_recording_compiles_nothing(self, impl, kv_cache, builder):
         """The acceptance criterion: no request compiles a new variant.
 

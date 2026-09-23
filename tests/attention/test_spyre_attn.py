@@ -38,6 +38,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _build_query_row_tables,
     _mirror_mask_stack,
+    derive_page_group,
+    grouping_unsupported_reason,
+    max_span_bytes,
+    max_span_width,
 )
 from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
@@ -101,6 +105,22 @@ def configure_compilation(request, monkeypatch):
     cfg.mode = original_mode
     torch._dynamo.config.accumulated_recompile_limit = original_limit
     torch._dynamo.reset()
+
+
+@pytest.fixture()
+def eager_attention(default_vllm_config):
+    """Present the run as eager.
+
+    ``VllmConfig`` resolves the fixture's unset compilation mode to STOCK, so the impl
+    reads the default fixture as compiled -- and grouping is compiled-only, so the eager
+    side of that law needs the mode said out loud.
+    """
+    from vllm.config import CompilationMode, get_current_vllm_config
+
+    config = get_current_vllm_config().compilation_config
+    previous, config.mode = config.mode, CompilationMode.NONE
+    yield
+    config.mode = previous
 
 
 def _alibi_slopes(num_heads: int) -> list[float]:
@@ -2051,15 +2071,22 @@ def test_batched_decode_matches_fp32_reference(
 
 
 @pytest.mark.parametrize(
-    "num_blocks,padded_query_len,num_kv_heads,qpk,for_each_tile,use_alibi",
+    "num_blocks,padded_query_len,num_kv_heads,qpk,for_each_tile,use_alibi,page_group",
     [
-        pytest.param(1, 4, 2, 1, False, False, id="one_block"),
-        pytest.param(4, 4, 2, 1, False, False, id="four_blocks"),
-        pytest.param(3, 8, 2, 2, False, False, id="gqa"),
-        pytest.param(1, 4, 2, 1, True, False, id="one_block_for_each_tile"),
-        pytest.param(4, 4, 2, 1, True, False, id="four_blocks_for_each_tile"),
-        pytest.param(3, 8, 2, 2, True, False, id="gqa_for_each_tile"),
-        pytest.param(4, 8, 2, 2, True, True, id="alibi_for_each_tile"),
+        pytest.param(1, 4, 2, 1, False, False, 1, id="one_block"),
+        pytest.param(4, 4, 2, 1, False, False, 1, id="four_blocks"),
+        pytest.param(3, 8, 2, 2, False, False, 1, id="gqa"),
+        pytest.param(1, 4, 2, 1, True, False, 1, id="one_block_for_each_tile"),
+        pytest.param(4, 4, 2, 1, True, False, 1, id="four_blocks_for_each_tile"),
+        pytest.param(3, 8, 2, 2, True, False, 1, id="gqa_for_each_tile"),
+        pytest.param(4, 8, 2, 2, True, True, 1, id="alibi_for_each_tile"),
+        # Grouped: one update per `page_group` pages, on both walks. Held against the
+        # same reference, so a fault in the group fold cannot cancel against the
+        # ungrouped body the way grouped-vs-ungrouped would let it.
+        pytest.param(4, 4, 2, 1, False, False, 2, id="page_group_2"),
+        pytest.param(4, 4, 2, 1, True, False, 2, id="page_group_2_for_each_tile"),
+        pytest.param(8, 8, 2, 2, True, True, 4, id="page_group_4_gqa_alibi_for_each_tile"),
+        pytest.param(4, 8, 2, 2, True, False, 4, id="page_group_covers_every_block"),
     ],
 )
 def test_page_attn_matches_fp32_reference(
@@ -2070,6 +2097,7 @@ def test_page_attn_matches_fp32_reference(
     qpk: int,
     for_each_tile: bool,
     use_alibi: bool,
+    page_group: int,
 ) -> None:
     """Prefill's online softmax equals one softmax over the whole KV window.
 
@@ -2132,6 +2160,7 @@ def test_page_attn_matches_fp32_reference(
         num_heads,
         num_kv_heads,
         head_size,
+        page_group=page_group,
         alibi_stack=alibi_stack,
     )
 
@@ -2150,6 +2179,236 @@ def test_page_attn_matches_fp32_reference(
     assert actual.shape == (padded_query_len, num_heads, head_size)
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_page_group_must_divide_the_page_count():
+    """A tile walk has no ragged final tile, so the kernel refuses a width that needs one.
+
+    Raised rather than trimmed: a trimmed tail would take its own width, and Dynamo
+    specializes on it, so every prefill could compile a variant warmup never recorded.
+    """
+    with pytest.raises(ValueError, match="positive divisor of num_blocks=3"):
+        page_attn_kernel(
+            torch.zeros(4, 2, 8),
+            torch.zeros(4, dtype=torch.int64),
+            torch.zeros(4, 16, 2, 8),
+            torch.zeros(4, 16, 2, 8),
+            torch.zeros(3, INT32_ELEMS_PER_STICK, dtype=torch.int64),
+            torch.zeros(3, 4, 16),
+            0.5,
+            3,
+            4,
+            2,
+            2,
+            8,
+            page_group=2,
+        )
+
+
+# --- page group width selection ---------------------------------------------------
+#
+# The shape the width was measured on: granite-3.3-8b, fp16.
+_GRANITE = dict(
+    num_kv_heads=8,
+    num_queries_per_kv=4,
+    head_size=128,
+    block_size=128,
+    element_size=2,
+)
+
+
+@pytest.mark.parametrize("padded_query_len", [2, 128, 512, 2048])
+def test_derived_page_group_is_the_one_measured_width(padded_query_len):
+    """One width, not the widest the hardware admits.
+
+    Sizing per query length was tried and dropped: it returned 2 for the long buckets,
+    which measured slower than not grouping at all on the head-major layout.
+    ``_PAGE_GROUP_WIDTH`` is the width both layouts measured a win at.
+    """
+    assert derive_page_group(num_blocks=64, padded_query_len=padded_query_len, **_GRANITE) == 4
+
+
+def test_derived_page_group_is_one_for_decode():
+    assert derive_page_group(num_blocks=64, padded_query_len=1, **_GRANITE) == 1
+
+
+def test_derived_page_group_needs_enough_pages_to_pay_off():
+    """Grouping is declined on the small KV buckets, where it measures slower.
+
+    Grouping a 4- or 8-block bucket at width 4 made prompts whose whole context fits in
+    8 blocks 21% slower end to end than ungrouped. See ``_MIN_GROUPED_BLOCKS``.
+    """
+    small = [derive_page_group(num_blocks=nb, padded_query_len=512, **_GRANITE) for nb in (2, 4, 8)]
+    assert small == [1, 1, 1]
+    assert derive_page_group(num_blocks=16, padded_query_len=512, **_GRANITE) == 4
+
+
+def test_derived_page_group_declines_a_page_count_it_cannot_tile():
+    """The walk tiles whole tiles only, so an indivisible page count opts out.
+
+    The recorder's ladder is powers of two, which 4 always divides; a sliding window is
+    what realizes other counts, and it must not compile a width the kernel then rejects.
+    """
+    assert derive_page_group(num_blocks=18, padded_query_len=512, **_GRANITE) == 1
+
+
+def test_derived_page_group_declines_when_the_width_exceeds_the_addressing_span():
+    """The span is a compile-time refusal, so a shape that cannot hold the width opts out.
+
+    Unlike the payoff floor this is not a performance trade: exceeding the per-core
+    addressing span raises ``Unsupported`` at compile time. Pages twice the granite
+    shape's admit only 2, which is why the fixed width still has to be checked against it.
+    """
+    wide_page = {**_GRANITE, "num_kv_heads": 16, "block_size": 256}
+    assert max_span_width(**{k: v for k, v in wide_page.items() if k != "num_queries_per_kv"}) == 2
+    assert derive_page_group(num_blocks=64, padded_query_len=512, **wide_page) == 1
+
+
+@pytest.mark.parametrize("halved", ["num_kv_heads", "head_size", "block_size"])
+def test_span_ceiling_scales_with_the_gathered_bytes(halved):
+    """The span tracks the gather's byte size, so a smaller page buys width.
+
+    Measured on AIU: at the granite shape a width of 16 is refused at compile time,
+    and halving any one of these three admits it.
+    """
+    shape = dict(num_kv_heads=8, head_size=128, block_size=128, element_size=2)
+    assert max_span_width(**shape) == 8
+    assert max_span_width(**{**shape, halved: shape[halved] // 2}) == 16
+
+
+def test_max_span_bytes_comes_from_the_compiler():
+    """The ceiling is read from torch-spyre, not from our copy of its value.
+
+    ``max_span_bytes`` falls back to a constant so a moved symbol cannot take attention
+    down, which would otherwise let the gate go quietly stale.
+    """
+    from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
+
+    assert max_span_bytes() == MAX_SPAN_BYTES
+
+
+# Two compile-time refusals the shape law cannot see, both mapped on AIU over a
+# head-shape x width x block-size grid; see
+# ``vllm_spyre_next/ZRL/claude/2026-09-21_kv_page_group_lx_capacity.md``. A width the
+# compiler refuses is worse than one that is merely slow, so the derivation must never
+# propose one.
+
+
+@pytest.mark.parametrize(
+    ("num_kv_heads", "num_queries_per_kv"),
+    [(8, 1), (1, 8), (32, 1)],  # mha, mqa, and mha at 32 heads
+)
+def test_derived_page_group_is_one_without_a_reusable_batch_dim(num_kv_heads, num_queries_per_kv):
+    """The DXP scheduler asserts on a singleton batch dim, in both compile modes.
+
+    Not a head-count law: (32, 1) is refused and (2, 4) accepted at the same 8 or 32
+    heads, so what matters is that both dims exceed 1.
+    """
+    shape = {**_GRANITE, "num_kv_heads": num_kv_heads, "num_queries_per_kv": num_queries_per_kv}
+    assert derive_page_group(num_blocks=64, padded_query_len=128, **shape) == 1
+    assert derive_page_group(num_blocks=64, padded_query_len=128, **_GRANITE) == 4
+
+
+def test_derived_page_group_is_one_in_eager_mode():
+    """Inductor cannot resolve the grouped stick layout when each group is dispatched
+    on its own; the same shapes compile and run under ``torch.compile``."""
+    assert derive_page_group(num_blocks=64, padded_query_len=128, compiled=False, **_GRANITE) == 1
+
+
+def test_grouping_unsupported_reason_names_the_limit():
+    """The reason reaches the log, so it has to say which limit refused."""
+    assert grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=4, compiled=True) is None
+    eager = grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=4, compiled=False)
+    assert eager is not None and "eager" in eager
+    mha = grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=1, compiled=True)
+    assert mha is not None and "num_queries_per_kv=1" in mha
+
+
+def _gqa_impl(**kwargs) -> SpyreAttentionImpl:
+    """An impl at a shape the derivation groups, so only the argument under test gates."""
+    return SpyreAttentionImpl(num_heads=32, head_size=128, scale=0.125, num_kv_heads=8, **kwargs)
+
+
+def test_page_group_auto_derives_a_width_per_bucket(default_vllm_config, monkeypatch):
+    """The default asks the shape, and the answer is the one measured width or 1.
+
+    Per bucket rather than once per layer because the page count and the query length
+    gate it, and both already specialize the compiled graph.
+    """
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = _gqa_impl()
+
+    assert impl._page_group_for_query(1, 64) == 1
+    # Query length no longer narrows the width; only the page count and the span gate it.
+    assert impl._page_group_for_query(2048, 64) == 4
+    assert impl._page_group_for_query(128, 64) == 4
+    assert impl._page_group_for_query(128, 8) == 1
+
+
+def test_page_group_is_used_only_for_multi_token_queries(default_vllm_config, monkeypatch):
+    """A pinned width still skips decode, whose cost is the page transfer."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "8")
+    impl = _gqa_impl()
+
+    assert impl._page_group_for_query(1, 16) == 1
+    assert impl._page_group_for_query(2, 16) == 8
+    assert impl._page_group_for_query(512, 16) == 8
+
+
+def test_pinned_page_group_falls_back_on_a_page_count_it_cannot_tile(
+    default_vllm_config, monkeypatch
+):
+    """Pinning a width must not raise inside the kernel on a bucket it does not divide."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "4")
+    impl = _gqa_impl()
+
+    assert impl._page_group_for_query(512, 18) == 1
+    assert impl._page_group_for_query(512, 16) == 4
+
+
+def test_page_group_auto_is_one_for_eager_attention(eager_attention, monkeypatch):
+    """Same shape that groups compiled; eager it has to stay at 1."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = _gqa_impl()
+
+    assert impl._page_group_for_query(128, 64) == 1
+
+
+def test_page_group_auto_is_one_for_mha(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = SpyreAttentionImpl(num_heads=8, head_size=128, scale=0.125, num_kv_heads=8)
+
+    assert impl._page_group_for_query(128, 64) == 1
+
+
+def test_explicit_page_group_survives_an_unsupported_shape(default_vllm_config, monkeypatch):
+    """The law is empirical, so a pinned width stays the escape hatch: warn, not raise."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "4")
+    impl = SpyreAttentionImpl(num_heads=8, head_size=128, scale=0.125, num_kv_heads=8)
+
+    assert impl._page_group_for_query(128, 64) == 4
+
+
+@pytest.mark.parametrize("page_group", [-1, -8])
+def test_invalid_page_group_is_rejected(default_vllm_config, monkeypatch, page_group):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", str(page_group))
+    with pytest.raises(ValueError, match="SPYRE_ATTN_PAGE_GROUP must be >= 0"):
+        _gqa_impl()
+
+
+def test_page_group_rejects_sliding_window(default_vllm_config, monkeypatch):
+    """A window realizes its own block counts, on which no width has been measured."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "2")
+    with pytest.raises(ValueError, match="sliding-window"):
+        _gqa_impl(sliding_window=128)
+
+
+def test_page_group_auto_falls_back_to_one_under_sliding_window(default_vllm_config, monkeypatch):
+    """A windowed model must not fail just because the width was left to us."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = _gqa_impl(sliding_window=128)
+
+    assert impl._page_group_for_query(512, 16) == 1
 
 
 @pytest.mark.parametrize(

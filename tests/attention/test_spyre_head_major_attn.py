@@ -46,6 +46,9 @@ from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+    page_attn_head_major_prefill_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
@@ -907,6 +910,90 @@ def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile)
         )
         assert got.shape == expected.shape
         torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+
+def _prefill_case(num_blocks: int, page_group: int, soft_cap: float, query_len: int = 7):
+    """The head-major prefill kernel's arguments for one grouping width."""
+    kv, qpk, d, block = 2, 2, 16, 16
+    heads = kv * qpk
+    set_random_seed(0)
+    k = torch.randn(num_blocks + 2, kv, block, d)
+    v = torch.randn(num_blocks + 2, kv, block, d)
+    query = torch.randn(query_len + 1, heads, d)
+    rows = torch.arange(query_len, dtype=torch.int32)
+    # Non-contiguous page ids: a grouped gather must follow the table, not a range.
+    page_table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    page_table[:, 0] = (torch.arange(num_blocks) * 3 + 1) % (num_blocks + 2)
+    mask_stack = torch.zeros(num_blocks, query_len, block)
+    mask_stack[-1, :, block // 2 :] = torch.finfo(torch.float32).min
+    return (
+        query,
+        rows,
+        k,
+        v,
+        page_table,
+        mask_stack,
+        d**-0.5,
+        num_blocks,
+        query_len,
+        heads,
+        kv,
+        d,
+        block,
+        soft_cap,
+        page_group,
+    )
+
+
+@pytest.mark.parametrize("for_each_tile", [False, True], ids=["loop", "for_each_tile"])
+@pytest.mark.parametrize("page_group", [2, 4, 8])
+def test_prefill_page_group_matches_one_page_per_update(monkeypatch, page_group, for_each_tile):
+    """Grouping reassociates the online softmax, so the result must not move.
+
+    8 blocks against widths 2/4/8 covers several groups, one group per trip, and a single
+    group covering the whole context; the last block is half masked, which is what the
+    group's shared maximum has to survive.
+    """
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
+    torch.set_default_device("cpu")
+
+    for soft_cap in (0.0, 30.0):
+        expected = page_attn_head_major_prefill_kernel(*_prefill_case(8, 1, soft_cap))
+        actual = page_attn_head_major_prefill_kernel(*_prefill_case(8, page_group, soft_cap))
+
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_prefill_page_group_keeps_the_group_as_a_batch_axis(monkeypatch):
+    """A group's pages must stay a batch axis, never be merged into the token axis.
+
+    Pages are ``[page, kv, block, head]``, so folding ``group * block`` leaves the kv axis
+    between the two merged axes: that merge is not viewable and lowers to a strided copy
+    whose address map the backend rejects ("Unexpected stick expression"). The numeric test
+    above cannot see it -- such a copy is arithmetically correct and fails only at device
+    lowering -- so this asserts the shape law instead: no traced tensor may carry an axis
+    of ``page_group * block_size``, and one gather serves the whole group.
+    """
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    # The unrolled walk, whose trace holds one body per trip, so the gather count is a
+    # number rather than a tile spec.
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    torch.set_default_device("cpu")
+    page_group, num_blocks, block_size = 4, 8, 16
+    args = _prefill_case(num_blocks, page_group, 0.0)
+    traced = make_fx(page_attn_head_major_prefill_kernel)(*args, None)
+
+    merged = page_group * block_size
+    for node in traced.graph.nodes:
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            assert merged not in tuple(value.shape), f"{node.format_node()} merged the group axis"
+
+    gathers = [n for n in traced.graph.nodes if "index_select" in str(n.target)]
+    # K and V per trip, plus the query rows: one gather per group, not one per page.
+    assert len(gathers) == 2 * (num_blocks // page_group) + 1
 
 
 @pytest.mark.parametrize(
