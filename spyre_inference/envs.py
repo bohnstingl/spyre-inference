@@ -32,13 +32,13 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GUARD: str = "off"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
-    SPYRE_ATTN_FOR_EACH_TILE: bool = False
+    SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_ATTN_MAX_CORES: int = 0
-    SPYRE_BATCHED_DECODE: bool = True
+    SPYRE_BATCHED_DECODE: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
@@ -77,8 +77,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
     # When "1", paged attention walks KV pages and batched decode walks logical
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
-    # one loop body. Off by default: the same bodies run under Python loops.
-    "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "0"))),
+    # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
+    "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
