@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = False
+    SPYRE_ATTN_PAGE_GROUP: int = 0
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
@@ -79,6 +80,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Off by default: the same bodies run under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "0"))),
+    # Adjacent KV pages per online-softmax update for query_len > 1, i.e. the width of
+    # one page-walk tile. Decode and one-token prefill always use 1. 0 (the default)
+    # derives the width per attention bucket from the shape and the toolchain's limits;
+    # see `derive_page_group` in v1/attention/backends/spyre_attn.py. Must be >= 0, and
+    # a width above 1 must divide the bucket's page count -- a tile walk has no ragged
+    # final tile -- or that bucket falls back to 1.
+    "SPYRE_ATTN_PAGE_GROUP": lambda: int(os.getenv("SPYRE_ATTN_PAGE_GROUP", "0")),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),

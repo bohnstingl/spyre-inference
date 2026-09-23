@@ -29,7 +29,6 @@ parameterised. This layout does not carry ALiBi.
 import contextlib
 
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -141,9 +140,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # At construction: forward() runs past a custom-op boundary that loses the config.
-        self.block_size: int = get_current_vllm_config().cache_config.block_size
-
         self._reshape_fn = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
         # Always the compiled kernel, even under --enforce-eager: the gather that keeps a
         # page LX-resident is a 2-D subscript, which lowers to aten.index and fails eager
@@ -314,6 +310,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.head_size,
                     self.block_size,
                     self.logits_soft_cap,
+                    # Same per-bucket width the token-major kernel takes: the group is a
+                    # batch axis of the matmuls, so this layout needs no narrower one.
+                    self._page_group_for_query(padded_query_len, num_blocks),
                     out,
                 )
 

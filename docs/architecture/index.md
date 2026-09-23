@@ -231,6 +231,18 @@ runs the identical bodies under the Python loops and is the rollback path. The s
 read once at import, because it decides the `fullgraph` setting the tiled walk needs —
 setting it after `spyre_inference` is imported has no effect.
 
+A tile need not be one page. For a query wider than one token both prefill kernels take a
+`page_group` — the tile width — and gather that many adjacent pages per trip, reducing
+them in one online-softmax update instead of one per page. The group rides through the
+body as a batch axis of the matmuls and is reduced away at its end, so no axis is merged
+and both cache layouts run the same body. `SPYRE_ATTN_PAGE_GROUP=0` (the default) derives
+the width per attention bucket (`derive_page_group`): it is the one measured width where
+grouping pays and the toolchain permits it, and 1 for decode, for the small KV buckets,
+for page counts the width does not divide, and wherever a compile-time limit refuses it.
+Pinning a value overrides the derivation, which is how a measurement is reproduced. The
+width is chosen where warmup and serving converge, so a bucket is recorded at the width it
+dispatches at and grouping adds no variant.
+
 ### Head-major KV cache
 
 `SPYRE_ATTN_KV_LAYOUT=head_major` selects a second backend,

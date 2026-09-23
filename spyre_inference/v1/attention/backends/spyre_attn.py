@@ -102,6 +102,168 @@ def _record_block(name: str):
 _BATCHED_DECODE_MIN_UNIFORMITY: float = 0.0
 
 
+# --- KV page group width ------------------------------------------------------
+#
+# The prefill kernels walk the KV pages `page_group` at a time, so one online-softmax
+# update and one page gather serve a whole group instead of one page. The group rides
+# through the body as a batch axis of the matmuls and is reduced away at its end, the
+# shape batched decode gives its chunk -- no axis is merged, so both cache layouts take
+# the same body.
+#
+# The width is a fixed `_PAGE_GROUP_WIDTH` rather than the widest the hardware admits.
+# Sizing it from an LX capacity model was tried and is not worth its complexity: the
+# widths it returned were 8 for short queries and 2 for long ones, and 2 measured
+# *slower* than not grouping at all on the head-major layout. What is left below are
+# gates -- is grouping worth it here, does the device permit it -- not a choice between
+# widths.
+
+# The width. Measured end to end on AIU, each sample against its own baseline and its own
+# grouping-off control: token-major gained 12-81% on prompts of three or more prefill
+# chunks, and head-major -6.4%/-6.5% P99 ITL on two samples. The adjacent widths are both
+# worse -- 2 is a net loss on head-major (+4.1%, +4.6% P99 ITL), and 8 buys little over 4
+# while binding against the addressing span on more shapes.
+#
+# Those measurements predate the tiled page walk, whose body reduces a group instead of
+# concatenating it into one wide score matmul, so they carry the width's *ranking* rather
+# than its win: the numbers have to be re-measured on device before they are quoted.
+_PAGE_GROUP_WIDTH = 4
+
+# Fewest KV pages in a bucket for grouping to earn back its fixed cost. Measured end to
+# end on AIU (granite-3.3-8b kv8/qpk4, 60 aiops prompts at max_num_batched_tokens=512,
+# so every prefill chunk is padded to 512 query rows), paired per prompt.
+#
+# Without the floor, prompts whose whole KV context fits in 8 blocks were 21% SLOWER
+# than ungrouped -- 13/13 prompts, two independent replicates, at width 4 and at width
+# 8 alike -- while prompts of 3 or more prefill chunks gained 12-81%. With the floor
+# those same prompts land back on the ungrouped control (paired median ratio 1.0006,
+# inside the 1.0008 spread between two control replicates) and every longer prompt is
+# unchanged to within 0.6%, so declining grouping here costs nothing measurable.
+#
+# 16 rather than some finer value because the attention bucketer only ever presents
+# num_blocks in {1,2,4,8,16,32,64}: the crossover cannot be located between 8 and 16.
+# A page count rather than a token count because the saving grouping is after is one
+# fewer softmax update per page folded in.
+_MIN_GROUPED_BLOCKS = 16
+
+# The page gather's per-core span is an addressing range, not a footprint, so a few
+# MB of logical pages covers hundreds of MB of address space. Measured on AIU: the
+# span is this constant multiple of the gathered group's byte size, and is
+# independent of the sequence length and of the query length. Halving any one of
+# num_kv_heads, head_size or block_size halves it, as does halving the width.
+_GATHER_SPAN_INFLATION = 128
+
+# `work_division.MAX_SPAN_BYTES`, used only if it cannot be read from the compiler.
+_DEFAULT_MAX_SPAN_BYTES = 256 * 1024 * 1024
+
+
+def max_span_bytes() -> int:
+    """The device's per-core addressing-span limit.
+
+    Falls back to the value this was calibrated against if the constant moves, since a
+    missing ceiling must not take attention down; `test_max_span_bytes_comes_from_the_
+    compiler` fails when the import stops resolving.
+    """
+    try:
+        from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
+    except ImportError:
+        return _DEFAULT_MAX_SPAN_BYTES
+    return int(MAX_SPAN_BYTES)
+
+
+def max_span_width(*, num_kv_heads: int, head_size: int, block_size: int, element_size: int) -> int:
+    """Widest group whose page gather stays inside the per-core addressing span.
+
+    Exceeding this raises `Unsupported` at compile time rather than degrading, so it
+    is a hard ceiling and not a budget to trade against.
+    """
+    group_bytes = num_kv_heads * block_size * head_size * element_size
+    ceiling = max_span_bytes() // _GATHER_SPAN_INFLATION
+    return max(1, ceiling // max(1, group_bytes))
+
+
+def grouping_unsupported_reason(
+    *, num_kv_heads: int, num_queries_per_kv: int, compiled: bool
+) -> str | None:
+    """Why the toolchain refuses any width above 1 here, or None if it accepts one.
+
+    Both refusals are compile-time, both were mapped over a head-shape x width x
+    block-size grid on AIU:
+
+    * The DXP scheduler asserts ``out_reuse_dim.size() == 1``
+      (``dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:960``) whenever the grouped score
+      matmul has a singleton batch dim. ``q`` is ``[kv, qpk, Lq, D]`` against a
+      gathered ``[kv, 1, T, D]``, so it is ``num_queries_per_kv > 1`` that leaves the
+      scheduler a dim to reuse, and ``num_kv_heads == 1`` leaves it none either. Not a
+      head-count law: kv32/qpk1 fails and kv2/qpk4 passes. Holds in both compile
+      modes. MHA and MQA violate it by construction.
+    * Inductor raises "no mechanism to resolve stick incompatibility" on a Pointwise
+      for widths above 1 in eager mode, where each group is dispatched separately.
+      Every such shape compiles and runs under ``torch.compile``.
+
+    Both were measured on the grouped score matmul as it was *then*: one wide
+    ``[Lq, group * block_size]`` product. The tiled walk keeps the group as a batch dim
+    instead, which may well hand the scheduler the reuse dim it wanted, so these gates
+    are conservative here rather than known to still bind. Re-mapping the grid on device
+    is what would let MHA and MQA group.
+    """
+    if not compiled:
+        return "eager attention cannot resolve the grouped stick layout"
+    if num_kv_heads <= 1 or num_queries_per_kv <= 1:
+        return (
+            f"num_kv_heads={num_kv_heads} num_queries_per_kv={num_queries_per_kv}: "
+            "the DXP scheduler needs both above 1"
+        )
+    return None
+
+
+def derive_page_group(
+    *,
+    num_blocks: int,
+    padded_query_len: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    head_size: int,
+    block_size: int,
+    element_size: int,
+    compiled: bool = True,
+) -> int:
+    """`_PAGE_GROUP_WIDTH` where grouping pays and the device allows it, else 1.
+
+    Keyed on the bucket's `(num_blocks, padded_query_len)`, both of which already
+    specialize the compiled graph, so choosing per bucket adds no warmup variants.
+
+    Returns 1 for single-row queries, where the page transfer rather than the
+    softmax bookkeeping is the cost; for buckets below `_MIN_GROUPED_BLOCKS`, where
+    grouping measures slower than not grouping; for page counts the width does not
+    divide, which a tile walk cannot express; for shapes whose pages are too large for
+    the width to fit the addressing span; and wherever the toolchain refuses grouping
+    outright. `compiled` defaults to the mode that serves.
+
+    A free function taking a shape rather than a method reading `self`: the gates are
+    shape laws carrying device measurements, and this way each can be tested over a
+    grid of shapes without standing up a backend.
+    """
+    if padded_query_len <= 1 or num_blocks < _MIN_GROUPED_BLOCKS:
+        return 1
+    if num_blocks % _PAGE_GROUP_WIDTH:
+        return 1
+    if grouping_unsupported_reason(
+        num_kv_heads=num_kv_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        compiled=compiled,
+    ):
+        return 1
+    span_limit = max_span_width(
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        element_size=element_size,
+    )
+    if span_limit < _PAGE_GROUP_WIDTH:
+        return 1
+    return _PAGE_GROUP_WIDTH
+
+
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
@@ -1119,6 +1281,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
+        # Read at construction: forward() runs past a custom-op boundary that loses the
+        # config. The builder asserts it matches the KV cache spec's block size.
+        self.block_size: int = get_current_vllm_config().cache_config.block_size
+        self._configure_page_group(sliding_window)
+
         # Resolved before the ALiBi slopes below, which are built at this dtype.
         # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
         _dtype = get_current_vllm_config().model_config.dtype
@@ -1206,6 +1373,108 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"padded_query_len={padded_query_len} needs a query buffer wider than "
             "itself; a gather selecting its whole source faults the device"
         )
+
+    def _configure_page_group(self, sliding_window: int | None) -> None:
+        """Resolve the KV page group policy once, before anything is traced.
+
+        Leaves `self._page_group` at 0 for "derive per bucket" (see `derive_page_group`)
+        or at the width `SPYRE_ATTN_PAGE_GROUP` pinned, and states which in the log so a
+        run's own output says what produced it.
+        """
+        self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
+        if self._page_group < 0:
+            raise ValueError(f"SPYRE_ATTN_PAGE_GROUP must be >= 0, got {self._page_group}")
+        self._derived_page_groups: dict[tuple[int, int], int] = {}
+
+        # A window leaves the block count unpadded (see _record_one), so its buckets are
+        # whatever the windows realize rather than the recorder's power-of-two ladder, and
+        # grouping has not been measured on them at all.
+        if sliding_window is not None:
+            if self._page_group > 1:
+                raise ValueError(
+                    "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with sliding-window "
+                    "attention; use SPYRE_ATTN_PAGE_GROUP=1"
+                )
+            # Derivation must not fail a windowed model just because the width was left
+            # to us.
+            self._page_group = 1
+
+        # Grouping is also refused outright by the toolchain for some head shapes and in
+        # eager mode (see `grouping_unsupported_reason`). Resolved once so the banner can
+        # say why a derived width never exceeds 1, and so a pinned width that is heading
+        # for a compile-time assertion says so before warmup does.
+        self._no_grouping_reason = grouping_unsupported_reason(
+            num_kv_heads=self.num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            compiled=self._compile_attn,
+        )
+        if self._page_group > 1 and self._no_grouping_reason:
+            # Warn rather than raise: the law is empirical, and a pinned width is the
+            # escape hatch for exactly the case where it is wrong.
+            logger.warning_once(
+                "SPYRE_ATTN_PAGE_GROUP=%d is not expected to compile here (%s); "
+                "use 0 to let the hardware choose",
+                self._page_group,
+                self._no_grouping_reason,
+            )
+
+        if self._page_group:
+            policy = f"pinned to {self._page_group} (SPYRE_ATTN_PAGE_GROUP)"
+        elif self._no_grouping_reason:
+            policy = f"derived as 1, grouping unavailable: {self._no_grouping_reason}"
+        else:
+            policy = "derived per attention bucket from the shape (SPYRE_ATTN_PAGE_GROUP=0)"
+        logger.info_once("KV page group: %s", policy)
+
+    def _page_group_for_query(self, query_len: int, num_blocks: int) -> int:
+        """Group pages only for multi-token prefill/chunked-prefill sequences.
+
+        At one query row the page transfer, not the online-softmax bookkeeping, is the
+        cost, so grouping buys nothing there and would fragment the decode variants the
+        recorder covers.
+
+        With ``SPYRE_ATTN_PAGE_GROUP=0`` the width comes from the shape. It is keyed on the
+        same ``(num_blocks, query_len)`` the recorder buckets on and that Dynamo already
+        specializes, so deriving per bucket adds no warmup variants.
+        """
+        if query_len <= 1:
+            return 1
+        if self._page_group:
+            if num_blocks % self._page_group:
+                # A tile walk has no ragged final tile, and a width that does not divide
+                # the page count would raise inside the kernel.
+                logger.warning_once(
+                    "SPYRE_ATTN_PAGE_GROUP=%d does not divide num_blocks=%d; "
+                    "that bucket runs one page per update",
+                    self._page_group,
+                    num_blocks,
+                )
+                return 1
+            return self._page_group
+        key = (num_blocks, query_len)
+        width = self._derived_page_groups.get(key)
+        if width is None:
+            width = derive_page_group(
+                num_blocks=num_blocks,
+                padded_query_len=query_len,
+                num_kv_heads=self.num_kv_heads,
+                num_queries_per_kv=self.num_queries_per_kv,
+                head_size=self.head_size,
+                block_size=self.block_size,
+                element_size=self.model_dtype.itemsize,
+                compiled=self._compile_attn,
+            )
+            self._derived_page_groups[key] = width
+            # Once per bucket that actually groups: a width of 1 is the unremarkable
+            # case, and every layer would otherwise log the whole bucket grid.
+            log = logger.info_once if width > 1 else logger.debug
+            log(
+                "derived page group %d for num_blocks=%d padded_query_len=%d",
+                width,
+                num_blocks,
+                query_len,
+            )
+        return width
 
     def _batched_decode_supported(self) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
@@ -1727,6 +1996,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.num_kv_heads,
             self.head_size,
             self.logits_soft_cap,
+            # Chosen here, where warmup and serving converge, so both compile a bucket at
+            # the same width and grouping adds no recorded variant.
+            self._page_group_for_query(padded_query_len, num_blocks),
             alibi_stack,
             out,
         )
