@@ -182,12 +182,24 @@ def max_span_width(*, num_kv_heads: int, head_size: int, block_size: int, elemen
 
 
 def grouping_unsupported_reason(
-    *, num_kv_heads: int, num_queries_per_kv: int, compiled: bool
+    *, num_kv_heads: int, num_queries_per_kv: int, compiled: bool, tiled: bool = False
 ) -> str | None:
     """Why the toolchain refuses any width above 1 here, or None if it accepts one.
 
-    Both refusals are compile-time, both were mapped over a head-shape x width x
-    block-size grid on AIU:
+    Every refusal is compile-time:
+
+    * A tile wider than one page makes the page gather's index tile-relative, and the
+      tiled lowering cannot resolve its own induction variable there: ``Unsupported:
+      indirect symbol u0 not found in indirect_sizes``
+      (``torch_spyre/_inductor/views.py:379``). Mapped on device 2026-09-23: it is the
+      loop advancing that breaks it, so width > 1 fails from two trips on and a width
+      covering the whole context in one trip still compiles, while width 1 -- what the
+      tiled walk ships -- is fine at any trip count. Both cache layouts, and the same
+      kernels group correctly under the Python page walk. Lifting this is torch-spyre
+      work: the tiled-indirect-access gap that
+      ``2026-09-18_for_each_tile_batched_chunking_plan.md`` §4.4 describes.
+
+    The remaining two were mapped over a head-shape x width x block-size grid on AIU:
 
     * The DXP scheduler asserts ``out_reuse_dim.size() == 1``
       (``dcg/dcg_fe/scheduler/L3DlOpsScheduler.cpp:960``) whenever the grouped score
@@ -206,6 +218,8 @@ def grouping_unsupported_reason(
     are conservative here rather than known to still bind. Re-mapping the grid on device
     is what would let MHA and MQA group.
     """
+    if tiled:
+        return "the tiled page walk cannot lower a gather wider than one page"
     if not compiled:
         return "eager attention cannot resolve the grouped stick layout"
     if num_kv_heads <= 1 or num_queries_per_kv <= 1:
@@ -226,6 +240,7 @@ def derive_page_group(
     block_size: int,
     element_size: int,
     compiled: bool = True,
+    tiled: bool = False,
 ) -> int:
     """`_PAGE_GROUP_WIDTH` where grouping pays and the device allows it, else 1.
 
@@ -237,7 +252,8 @@ def derive_page_group(
     grouping measures slower than not grouping; for page counts the width does not
     divide, which a tile walk cannot express; for shapes whose pages are too large for
     the width to fit the addressing span; and wherever the toolchain refuses grouping
-    outright. `compiled` defaults to the mode that serves.
+    outright, which the tiled page walk does. `compiled` and `tiled` default to the mode
+    that serves.
 
     A free function taking a shape rather than a method reading `self`: the gates are
     shape laws carrying device measurements, and this way each can be tested over a
@@ -251,6 +267,7 @@ def derive_page_group(
         num_kv_heads=num_kv_heads,
         num_queries_per_kv=num_queries_per_kv,
         compiled=compiled,
+        tiled=tiled,
     ):
         return 1
     span_limit = max_span_width(
@@ -1407,6 +1424,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_kv_heads=self.num_kv_heads,
             num_queries_per_kv=self.num_queries_per_kv,
             compiled=self._compile_attn,
+            tiled=tile_loop.USE_FOR_EACH_TILE,
         )
         if self._page_group > 1 and self._no_grouping_reason:
             # Warn rather than raise: the law is empirical, and a pinned width is the
@@ -1463,6 +1481,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 block_size=self.block_size,
                 element_size=self.model_dtype.itemsize,
                 compiled=self._compile_attn,
+                tiled=tile_loop.USE_FOR_EACH_TILE,
             )
             self._derived_page_groups[key] = width
             # Once per bucket that actually groups: a width of 1 is the unremarkable

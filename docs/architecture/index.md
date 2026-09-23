@@ -239,6 +239,9 @@ and both cache layouts run the same body. `SPYRE_ATTN_PAGE_GROUP=0` (the default
 the width per attention bucket (`derive_page_group`): it is the one measured width where
 grouping pays and the toolchain permits it, and 1 for decode, for the small KV buckets,
 for page counts the width does not divide, and wherever a compile-time limit refuses it.
+One of those limits is `SPYRE_ATTN_FOR_EACH_TILE=1` itself: a tile wider than one page
+makes the page gather's index tile-relative, which the tiled lowering cannot resolve, so
+the two optimizations do not compose yet and grouping declines under the tiled walk.
 Pinning a value overrides the derivation, which is how a measurement is reproduced. The
 width is chosen where warmup and serving converge, so a bucket is recorded at the width it
 dispatches at and grouping adds no variant.

@@ -2315,6 +2315,14 @@ def test_derived_page_group_is_one_in_eager_mode():
     assert derive_page_group(num_blocks=64, padded_query_len=128, compiled=False, **_GRANITE) == 1
 
 
+def test_derived_page_group_is_one_on_the_tiled_page_walk():
+    """A tile wider than one page makes the gather index tile-relative, and the tiled
+    lowering cannot resolve its own induction variable there once the loop advances
+    (device, 2026-09-23, both layouts: ``indirect symbol u0 not found in
+    indirect_sizes``). The same widths group correctly under the Python page walk."""
+    assert derive_page_group(num_blocks=64, padded_query_len=128, tiled=True, **_GRANITE) == 1
+
+
 def test_grouping_unsupported_reason_names_the_limit():
     """The reason reaches the log, so it has to say which limit refused."""
     assert grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=4, compiled=True) is None
@@ -2322,6 +2330,21 @@ def test_grouping_unsupported_reason_names_the_limit():
     assert eager is not None and "eager" in eager
     mha = grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=1, compiled=True)
     assert mha is not None and "num_queries_per_kv=1" in mha
+    tiled = grouping_unsupported_reason(
+        num_kv_heads=8, num_queries_per_kv=4, compiled=True, tiled=True
+    )
+    assert tiled is not None and "tiled page walk" in tiled
+
+
+def test_page_group_auto_is_one_under_the_tiled_page_walk(default_vllm_config, monkeypatch):
+    """The two optimizations do not compose yet, and the default must not pick a width
+    that fails at warmup -- where a failed variant is only a warning, so the engine
+    would come up healthy and then die on the first prefill."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", True)
+    impl = _gqa_impl()
+
+    assert impl._page_group_for_query(128, 64) == 1
 
 
 def _gqa_impl(**kwargs) -> SpyreAttentionImpl:

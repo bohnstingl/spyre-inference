@@ -85,7 +85,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # derives the width per attention bucket from the shape and the toolchain's limits;
     # see `derive_page_group` in v1/attention/backends/spyre_attn.py. Must be >= 0, and
     # a width above 1 must divide the bucket's page count -- a tile walk has no ragged
-    # final tile -- or that bucket falls back to 1.
+    # final tile -- or that bucket falls back to 1. Not compatible with
+    # SPYRE_ATTN_FOR_EACH_TILE=1, which cannot lower a gather wider than one page: the
+    # derivation declines there, and pinning a width past it warns.
     "SPYRE_ATTN_PAGE_GROUP": lambda: int(os.getenv("SPYRE_ATTN_PAGE_GROUP", "0")),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
