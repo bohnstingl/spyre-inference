@@ -1214,6 +1214,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # dispatch to. Set SPYRE_BATCHED_DECODE=0 to force the loop for all sizes.
         if not envs.SPYRE_BATCHED_DECODE:
             return False
+        # A multi-block tile makes the page gather's index tile-relative. The
+        # tiled lowering cannot yet resolve that induction symbol, so the two
+        # optimizations do not compose (the same limitation as grouped KV pages).
+        if tile_loop.USE_FOR_EACH_TILE:
+            return False
         # The 2-D page index lowers to aten.index, which upcasts the int32 index
         # to int64 and fails eager; eager takes the per-seq loop instead.
         if not self._compile_attn:

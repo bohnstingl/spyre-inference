@@ -1632,6 +1632,20 @@ def test_spyre_attn_batched_decode_correctness(
     )
 
 
+def test_batched_decode_is_unsupported_with_tiled_attention(
+    default_vllm_config, enable_batched_decode
+) -> None:
+    """The tiled lowering cannot resolve the batched gather's advancing index."""
+    impl = SpyreAttentionImpl(
+        num_heads=4,
+        head_size=64,
+        scale=0.125,
+        num_kv_heads=2,
+    )
+
+    assert not impl._batched_decode_supported()
+
+
 @pytest.mark.parametrize(
     "configure_device",
     [pytest.param("spyre", id="device_spyre")],
