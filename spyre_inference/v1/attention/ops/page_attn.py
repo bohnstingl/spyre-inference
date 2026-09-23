@@ -16,6 +16,7 @@
 
 import torch
 
+from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 
@@ -122,10 +123,13 @@ def page_attn_kernel(
             ), None
 
         tile_max, tile_sum, tile_output = carry
-        # Read tile_max before the maximum that supersedes it, or the tiled lowering
-        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
-        rescale = torch.exp(-torch.relu(scores_max - tile_max))
         new_max = torch.maximum(tile_max, scores_max)
+        if tile_loop.USE_FOR_EACH_TILE:
+            # Read tile_max before the maximum that supersedes it, or the tiled
+            # lowering copies the whole carry every trip.
+            rescale = torch.exp(-torch.relu(scores_max - tile_max))
+        else:
+            rescale = torch.exp(tile_max - new_max)
         tile_probs = torch.exp(scores - new_max)
         new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
         new_output = tile_output * rescale + torch.matmul(tile_probs, v_page_4d)
