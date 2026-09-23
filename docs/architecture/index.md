@@ -220,6 +220,17 @@ buckets. A single step can carry a mix of prefill and decode sequences; each seq
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
 `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
+Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
+time, so a graph holds one copy of the attention body per page and compile time grows
+with KV length. `SPYRE_ATTN_FOR_EACH_TILE=1` walks that axis with torch-spyre's
+`for_each_tile` instead, leaving one body plus a tile spec, and the same applies to the
+batched-decode kernel's walk over block chunks. Both kernels carry the online softmax as
+a `(tile_max, tile_sum, tile_output)` triple either way; `walk_tiles` picks the walk and
+is the only place that reads the variable, so `SPYRE_ATTN_FOR_EACH_TILE=0` (the default)
+runs the identical bodies under the Python loops and is the rollback path. The switch is
+read once at import, because it decides the `fullgraph` setting the tiled walk needs —
+setting it after `spyre_inference` is imported has no effect.
+
 ### Head-major KV cache
 
 `SPYRE_ATTN_KV_LAYOUT=head_major` selects a second backend,
