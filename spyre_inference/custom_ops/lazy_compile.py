@@ -43,6 +43,15 @@ class CompileOutermost:
     config context is live; ``enforce_eager`` arrives as mode ``NONE``.
     """
 
+    allow_inference_recompiles: bool = False
+    """Set on subclasses whose kernel legitimately recompiles per input shape.
+
+    ``compile_when_outermost`` registers its kernel with the compile guard so a
+    post-warmup compile is flagged. A layer that compiles per distinct shape *by
+    design* (``SpyreConv2d``, one graph per ``(H, W)``) would make that a permanent
+    false positive, so it opts out instead of being allowlisted from the outside.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         mode = get_cached_compilation_config().mode
@@ -75,6 +84,10 @@ def compile_when_outermost(method: F | None = None, *, force_compile: bool = Fal
                     method.__name__,
                     "force_compile is set" if force_compile else "no enclosing graph covers it",
                 )
+                if not self.allow_inference_recompiles:
+                    from spyre_inference.v1.worker import compile_guard
+
+                    compile_guard.watch(method, f"{type(self).__name__}.{method.__name__}")
                 # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
                 self.spyre_compiled_kernel = torch.compile(
                     method.__get__(self),
