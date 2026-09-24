@@ -2357,8 +2357,13 @@ def test_page_group_auto_derives_a_width_per_bucket(default_vllm_config, monkeyp
 
     Per bucket rather than once per layer because the page count and the query length
     gate it, and both already specialize the compiled graph.
+
+    Pins the Python walk, as its tiled sibling above pins the tiled one: grouping is
+    only available there, so leaving the walk to `SPYRE_ATTN_FOR_EACH_TILE` would make
+    this assert the default rather than the derivation.
     """
     monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     impl = _gqa_impl()
 
     assert impl._page_group_for_query(1, 64) == 1
