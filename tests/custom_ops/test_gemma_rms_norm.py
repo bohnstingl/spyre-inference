@@ -28,6 +28,7 @@ import sys
 
 import pytest
 import torch
+from torch._inductor.exc import InductorError
 
 # vLLM's own float16 bound for these ops (ir/ops/layernorm.py `override_tolerance`).
 _ATOL, _RTOL = 1e-2, 2e-3
@@ -146,6 +147,59 @@ def test_spyre_gemma_rmsnorm_accumulates_the_variance_in_fp32(default_vllm_confi
 
     torch.testing.assert_close(actual, fp32_oracle.float(), atol=_ATOL, rtol=_RTOL)
     assert (actual - fp16_oracle.float()).abs().max() > 1.0
+
+
+@pytest.mark.rmsnorm
+@pytest.mark.parametrize("use_residual", [False, True])
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(
+            torch.float16,
+            marks=pytest.mark.xfail(
+                strict=True,
+                raises=InductorError,
+                reason=(
+                    "fp16 activations reach the trailing weight multiply as a staggered-EA "
+                    "fp32 convert (torch-spyre#2971) that the STANDARD [hidden] weight cannot "
+                    "broadcast against, so eager lowering raises 'Multi-arg pointwise with "
+                    "mixed EA'. This is what force_compile=True exists for; when it XPASS-es, "
+                    "drop force_compile from SpyreGemmaRMSNorm."
+                ),
+            ),
+        ),
+        torch.float32,
+    ],
+)
+def test_gemma_rmsnorm_eager_support_is_fp32_only(default_vllm_config, dtype, use_residual):
+    """Eager (uncompiled) ``forward_native`` lowers in fp32 but not in fp16.
+
+    Calls the undecorated upstream method so ``compile_when_outermost`` cannot compile
+    it, which is the one path ``force_compile=True`` denies the layer.
+    """
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    _install_worker_torch_wrap()
+
+    eps = 1e-6
+    hidden_size = 256
+    torch.manual_seed(0)
+
+    x = torch.randn(4, hidden_size, dtype=dtype)
+    residual = torch.randn(4, hidden_size, dtype=dtype) if use_residual else None
+    layer = GemmaRMSNorm(hidden_size, eps=eps).to(dtype)
+    layer.weight.data = torch.randn(hidden_size, dtype=dtype)
+
+    expected = reference_gemma_rms_norm(x, layer.weight.data, eps, residual)
+
+    layer.to("spyre")
+    actual = GemmaRMSNorm.forward_native(
+        layer, x.to("spyre"), residual.to("spyre") if use_residual else None
+    )
+
+    normed = actual[0] if use_residual else actual
+    expected_norm = expected[0] if use_residual else expected
+    torch.testing.assert_close(normed.cpu().float(), expected_norm.float(), atol=_ATOL, rtol=_RTOL)
 
 
 @pytest.mark.rmsnorm

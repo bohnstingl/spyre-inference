@@ -32,6 +32,7 @@ from spyre_inference.custom_ops.head_pad import (
     fix_padded_qk_norm_eps,
     install_padded_head_dim,
     verify_padded_head_dim,
+    verify_padded_qk_norm_weights,
 )
 
 _ORIG, _PADDED = 64, 128
@@ -245,6 +246,37 @@ def test_fix_padded_qk_norm_eps_scales_only_qk_norms():
 
     assert q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
     assert other_q_norm.variance_epsilon == pytest.approx(1e-6)
+
+
+def _qk_norm_model(norm_cls):
+    """A model whose ``q_norm`` is a padded-width ``norm_cls``."""
+    model = torch.nn.Module()
+    model.q_norm = norm_cls(_PADDED, eps=1e-6)
+    return model
+
+
+def test_verify_padded_qk_norm_weights_rejects_a_zero_centred_norm(default_vllm_config):
+    """A GemmaRMSNorm QK-norm cannot be padded by rescaling its weight.
+
+    Its multiplier is ``1 + w``, so the ``sqrt(orig/padded)`` folded into ``w`` lands
+    in the wrong place and nothing downstream raises -- hence the explicit guard.
+    """
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
+
+    cfg = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+
+    with pytest.raises(NotImplementedError, match="zero-centred"):
+        verify_padded_qk_norm_weights(_qk_norm_model(GemmaRMSNorm), cfg)
+
+    # The plain norm the folding was written for stays accepted.
+    verify_padded_qk_norm_weights(_qk_norm_model(RMSNorm), cfg)
+
+
+def test_verify_padded_qk_norm_weights_is_a_noop_without_padding(default_vllm_config):
+    """No ``_spyre_orig_head_dim`` means the platform never padded this model."""
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    verify_padded_qk_norm_weights(_qk_norm_model(GemmaRMSNorm), SimpleNamespace(head_dim=_PADDED))
 
 
 def test_pad_weight_leaves_a_norm_of_another_width_alone():
