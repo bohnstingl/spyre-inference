@@ -17,10 +17,17 @@
 import pytest
 import torch
 
+from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
 EXTENT, WIDTH = 8, 3
 INIT = (torch.zeros(1),)
+
+
+@pytest.fixture(autouse=True)
+def _use_python_walk(monkeypatch):
+    """These contract tests inspect calls, so use the observable fallback walk."""
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
 
 
 def _recording_body(log: list):

@@ -32,14 +32,14 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GUARD: str = "off"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
-    SPYRE_ATTN_FOR_EACH_TILE: bool = False
+    SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_PAGE_GROUP: int = 0
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_ATTN_MAX_CORES: int = 0
-    SPYRE_BATCHED_DECODE: bool = True
+    SPYRE_BATCHED_DECODE: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
@@ -78,8 +78,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
     # When "1", paged attention walks KV pages and batched decode walks logical
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
-    # one loop body. Off by default: the same bodies run under Python loops.
-    "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "0"))),
+    # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
+    "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
     # Adjacent KV pages per online-softmax update for query_len > 1, i.e. the width of
     # one page-walk tile. Decode and one-token prefill always use 1. 0 (the default)
     # derives the width per attention bucket from the shape and the toolchain's limits;
@@ -106,10 +106,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
-    # When "1" (default), enables the batched multi-sequence decode kernel for
+    # When "1", enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
-    # per-seq loop either way. "0" forces the loop for all batch sizes.
-    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
+    # per-seq loop either way. Disabled by default because the batched kernel's
+    # multi-block tile is not supported by the default tiled attention walk.
+    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
