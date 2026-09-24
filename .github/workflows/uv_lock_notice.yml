@@ -72,7 +72,7 @@ jobs:
                   '',
                   '**Please confirm in a reply:**',
                   '',
-                  `- ✅ **Intentional** (a dependency bump, or a deliberate \`pyproject.toml\` change) — say so here and request a review from a dependency maintainer (see \`CODEOWNERS\`).`,
+                  `- ✅ **Intentional** (a dependency bump, or a deliberate \`pyproject.toml\` change) — say so here.`,
                   '- ↩️ **Not intentional** — drop the change:',
                   '',
                   '  ```bash',
