@@ -218,10 +218,10 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
 variant `SpyreAttnBucketer` can produce — the product of the KV-length and query-length
 buckets below — so a served request always lands on an already-compiled kernel. When the
-batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup also
-records its variants, the product of the KV-length (`num_blocks`) and num-sequences
-buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
-padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
+batched-decode kernel is explicitly enabled (`SPYRE_BATCHED_DECODE=1`; it is disabled by
+default), warmup also records its variants, the product of the KV-length (`num_blocks`)
+and num-sequences buckets. A single step can carry a mix of prefill and decode sequences;
+each sequence is padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
 `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
 Under `dynamic=False` the Python loop over a sequence's KV pages is unrolled at trace
@@ -273,9 +273,9 @@ attention even under `--enforce-eager` — attention compiles in its own domain,
 of the model still runs eager. Because the bmm's output axes
 (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
 mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
-at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries neither ALiBi
-(which needs a bias tile per query group) nor batched decode (whose kernel gathers whole
-pages from the unfolded cache) — both are available on the token-major layout.
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. The layout does not support ALiBi,
+which needs a bias tile per query group. Batched decode uses a layout-specific kernel that
+gathers whole pages from the head-major cache.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
 planner's own verdicts. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
@@ -289,8 +289,8 @@ Key constraints:
   to `max_model_len` (avoids per-step recompilation on Spyre)
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
-- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
-  default; not on the head-major layout):
+- **Num-sequences bucketing** (batched-decode kernel only, explicitly enabled with
+  `SPYRE_BATCHED_DECODE=1`; disabled by default):
   powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
   kernel is recorded over the `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
