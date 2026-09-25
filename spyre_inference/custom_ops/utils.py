@@ -20,6 +20,7 @@ dtype conversion.
 """
 
 from functools import lru_cache
+from typing import Sequence
 
 import torch
 from torch.utils._pytree import tree_map
@@ -29,7 +30,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
-def row_outermost_layout(shape: torch.Size, dtype: torch.dtype):
+def row_outermost_layout(shape: Sequence[int], dtype: torch.dtype):
     """Layout with dim 0 whole at device position 0, last dim as the stick axis.
 
     Spyre needs an indexed dim outermost; the default tiled layout places it
