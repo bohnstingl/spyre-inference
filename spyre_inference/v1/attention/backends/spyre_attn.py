@@ -1880,7 +1880,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if active_block_indices_all is not None:
                 active_bs = active_block_indices_all[seq_idx]
             elif padded_num_blocks is not None:
-                active_bs = list(range(padded_num_blocks[seq_idx]))
+                # Repeat the last real block rather than counting past it, as the
+                # sliding-window branch does: block_table is only
+                # ceil(max_model_len / block_size) wide, which a floored bucket exceeds.
+                real_bs = (kv_len + block_size - 1) // block_size
+                active_bs = list(range(real_bs)) + [real_bs - 1] * (
+                    padded_num_blocks[seq_idx] - real_bs
+                )
             else:
                 active_bs = list(range((kv_len + block_size - 1) // block_size))
 
