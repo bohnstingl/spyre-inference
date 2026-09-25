@@ -73,9 +73,7 @@ def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
     def decorator(method: F) -> F:
         @functools.wraps(method)
         def wrapper(self, *args, **kwargs):
-            if torch.compiler.is_compiling() or (
-                not force and not self.spyre_compile_enabled
-            ):
+            if torch.compiler.is_compiling() or (not force and not self.spyre_compile_enabled):
                 return method(self, *args, **kwargs)
             if self.spyre_compiled_kernel is None:
                 logger.info_once(
