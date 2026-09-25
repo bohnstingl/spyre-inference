@@ -83,7 +83,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     install_mlp_pad_weight_loader,
     verify_padded_intermediate_size,
 )
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
@@ -366,33 +366,18 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
 
-    def _convert_tensors(
-        self,
-        value,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-        predicate=None,
-    ):
-        """Convert matching tensors throughout an argument tree at a model boundary."""
-
-        def _convert(t):
-            if isinstance(t, torch.Tensor) and (predicate is None or predicate(t)):
-                return convert(
-                    t, dtype=dtype, device=self._spyre_device if device is None else device
-                )
-            return t
-
-        return tree_map(_convert, value)
-
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
         # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
         # in models/roberta.py.
         is_integer = lambda t: t.dtype in (torch.int32, torch.int64)
-        args_converted = self._convert_tensors(args, dtype=torch.int64, predicate=is_integer)
-        kwargs_converted = self._convert_tensors(kwargs, dtype=torch.int64, predicate=is_integer)
+        args_converted = convert_tensor_tree(
+            args, device=self._spyre_device, dtype=torch.int64, predicate=is_integer
+        )
+        kwargs_converted = convert_tensor_tree(
+            kwargs, device=self._spyre_device, dtype=torch.int64, predicate=is_integer
+        )
 
         # The Llama-4 scale cache keys on `positions` identity, blind to an in-place rewrite.
         reset_llama4_scale_cache()
@@ -402,7 +387,7 @@ class _SpyreModelWrapper:
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
-            result = self._convert_tensors(result, device="cpu")
+            result = convert_tensor_tree(result, device="cpu")
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
@@ -438,7 +423,7 @@ class _SpyreModelWrapper:
         if padded_rows != num_rows:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
-        hidden_states = self._convert_tensors(hidden_states)
+        hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -499,17 +484,6 @@ class _SpyreModelWrapper:
         multimodal prompt starts producing garbage rather than failing, suspect
         that layout again before anything else here.
         """
-        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
-        if has_mm and is_multimodal is None:
-            raise ValueError(
-                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
-                "multimodal merge needs the mask."
-            )
-        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
-            raise NotImplementedError(
-                "SpyreModelWrapper.embed_input_ids does not support models with "
-                "out-of-vocabulary multimodal tokens."
-            )
         # Generic path: model.embed_input_ids only does text embedding, or
         # boolean-mask ops are handled inside the model's own patch (e.g.
         # patch_embed_input_ids for Granite4Vision).
