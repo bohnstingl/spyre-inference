@@ -129,9 +129,15 @@ Two adaptations worth knowing:
   for an out-of-tree platform (it selects `UnquantizedMoeBackend.OOT` — no kernel — and
   leaves `process_weights_after_loading` to the plugin). A `CustomOp.register_oot`
   replacement for `UnquantizedFusedMoEMethod` computes the experts in two Spyre forms —
-  gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
-  in the post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
-  `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
+  gathered, which reads only a token's routed experts but lowers one token at a time, and
+  all-expert persistent. Dispatch looks only at the packed token count: up to
+  `SPYRE_MOE_GATHERED_MAX_TOKENS` — a decode batch, or a prompt that buckets that short — the
+  gathered form is driven once per token, and above it the all-expert form takes the whole
+  batch in one call. A batch whose rows are not stick-addressable takes the all-expert form
+  whatever its size, since each row's storage offset has to span whole sticks for the compiled
+  loop to address it.
+  In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
+  the `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
   since the device cannot hold both layouts at once. Tensor parallelism needs nothing
   further: upstream shards each expert's intermediate dim, so the forms just see a
   narrower `M` — zero-widened to whole sticks where a shard lands mid-stick — and
@@ -195,7 +201,10 @@ grows with layer count.
 
 ## Attention Backend
 
-The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations
+Decoder attention has two backends, which differ only in how a page is laid out; the
+default is the head-major one described below. `SpyreAttentionBackend` is the token-major
+layout (`SPYRE_ATTN_KV_LAYOUT=token_major`) and the structure both share, so it is
+described first. It implements paged attention using pure PyTorch operations
 (no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
 `[num_blocks, block_size, num_kv_heads, head_size]` — the shape
 `SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
@@ -222,9 +231,9 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
 variant `SpyreAttnBucketer` can produce — the product of the KV-length and query-length
 buckets below — so a served request always lands on an already-compiled kernel. When the
-batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup also
-records its variants, the product of the KV-length (`num_blocks`) and num-sequences
-buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
+batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default, which under the
+default tiled walk means the head-major layout) warmup also records its variants, the
+product of the KV-length (`num_blocks`) and num-sequences buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
 `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
@@ -241,8 +250,8 @@ setting it after `spyre_inference` is imported has no effect.
 
 ### Head-major KV cache
 
-`SPYRE_ATTN_KV_LAYOUT=head_major` selects a second backend,
-`SpyreHeadMajorAttentionBackend`, that stores a page as
+`SpyreHeadMajorAttentionBackend` is the default decoder backend
+(`SPYRE_ATTN_KV_LAYOUT=head_major`). It stores a page as
 `[num_blocks, num_kv_heads, block_size, head_size]` instead. The page then arrives in the
 shape the matmuls want, so the per-page permute in step 3 disappears — that is the whole
 point of the layout. It moves the transpose to the write: a token's KV heads are
@@ -277,9 +286,11 @@ attention even under `--enforce-eager` — attention compiles in its own domain,
 of the model still runs eager. Because the bmm's output axes
 (`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
 mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
-at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries neither ALiBi
-(which needs a bias tile per query group) nor batched decode (whose kernel gathers whole
-pages from the unfolded cache) — both are available on the token-major layout.
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries no ALiBi (which
+needs a bias tile per query group), so an ALiBi model needs `token_major`. Batched decode
+runs the other way round: its page index is uploaded one entry per stick here, which is
+what the tiled walk needs, so the batched kernel is reached on this layout and declined on
+token-major until that port lands.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
 planner's own verdicts. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
@@ -294,7 +305,7 @@ Key constraints:
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
-  default; not on the head-major layout):
+  default; under the default tiled walk, the head-major layout only):
   powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
   kernel is recorded over the `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
