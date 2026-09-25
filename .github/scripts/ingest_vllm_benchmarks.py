@@ -520,6 +520,8 @@ def _write_artifact_results(client, db: str, rows, run_id_value: str, rpm_lock: 
         # BENCHMARKS not metrics: 26 metrics of one benchmark is one measurement, so counting
         # metrics would inflate every perf leg ~26x.
         benchmarks = len({json.loads(r["extra"]).get("test_name", "") for r in rows})
+        # Suite wall clock: sum of each throughput-schema file's own elapsed_time metric.
+        duration_s = sum(r["actual"] for r in rows if r.get("metric") == "elapsed_time")
         props = {
             "source": "gha",
             # run_url is THE link key across the whole v2 schema -- one key for a Jenkins build
@@ -547,7 +549,7 @@ def _write_artifact_results(client, db: str, rows, run_id_value: str, rpm_lock: 
                     "test_type": "perf",
                     "state": "passed",
                     "arch": canonical_arch(arch),
-                    "duration_s": 0.0,
+                    "duration_s": duration_s,
                     "props": props,
                 }
                 for aid in ids
