@@ -117,8 +117,8 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
 
     Both modes: `CompileOutermost` samples the mode at construction, so under
-    `enforce_eager` the `compile_when_outermost` kernels fall through to eager — except
-    the norms, which pass `force_compile=True` and compile in either mode — and the
+    `enforce_eager` the `maybe_compile` kernels fall through to eager — except the
+    norms, which pass `force=True` and compile in either mode — and the
     compiled path — the repo default — goes uncovered.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and

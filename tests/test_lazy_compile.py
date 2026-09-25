@@ -30,7 +30,7 @@ from vllm.config import CompilationMode
 from spyre_inference.custom_ops import lazy_compile
 from spyre_inference.custom_ops.lazy_compile import (
     CompileOutermost,
-    compile_when_outermost,
+    maybe_compile,
 )
 
 
@@ -66,7 +66,7 @@ class _Norm(CompileOutermost, nn.Module):
         super().__init__()
         self.calls = 0
 
-    @compile_when_outermost
+    @maybe_compile
     def kernel(self, x: torch.Tensor) -> torch.Tensor:
         self.calls += 1
         return x * 2
@@ -75,7 +75,7 @@ class _Norm(CompileOutermost, nn.Module):
 class _NoMixin(nn.Module):
     """Decorated but never samples a policy."""
 
-    @compile_when_outermost
+    @maybe_compile
     def kernel(self, x: torch.Tensor) -> torch.Tensor:
         return x * 2
 
@@ -87,7 +87,7 @@ class _Tail(CompileOutermost, nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(8))
 
-    @compile_when_outermost
+    @maybe_compile
     def kernel(self, x: torch.Tensor, residual: torch.Tensor) -> tuple[torch.Tensor, ...]:
         x = x + residual
         variance = x.pow(2).mean(dim=-1, keepdim=True)
@@ -95,7 +95,7 @@ class _Tail(CompileOutermost, nn.Module):
 
 
 class _ForcedNorm(CompileOutermost, nn.Module):
-    @compile_when_outermost(force_compile=True)
+    @maybe_compile(force=True)
     def kernel(self, x: torch.Tensor) -> torch.Tensor:
         return x * 2
 

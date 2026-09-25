@@ -163,8 +163,8 @@ def test_spyre_gemma_rmsnorm_accumulates_the_variance_in_fp32(default_vllm_confi
                     "fp16 activations reach the trailing weight multiply as a staggered-EA "
                     "fp32 convert (torch-spyre#2971) that the STANDARD [hidden] weight cannot "
                     "broadcast against, so eager lowering raises 'Multi-arg pointwise with "
-                    "mixed EA'. This is what force_compile=True exists for; when it XPASS-es, "
-                    "drop force_compile from SpyreGemmaRMSNorm."
+                    "mixed EA'. This is what force=True exists for; when it XPASS-es, "
+                    "drop force from SpyreGemmaRMSNorm."
                 ),
             ),
         ),
@@ -174,8 +174,8 @@ def test_spyre_gemma_rmsnorm_accumulates_the_variance_in_fp32(default_vllm_confi
 def test_gemma_rmsnorm_eager_support_is_fp32_only(default_vllm_config, dtype, use_residual):
     """Eager (uncompiled) ``forward_native`` lowers in fp32 but not in fp16.
 
-    Calls the undecorated upstream method so ``compile_when_outermost`` cannot compile
-    it, which is the one path ``force_compile=True`` denies the layer.
+    Calls the undecorated upstream method so ``maybe_compile`` cannot compile it,
+    which is the one path ``force=True`` denies the layer.
     """
     from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 

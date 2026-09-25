@@ -30,7 +30,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from .utils import convert, place_row_gathered
 
@@ -100,7 +100,7 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
 
         return super()._apply(place, recurse)
 
-    @compile_when_outermost
+    @maybe_compile
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
             reindex_table = self._spyre_reindex_table

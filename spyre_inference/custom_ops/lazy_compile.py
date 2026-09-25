@@ -37,7 +37,7 @@ F = TypeVar("F", bound=Callable)
 
 
 class CompileOutermost:
-    """Base for layers with one ``@compile_when_outermost`` kernel.
+    """Base for layers with one ``@maybe_compile`` kernel.
 
     The mode is sampled here because construction is the only point where the vLLM
     config context is live; ``enforce_eager`` arrives as mode ``NONE``.
@@ -46,7 +46,7 @@ class CompileOutermost:
     allow_inference_recompiles: bool = False
     """Set on subclasses whose kernel legitimately recompiles per input shape.
 
-    ``compile_when_outermost`` registers its kernel with the compile guard so a
+    ``maybe_compile`` registers its kernel with the compile guard so a
     post-warmup compile is flagged. A layer that compiles per distinct shape *by
     design* (``SpyreConv2d``, one graph per ``(H, W)``) would make that a permanent
     false positive, so it opts out instead of being allowlisted from the outside.
@@ -59,13 +59,13 @@ class CompileOutermost:
         self.spyre_compiled_kernel: Callable | None = None
 
 
-def compile_when_outermost(method: F | None = None, *, force_compile: bool = False) -> F:
+def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
     """Compile ``method`` on its first call that no other graph is already tracing.
 
     Args:
         method: The kernel method to wrap. Omitted when the decorator is applied
             with keyword arguments.
-        force_compile: When ``True``, compile the method in vLLM eager mode.
+        force: When ``True``, compile the method in vLLM eager mode.
             An enclosing Dynamo graph always absorbs the method: nested
             ``torch.compile`` is not supported while it is tracing.
     """
@@ -74,7 +74,7 @@ def compile_when_outermost(method: F | None = None, *, force_compile: bool = Fal
         @functools.wraps(method)
         def wrapper(self, *args, **kwargs):
             if torch.compiler.is_compiling() or (
-                not force_compile and not self.spyre_compile_enabled
+                not force and not self.spyre_compile_enabled
             ):
                 return method(self, *args, **kwargs)
             if self.spyre_compiled_kernel is None:
@@ -82,7 +82,7 @@ def compile_when_outermost(method: F | None = None, *, force_compile: bool = Fal
                     "Compiling %s.%s as its own graph: %s.",
                     type(self).__name__,
                     method.__name__,
-                    "force_compile is set" if force_compile else "no enclosing graph covers it",
+                    "force is set" if force else "no enclosing graph covers it",
                 )
                 if not self.allow_inference_recompiles:
                     from spyre_inference.v1.worker import compile_guard

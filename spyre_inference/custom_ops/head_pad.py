@@ -107,12 +107,9 @@ def _pad_qk_norm_weight(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor
     """Pad a per-head QK-norm weight ``[orig] -> [padded]`` to match padded Q/K.
 
     RMS over the padded head divides by ``padded`` not ``orig``; folding
-    ``sqrt(orig/padded)`` into the weight restores the original scale. That leaves the
-    eps term, which the wider divisor makes ``padded/orig`` too large --
-    ``fix_padded_qk_norm_eps`` scales it back, and the pair is then exact.
-
-    Assumes the stored weight is the multiplier; ``verify_padded_qk_norm_weights``
-    rejects the zero-centred norms for which it is not.
+    ``sqrt(orig/padded)`` into the weight restores the original scale. Exact but
+    for the eps term (the wider divisor scales it by ``padded/orig``), which is
+    negligible at the usual eps=1e-6.
     """
     return _pad_qk_interleaved(w * math.sqrt(orig / padded), 1, orig, padded)
 
@@ -399,66 +396,6 @@ def fix_padded_attention_scale(model, hf_config) -> None:
             module.scaling = orig_default
             n += 1
     logger.info("Reset attention scale to 1/sqrt(%d) on %d head_dim-derived layers.", orig, n)
-
-
-def _padded_qk_norms(model, padded: int) -> Iterable[tuple[str, torch.nn.Module]]:
-    """The per-head QK-norms ``_pad_qk_norm_weight`` widened to ``padded``.
-
-    Matched on the name plus a head_dim-wide weight: a ``q_norm`` taken over some
-    other width is not a QK-norm and was never padded.
-    """
-    for name, module in model.named_modules():
-        weight = getattr(module, "weight", None)
-        if (
-            name.endswith(("q_norm", "k_norm"))
-            and hasattr(module, "variance_epsilon")
-            and weight is not None
-            and weight.numel() == padded
-        ):
-            yield name, module
-
-
-def verify_padded_qk_norm_weights(model, hf_config) -> None:
-    """Refuse a zero-centred QK-norm, whose padded weight would be silently wrong.
-
-    ``_pad_qk_norm_weight`` folds ``sqrt(orig/padded)`` into the stored weight to undo
-    the wider reduction. That assumes the stored weight *is* the multiplier. A
-    ``GemmaRMSNorm`` multiplies by ``1 + w``, so folding into ``w`` yields
-    ``1 + w*sqrt(orig/padded)`` where ``(1 + w)*sqrt(orig/padded)`` is needed.
-    """
-    if not head_padding_active(hf_config):
-        return
-    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-
-    bad = sorted(
-        name
-        for name, module in _padded_qk_norms(model, hf_config.head_dim)
-        if isinstance(module, GemmaRMSNorm)
-    )
-    if bad:
-        raise NotImplementedError(
-            f"Spyre padded head_dim {getattr(hf_config, _ORIG_ATTR)} -> "
-            f"{hf_config.head_dim}, but these QK-norms are zero-centred "
-            f"({GemmaRMSNorm.__name__}, weight applied as 1 + w), so the "
-            f"sqrt(orig/padded) folded into their padded weight is wrong: "
-            f"{', '.join(bad)}"
-        )
-
-
-def fix_padded_qk_norm_eps(model, hf_config) -> None:
-    """Scale QK-norm epsilon to compensate for the wider padded reduction."""
-    if not head_padding_active(hf_config):
-        return
-    orig = getattr(hf_config, _ORIG_ATTR)
-    padded = hf_config.head_dim
-    n = 0
-    for _, module in _padded_qk_norms(model, padded):
-        if getattr(module, "_spyre_padded_qk_norm_eps", False):
-            continue
-        module.variance_epsilon *= orig / padded
-        module._spyre_padded_qk_norm_eps = True
-        n += 1
-    logger.info("Scaled QK-norm epsilon by %d/%d on %d layers.", orig, padded, n)
 
 
 def fix_padded_rope(model, hf_config) -> None:

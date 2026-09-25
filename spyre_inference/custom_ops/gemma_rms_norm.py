@@ -25,14 +25,14 @@ import torch
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareGemmaRMSNorm
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 
 
 @GemmaRMSNorm.register_oot(name="GemmaRMSNorm")
 class SpyreGemmaRMSNorm(CompileOutermost, GemmaRMSNorm):
     """Out-of-tree (OOT) GemmaRMSNorm implementation for IBM's Spyre."""
 
-    @compile_when_outermost(force_compile=True)
+    @maybe_compile(force=True)
     def forward_oot(
         self,
         x: torch.Tensor,

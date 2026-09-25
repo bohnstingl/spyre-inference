@@ -73,12 +73,10 @@ from spyre_inference import envs
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
-    fix_padded_qk_norm_eps,
     fix_padded_rope,
     install_head_pad_weight_loader,
     install_padded_head_dim,
     verify_padded_head_dim,
-    verify_padded_qk_norm_weights,
 )
 from spyre_inference.custom_ops.mlp_pad import (
     install_mlp_pad_weight_loader,
@@ -661,11 +659,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Restore original RoPE frequencies and attention scale corrupted by the
         # head_dim width override (no-op unless the platform padded head_dim).
         verify_padded_head_dim(self.model, self.model_config.hf_text_config)
-        verify_padded_qk_norm_weights(self.model, self.model_config.hf_text_config)
         verify_padded_intermediate_size(self.model, self.model_config.hf_text_config)
         fix_padded_rope(self.model, self.model_config.hf_text_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_text_config)
-        fix_padded_qk_norm_eps(self.model, self.model_config.hf_text_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
