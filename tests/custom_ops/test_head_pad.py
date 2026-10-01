@@ -250,6 +250,130 @@ def test_fix_padded_qk_norm_eps_scales_only_qk_norms():
     assert other_q_norm.variance_epsilon == pytest.approx(1e-6)
 
 
+def _padded_norm():
+    norm = torch.nn.Module()
+    norm.variance_epsilon = 1e-6
+    norm.weight = torch.nn.Parameter(torch.ones(_PADDED))
+    return norm
+
+
+class _LanguageModel(torch.nn.Module):
+    pass
+
+
+# All `_mark_language_model` reads from the vLLM config.
+_MM_VLLM_CONFIG = SimpleNamespace(
+    model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_encoder_only=False))
+)
+
+
+def _composite_model(vision_norm: torch.nn.Module) -> torch.nn.Module:
+    """A native multimodal model with a padded text ``q_norm`` and a vision ``q_norm``."""
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
+    class _Composite(torch.nn.Module, SupportsMultiModal):
+        pass
+
+    model = _Composite()
+    model.vision_tower = torch.nn.Module()
+    model.vision_tower.q_norm = vision_norm
+    with model._mark_language_model(_MM_VLLM_CONFIG):
+        model.language_model = _LanguageModel()
+    model.language_model.q_norm = _padded_norm()
+    return model
+
+
+def test_fix_padded_qk_norm_eps_skips_the_vision_tower_of_a_multimodal_model():
+    """A vision ``q_norm`` of the padded width was never padded; its eps must stay."""
+    model = _composite_model(_padded_norm())
+
+    fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert model.language_model.q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
+    assert model.vision_tower.q_norm.variance_epsilon == pytest.approx(1e-6)
+
+
+def test_fix_padded_qk_norm_eps_skips_the_vision_tower_on_the_transformers_backend():
+    """Its ``get_language_model()`` wraps the whole model; the marked decoder does not."""
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
+    class _Backend(torch.nn.Module, SupportsMultiModal):
+        def get_language_model(self):
+            return torch.nn.Module()
+
+    hf_model = torch.nn.Module()
+    hf_model.vision_tower = torch.nn.Module()
+    hf_model.vision_tower.q_norm = _padded_norm()
+    hf_model.language_model = _LanguageModel()
+    hf_model.language_model.q_norm = _padded_norm()
+    model = _Backend()
+    with model._mark_language_model(_MM_VLLM_CONFIG, targets=_LanguageModel):
+        model.model = hf_model
+
+    fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert hf_model.language_model.q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
+    assert hf_model.vision_tower.q_norm.variance_epsilon == pytest.approx(1e-6)
+
+
+def test_fix_padded_qk_norm_eps_scans_a_text_only_model_under_any_name():
+    """E.g. ``GEMMA4_TEXT_BACKBONE_OVERRIDE``: composite config, text-only tree."""
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.model.layers[0].q_norm = _padded_norm()
+
+    fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert model.model.layers[0].q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
+
+
+def _multimodal_model(get_language_model) -> torch.nn.Module:
+    """A multimodal model with a padded-width ``q_norm`` and the given resolver."""
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
+    class _Composite(torch.nn.Module, SupportsMultiModal):
+        pass
+
+    _Composite.get_language_model = get_language_model
+    model = _Composite()
+    model.decoder = torch.nn.Module()
+    model.decoder.q_norm = _padded_norm()
+    return model
+
+
+def _unresolvable(self):
+    raise NotImplementedError
+
+
+def _outside_wrapper(self):
+    # Like the Transformers backend.
+    return torch.nn.Module()
+
+
+def _returns_self(self):
+    return self
+
+
+@pytest.mark.parametrize("resolver", [_unresolvable, _outside_wrapper, _returns_self])
+def test_fix_padded_qk_norm_eps_refuses_an_unisolatable_language_model(resolver):
+    """Without a language submodule, text and tower norms cannot be told apart."""
+    model = _multimodal_model(resolver)
+    cfg = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+
+    with pytest.raises(NotImplementedError, match="cannot isolate the language model"):
+        fix_padded_qk_norm_eps(model, cfg)
+    assert model.decoder.q_norm.variance_epsilon == pytest.approx(1e-6)
+
+
+def test_fix_padded_qk_norm_eps_allows_an_unisolatable_model_without_qk_norms():
+    """No QK-norm, nothing ambiguous."""
+    model = _multimodal_model(_unresolvable)
+    del model.decoder.q_norm
+
+    fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+
 def _qk_norm_model(norm_cls):
     """A model whose ``q_norm`` is a padded-width ``norm_cls``."""
     model = torch.nn.Module()
@@ -272,6 +396,15 @@ def test_verify_padded_qk_norm_weights_rejects_a_zero_centred_norm(default_vllm_
 
     # The plain norm the folding was written for stays accepted.
     verify_padded_qk_norm_weights(_qk_norm_model(RMSNorm), cfg)
+
+    # A multimodal model's vision GemmaRMSNorm was never padded, so it is not rejected.
+    verify_padded_qk_norm_weights(_composite_model(GemmaRMSNorm(_PADDED, eps=1e-6)), cfg)
+
+    # The error names the full qualname, not one relative to the language model.
+    composite = _composite_model(_padded_norm())
+    composite.language_model.q_norm = GemmaRMSNorm(_PADDED, eps=1e-6)
+    with pytest.raises(NotImplementedError, match=r"language_model\.q_norm"):
+        verify_padded_qk_norm_weights(composite, cfg)
 
 
 def test_verify_padded_qk_norm_weights_is_a_noop_without_padding(default_vllm_config):

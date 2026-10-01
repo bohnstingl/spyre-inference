@@ -401,13 +401,33 @@ def fix_padded_attention_scale(model, hf_config) -> None:
     logger.info("Reset attention scale to 1/sqrt(%d) on %d head_dim-derived layers.", orig, n)
 
 
-def _padded_qk_norms(model, padded: int) -> Iterable[tuple[str, torch.nn.Module]]:
-    """The per-head QK-norms ``_pad_qk_norm_weight`` widened to ``padded``.
+def _language_backbones(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]] | None:
+    """The padded text backbone(s) as ``(qualname, module)``; None if not isolatable.
 
-    Matched on the name plus a head_dim-wide weight: a ``q_norm`` taken over some
-    other width is not a QK-norm and was never padded.
+    Read from ``_mark_language_model``, which native and Transformers-backend
+    multimodal models both call; ``get_language_model()`` is the fallback.
     """
+    from vllm.model_executor.models.interfaces import supports_multimodal
+
+    if not supports_multimodal(model):
+        return [("", model)]
+    names = [n for n in getattr(model, "_language_model_names", None) or () if n]
+    if names:
+        return [(n, model.get_submodule(n)) for n in names]
+    try:
+        language_model = model.get_language_model()
+    except NotImplementedError:
+        return None
     for name, module in model.named_modules():
+        if module is language_model and module is not model:
+            return [(name, module)]
+    return None
+
+
+def _qk_norms_of_width(
+    model: torch.nn.Module, padded: int, prefix: str = ""
+) -> Iterable[tuple[str, torch.nn.Module]]:
+    for name, module in model.named_modules(prefix=prefix):
         weight = getattr(module, "weight", None)
         if (
             name.endswith(("q_norm", "k_norm"))
@@ -416,6 +436,30 @@ def _padded_qk_norms(model, padded: int) -> Iterable[tuple[str, torch.nn.Module]
             and weight.numel() == padded
         ):
             yield name, module
+
+
+def _padded_qk_norms(model, padded: int) -> list[tuple[str, torch.nn.Module]]:
+    """The head_dim-wide QK-norms of the text backbone, i.e. those that were padded.
+
+    Raises:
+        NotImplementedError: Such norms exist but the backbone cannot be isolated.
+    """
+    backbones = _language_backbones(model)
+    if backbones is not None:
+        found = {
+            id(module): (name, module)
+            for prefix, backbone in backbones
+            for name, module in _qk_norms_of_width(backbone, padded, prefix)
+        }
+        return list(found.values())
+    candidates = [name for name, _ in _qk_norms_of_width(model, padded)]
+    if candidates:
+        raise NotImplementedError(
+            f"Spyre padded head_dim to {padded}, but cannot isolate the language model "
+            f"of {type(model).__name__}, so these QK-norms may belong to an unpadded "
+            f"tower: {', '.join(sorted(candidates))}"
+        )
+    return []
 
 
 def verify_padded_qk_norm_weights(model, hf_config) -> None:
