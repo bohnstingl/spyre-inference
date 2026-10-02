@@ -32,9 +32,11 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 blip2 = pytest.importorskip("vllm.model_executor.models.blip2")
 
 # Minimal dimensions that exercise the attention path without a full model load.
-HIDDEN_SIZE = 64
+# HEAD_DIM must be stick-aligned (a multiple of 64) on Spyre, matching Granite Vision's
+# Q-Former head_dim=64 configuration.
+HEAD_DIM = 64
 NUM_HEADS = 4
-HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
+HIDDEN_SIZE = NUM_HEADS * HEAD_DIM  # 256
 
 # Capture the unpatched forward at import time, before any test can trigger
 # the process-wide class patch via patch_blip2_qformer_attention().
