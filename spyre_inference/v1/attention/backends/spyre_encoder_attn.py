@@ -480,13 +480,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._rect_fn = _encoder_rect_compiled
             self._rect_out_fn = _encoder_rect_out_compiled
             self._gather_fn = _encoder_gather_compiled
-            self._attn_fn = _encoder_sdpa_compiled
+            self._sdpa_fn = _encoder_sdpa_compiled
             self._fused_fn = _encoder_fused_compiled
         else:
             self._rect_fn = _encoder_rect_kernel
             self._rect_out_fn = _encoder_rect_kernel_out
             self._gather_fn = _encoder_gather_kernel
-            self._attn_fn = _encoder_sdpa_kernel
+            self._sdpa_fn = _encoder_sdpa_kernel
             self._fused_fn = _encoder_fused_kernel
         # get_current_vllm_config() only works at construction time; forward() runs
         # through a custom-op boundary that loses the context.
@@ -533,7 +533,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         return self._gather_fn(query, key, value, row_index)
 
     def _run_attn(self, q_rows, k_rows, v_rows, mask, group, heads, kv_heads, dim):
-        return self._attn_fn(
+        return self._sdpa_fn(
             q_rows,
             k_rows,
             v_rows,
