@@ -34,10 +34,12 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 
 from spyre_inference.custom_ops.text_backbone import (
     is_text_weight,
@@ -458,27 +460,28 @@ def fix_padded_rope(model, hf_config, model_config=None) -> None:
     max_position = hf_config.max_position_embeddings
     rope_parameters = getattr(hf_config, "rope_parameters", None)
 
-    # Duck-type on an attribute only _SpyreRotaryMixin sets, not isinstance: keeps
-    # `module` typed as nn.Module so the RotaryEmbedding attribute reads below type-check.
+    # Duck-type on an attribute only _SpyreRotaryMixin sets, then cast for the
+    # RotaryEmbeddingBase attribute reads below.
     def is_spyre_rope(_, module) -> bool:
         return hasattr(module, "_rotation_cache")
 
     n = 0
     for _, module in text_modules(model, model_config, is_spyre_rope, "RoPE modules"):
+        rope = cast(RotaryEmbeddingBase, module)
         ref = get_rope(
             orig,
             max_position=max_position,
-            is_neox_style=module.is_neox_style,
+            is_neox_style=rope.is_neox_style,
             rope_parameters=rope_parameters,
-            dtype=module.dtype,
+            dtype=rope.dtype,
         )
-        module.cos_sin_cache = ref.cos_sin_cache.to(module.cos_sin_cache.dtype)
-        module._rotation_cache = None
-        module._device_rotation_cache = None
+        rope.cos_sin_cache = ref.cos_sin_cache.to(rope.cos_sin_cache.dtype)
+        rope._rotation_cache = None
+        rope._device_rotation_cache = None
         # Narrowed frequencies make this instance model-specific; unshare it so
         # get_rope cannot hand it to a later model with a real head_dim of orig*2.
         for cache_key, cached in list(_ROPE_DICT.items()):
-            if cached is module:
+            if cached is rope:
                 del _ROPE_DICT[cache_key]
         n += 1
     logger.info("Injected original head_dim=%d RoPE frequencies into %d modules.", orig, n)
