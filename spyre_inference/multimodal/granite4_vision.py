@@ -65,6 +65,40 @@ def patch_interpolate_downsampler() -> None:
     )
 
 
+def patch_spatial_offset_downsampler() -> None:
+    """Rewrite SpatialOffsetDownsampler's 2x2-block sampling so it is correct on Spyre.
+
+    On Spyre, selecting index 0 of a size-2 dim right before the last dim of a
+    reshaped tensor returns wrong values (``x.view(R, 2, C)[:, 0].contiguous()``
+    reproduces it), which corrupts the stock forward for offsets 0 and 2. Select
+    the row parity first, then the column parity as a C-wide chunk of the last dim.
+    """
+    try:
+        from vllm.model_executor.models.granite4_vision import SpatialOffsetDownsampler
+    except ImportError:
+        return
+
+    if getattr(SpatialOffsetDownsampler.__call__, "_spyre_patched", False):
+        return
+
+    def _spatial_offset_downsampler_call(
+        self: SpatialOffsetDownsampler,
+        image_features: torch.Tensor,
+    ) -> torch.Tensor:
+        B, _, C = image_features.shape
+        n = self.new_image_side
+        rows = image_features.reshape(B, n, 2, n, 2 * C)[:, :, self.offset_h].contiguous()
+        sampled = rows[..., self.offset_w * C : (self.offset_w + 1) * C].contiguous()
+        return sampled.reshape(B, -1, C)
+
+    _spatial_offset_downsampler_call._spyre_patched = True  # type: ignore[attr-defined]
+    SpatialOffsetDownsampler.__call__ = _spatial_offset_downsampler_call  # type: ignore[method-assign]
+    logger.info(
+        "Spyre: patched SpatialOffsetDownsampler to sample row then column parity"
+        " (offset-0 strided select is wrong on Spyre)."
+    )
+
+
 def patch_pack_and_unpad_image_features() -> None:
     """Run Granite4VisionForConditionalGeneration._pack_and_unpad_image_features on CPU.
 
@@ -236,6 +270,7 @@ def migrate_ds_buffers(model: torch.nn.Module, device: torch.device) -> None:
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Apply Granite 4 Vision workarounds."""
     patch_interpolate_downsampler()
+    patch_spatial_offset_downsampler()
     patch_pack_and_unpad_image_features()
     patch_embed_input_ids()
     migrate_ds_buffers(model, device)

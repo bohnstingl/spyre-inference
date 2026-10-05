@@ -14,10 +14,12 @@
 
 """Tests for `spyre_inference/multimodal/granite4_vision.py`.
 
-Two class-level patches, each guarded by a `_spyre_patched` flag:
+Class-level patches, each guarded by a `_spyre_patched` flag:
 
 - `patch_interpolate_downsampler`: offloads `InterpolateDownsampler.__call__`
   to CPU (F.adaptive_avg_pool2d not supported on Spyre).
+- `patch_spatial_offset_downsampler`: rewrites `SpatialOffsetDownsampler.__call__`
+  so offsets 0 and 2 sample the right patches on Spyre.
 - `patch_pack_and_unpad_image_features`: offloads
   `Granite4VisionForConditionalGeneration._pack_and_unpad_image_features` to CPU
   (5-D permute produces a stick expression Spyre's work_division cannot lower).
@@ -131,6 +133,7 @@ class _MinimalGranite4VisionModel(nn.Module):
     [
         "Granite4VisionForConditionalGeneration",
         "InterpolateDownsampler",
+        "SpatialOffsetDownsampler",
     ],
 )
 def test_patch_target_symbols_still_exist(symbol):
@@ -177,6 +180,21 @@ def test_patch_interpolate_downsampler_is_applied_and_idempotent():
     assert getattr(patched, "_spyre_patched", False) is True
 
     patch_interpolate_downsampler()
+    assert cls.__call__ is patched, "second call must be a no-op"
+
+
+@pytest.mark.granite4_vision
+def test_patch_spatial_offset_downsampler_is_applied_and_idempotent():
+    """`patch_spatial_offset_downsampler` must mark `__call__` with `_spyre_patched`
+    and a second call must leave the same function in place."""
+    from spyre_inference.multimodal.granite4_vision import patch_spatial_offset_downsampler
+
+    patch_spatial_offset_downsampler()
+    cls = granite4_vision.SpatialOffsetDownsampler
+    patched = cls.__call__
+    assert getattr(patched, "_spyre_patched", False) is True
+
+    patch_spatial_offset_downsampler()
     assert cls.__call__ is patched, "second call must be a no-op"
 
 
@@ -251,6 +269,23 @@ def test_interpolate_downsampler_output_shape(batch_size):
     assert out.shape == torch.Size(expected_shape), (
         f"downsampler output shape {out.shape} != expected {expected_shape}"
     )
+
+
+@pytest.mark.granite4_vision
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+def test_spatial_offset_downsampler_patched_matches_stock(offset):
+    """The rewrite only reorders indexing, so on CPU it must be bit-exact."""
+    from spyre_inference.multimodal.granite4_vision import patch_spatial_offset_downsampler
+
+    patch_spatial_offset_downsampler()
+    ds = granite4_vision.SpatialOffsetDownsampler(_MinimalDownsamplerConfig(), offset=offset)
+    image_features = _make_image_features(batch=2)
+
+    actual = ds(image_features)
+    expected = _STOCK_SPATIAL_OFFSET_CALL(ds, image_features)
+
+    assert actual.shape == (2, NEW_IMAGE_SIDE**2, FEATURE_DIM)
+    assert torch.equal(actual, expected)
 
 
 # ---------------------------------------------------------------------------
