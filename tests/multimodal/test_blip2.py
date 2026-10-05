@@ -129,12 +129,14 @@ def test_patch_is_applied_and_idempotent():
 
 
 @pytest.mark.blip2
-def test_patched_forward_output_matches_stock(tp_group):
+@pytest.mark.parametrize("bsz", [1, 2])
+def test_patched_forward_output_matches_stock(tp_group, bsz):
     """The SDPA patched forward must produce the same output as the stock forward."""
     from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
 
     seq_len = 8
-    hidden_states = torch.randn(1, seq_len, HIDDEN_SIZE, dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(10 + bsz)
+    hidden_states = torch.randn(bsz, seq_len, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
 
     # Use the forward captured at import time — guards against earlier tests
     # having already applied the process-wide class patch.
@@ -150,7 +152,8 @@ def test_patched_forward_output_matches_stock(tp_group):
 
 
 @pytest.mark.blip2
-def test_patched_forward_with_cross_attention_matches_stock(tp_group):
+@pytest.mark.parametrize("bsz", [1, 2])
+def test_patched_forward_with_cross_attention_matches_stock(tp_group, bsz):
     """Cross-attention variant (encoder_hidden_states is not None) must also
     produce the same output as the stock forward."""
     from vllm.model_executor.models.blip2 import Blip2QFormerConfig
@@ -176,8 +179,9 @@ def test_patched_forward_with_cross_attention_matches_stock(tp_group):
         _finish_weight_loading(attn)
         return attn
 
-    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
-    encoder_hidden_states = torch.randn(1, 16, HIDDEN_SIZE, dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(20 + bsz)
+    hidden_states = torch.randn(bsz, 8, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
+    encoder_hidden_states = torch.randn(bsz, 16, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
 
     # Use the forward captured at import time — guards against earlier tests
     # having already applied the process-wide class patch.
@@ -211,7 +215,8 @@ def test_apply_invokes_patch():
 
 
 @pytest.mark.blip2
-def test_patched_forward_output_matches_cpu_on_spyre(tp_group):
+@pytest.mark.parametrize("bsz", [1, 2])
+def test_patched_forward_output_matches_cpu_on_spyre(tp_group, bsz):
     """The patched forward on-card must equal the same forward on CPU."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -220,8 +225,8 @@ def test_patched_forward_output_matches_cpu_on_spyre(tp_group):
 
     patch_blip2_qformer_attention()
 
-    rng = torch.Generator(device="cpu").manual_seed(5)
-    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
+    rng = torch.Generator(device="cpu").manual_seed(5 + bsz)
+    hidden_states = torch.randn(bsz, 8, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
 
     # Use the forward captured at import time — guards against earlier tests
     # having already applied the process-wide class patch.
@@ -231,6 +236,55 @@ def test_patched_forward_output_matches_cpu_on_spyre(tp_group):
     device = torch.device("spyre")
     attn_dev = _make_qformer_attention(tp_group).to(device)
     actual = blip2.Blip2QFormerMultiHeadAttention.forward(attn_dev, hidden_states.to(device))
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.blip2
+@pytest.mark.parametrize("bsz", [1, 2])
+def test_patched_forward_cross_attention_output_matches_cpu_on_spyre(tp_group, bsz):
+    """The patched cross-attention forward on-card must equal the same forward on CPU."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from vllm.model_executor.models.blip2 import Blip2QFormerConfig
+
+    from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
+
+    patch_blip2_qformer_attention()
+
+    config = Blip2QFormerConfig(
+        hidden_size=HIDDEN_SIZE,
+        encoder_hidden_size=HIDDEN_SIZE,
+        num_attention_heads=NUM_HEADS,
+        attention_probs_dropout_prob=0.0,
+    )
+
+    def _make_cross_attn():
+        attn = blip2.Blip2QFormerMultiHeadAttention(
+            config, quant_config=None, cache_config=None, is_cross_attention=True
+        ).to(torch.float16)
+        rng = torch.Generator(device="cpu").manual_seed(2)
+        for p in attn.parameters():
+            p.data.copy_(torch.empty_like(p.data, device="cpu").normal_(std=0.02, generator=rng))
+        _finish_weight_loading(attn)
+        return attn
+
+    rng = torch.Generator(device="cpu").manual_seed(7 + bsz)
+    hidden_states = torch.randn(bsz, 8, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
+    encoder_hidden_states = torch.randn(bsz, 16, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
+
+    # Use the forward captured at import time — guards against earlier tests
+    # having already applied the process-wide class patch.
+    attn_cpu = _make_cross_attn()
+    expected = _STOCK_FORWARD(attn_cpu, hidden_states, encoder_hidden_states)
+
+    device = torch.device("spyre")
+    attn_dev = _make_cross_attn().to(device)
+    actual = blip2.Blip2QFormerMultiHeadAttention.forward(
+        attn_dev, hidden_states.to(device), encoder_hidden_states.to(device)
+    )
 
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
