@@ -43,6 +43,7 @@ _STOCK_INTERPOLATE_CALL = granite4_vision.InterpolateDownsampler.__call__
 _STOCK_PACK_AND_UNPAD = (
     granite4_vision.Granite4VisionForConditionalGeneration._pack_and_unpad_image_features
 )
+_STOCK_SPATIAL_OFFSET_CALL = granite4_vision.SpatialOffsetDownsampler.__call__
 
 # InterpolateDownsampler config matching Granite Vision 4.1-4B defaults.
 # The SigLIP encoder outputs a 24×24 grid (336px / 14px patch = 24 patches/side)
@@ -325,6 +326,31 @@ def test_interpolate_downsampler_matches_cpu_on_spyre():
     device = torch.device("spyre")
     image_features_dev = image_features_cpu.to(device)
     actual = ds(image_features_dev)
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.granite4_vision
+@pytest.mark.parametrize("offset", [0, 1, 2, 3])
+def test_spatial_offset_downsampler_matches_cpu_on_spyre(offset):
+    """Every 2x2-block offset must sample the same patches on-card as on CPU.
+
+    The spatial projectors feed these features straight into the LLM, so a wrong
+    sample corrupts the image embedding silently.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.multimodal import granite4_vision as spyre_gv
+
+    spyre_gv.apply(_make_dummy_model(), torch.device("cpu"))
+
+    ds = granite4_vision.SpatialOffsetDownsampler(_MinimalDownsamplerConfig(), offset=offset)
+    image_features = _make_image_features(batch=2)
+    expected = _STOCK_SPATIAL_OFFSET_CALL(ds, image_features)
+
+    actual = ds(image_features.to(torch.device("spyre")))
 
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
