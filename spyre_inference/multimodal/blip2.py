@@ -49,27 +49,18 @@ def patch_blip2_qformer_attention() -> None:
         # lowering of transpose -> SDPA reads non-contiguous (transposed) tensors
         # with the wrong stick layout and returns garbage.  See hf-adapters'
         # make_encoder_block for the same pattern.
-        q = (
-            self.query(hidden_states)
-            .view(bsz, q_len, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-            .contiguous()
-        )
+        def _project(proj, x):
+            return (
+                proj(x)
+                .view(bsz, x.shape[1], self.num_attention_heads, self.attention_head_size)
+                .transpose(1, 2)
+                .contiguous()
+            )
 
+        q = _project(self.query, hidden_states)
         kv_src = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
-        kv_len = kv_src.shape[1]
-        k = (
-            self.key(kv_src)
-            .view(bsz, kv_len, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-            .contiguous()
-        )
-        v = (
-            self.value(kv_src)
-            .view(bsz, kv_len, self.num_attention_heads, self.attention_head_size)
-            .transpose(1, 2)
-            .contiguous()
-        )
+        k = _project(self.key, kv_src)
+        v = _project(self.value, kv_src)
 
         attn_out = F.scaled_dot_product_attention(
             q,
