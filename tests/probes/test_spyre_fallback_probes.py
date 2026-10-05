@@ -19,7 +19,7 @@ Each test exercises a single primitive that spyre-inference needs on-device
 xfail: when a primitive starts working in torch-spyre, the corresponding
 probe flips to XPASS and we can remove the associated workaround here.
 
-Section 10 applies the same idea to workarounds for upstream vLLM bugs: those
+Section 12 applies the same idea to workarounds for upstream vLLM bugs: those
 probes need no device and inspect vLLM instead.
 
 All device tests run against the real Spyre device when available; otherwise
@@ -1372,3 +1372,37 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 16. Offset-0 strided select (Granite Vision SpatialOffsetDownsampler)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre normalize_coordinates gives the gap dim of an offset-0 strided "
+        "coordinate (2*c0) no synthetic variable, so the backend reads a tiled "
+        "[sticks, rows, 64] source row-major and selecting index 0 of a split dim "
+        "returns wrong values. When this XPASS-es, remove "
+        "patch_spatial_offset_downsampler from multimodal/granite4_vision.py."
+    ),
+)
+def test_spyre_offset_zero_strided_select(spyre_device):
+    """vLLM's SpatialOffsetDownsampler sampling at offset (0, 0), in plain torch.
+
+    Calls no vLLM class on purpose: the workaround patches
+    `SpatialOffsetDownsampler.__call__` process-wide. The input must be DMA'd from
+    host with multi-stick rows; a device-built tensor hides the bug.
+    """
+    side, n, hidden = 24, 12, 1152
+    x = torch.randn(1, side * side, hidden, dtype=torch.float16)
+
+    def sample(t):
+        blocks = t.reshape(1, side, side, hidden).reshape(1, n, 2, n, 2, hidden)
+        return blocks[:, :, 0, :, 0, :].reshape(1, -1, hidden)
+
+    actual = sample(x.to(spyre_device)).cpu()
+
+    torch.testing.assert_close(actual.float(), sample(x).float(), atol=2e-2, rtol=2e-2)
