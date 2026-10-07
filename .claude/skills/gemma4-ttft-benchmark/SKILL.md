@@ -140,6 +140,7 @@ From the dt-inductor2 pod, 2026-10-06/07, both arms on one profiler-free torch-s
 ## Output layout
 
 `<out>/` (default `$HOME/gemma4-ttft-1102/<timestamp>/`):
+
 - `report.md` / `report.json`: package table, findings, per-arm rows, ratio.
 - `<arm>_<rep>/run.log`: full log; `vllm_<rep>/latency.json`: vLLM's JSON.
 - `env_<arm>.json`: everything the check found, with its findings.
