@@ -14,6 +14,9 @@
 #                       venv's bin/activate (sourcing only sets shell variables)
 #   --model PATH        model dir or HF id (default /models/google/gemma-4-26B-A4B)
 #   --arms "hf vllm"    arms and their order (default "hf vllm")
+#   --tp "1 2 4"        tensor-parallel sizes to sweep on the vLLM arm (default "1"). hf
+#                       is single-card and always runs at TP1. A size above the host's
+#                       Spyre card count is a hard error (nothing runs).
 #   --repeat N          run the arm list N times, alternating (default 1)
 #   --check             check the environment, print findings and the plan, run nothing
 #   --accept-warnings   benchmark despite WARN findings (the user has reviewed them)
@@ -34,6 +37,7 @@ PY=""
 HF_PY=""
 ENV_SCRIPT=""
 ARMS="hf vllm"
+TP="1"
 REPEAT=1
 CHECK_ONLY=0
 ACCEPT_WARNINGS=0
@@ -51,13 +55,14 @@ while [ $# -gt 0 ]; do
     --env-script) ENV_SCRIPT=$2; shift 2 ;;
     --model) MODEL=$2; shift 2 ;;
     --arms) ARMS=$2; shift 2 ;;
+    --tp) TP=$2; shift 2 ;;
     --repeat) REPEAT=$2; shift 2 ;;
     --check) CHECK_ONLY=1; shift ;;
     --accept-warnings) ACCEPT_WARNINGS=1; shift ;;
     --allow-profiler) ALLOW_PROFILER=1; shift ;;
     --recompiles) RECOMPILES=1; shift ;;
     --out) OUT=$2; shift 2 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     *) die "unknown argument '$1' (try --help)" ;;
   esac
 done
@@ -79,6 +84,12 @@ fi
 for p in "$PY" "$HF_PY"; do [ -x "$p" ] || die "no interpreter at $p"; done
 for arm in $ARMS; do
   case "$arm" in hf|vllm) ;; *) die "unknown arm '$arm' (hf, vllm)" ;; esac
+done
+MAX_TP=1
+for tp in $TP; do
+  case "$tp" in '' | *[!0-9]*) die "invalid --tp value '$tp' (positive integers only)" ;; esac
+  [ "$tp" -ge 1 ] || die "invalid --tp value '$tp' (must be >= 1)"
+  [ "$tp" -le "$MAX_TP" ] || MAX_TP=$tp
 done
 [ -n "$OUT" ] || OUT=${GEMMA4_TTFT_OUT:-$HOME/gemma4-ttft-1102}/$(date +%Y-%m-%d_%H%M%S)
 STAGE=$(mktemp -d)
@@ -127,16 +138,31 @@ if [[ " $ARMS " == *" vllm "* ]]; then
 fi
 VLLM_CMD=("$(dirname "$PY")/vllm")
 [ -x "${VLLM_CMD[0]}" ] || VLLM_CMD=("$PY" -m vllm.entrypoints.cli.main)
+
+# Spyre cards available: $SPYRE_DEVICES if pinned, else the numbered IOMMU-group nodes
+# under /dev/vfio (the `vfio` container node is not one). 0 means "could not determine".
+card_count() {
+  if [ -n "${SPYRE_DEVICES:-}" ]; then echo "${SPYRE_DEVICES//,/ }" | wc -w
+  elif [ -d /dev/vfio ]; then ls /dev/vfio 2>/dev/null | grep -cE '^[0-9]+$'
+  else echo 0; fi
+}
+VLLM_IN_ARMS=0; [[ " $ARMS " == *" vllm "* ]] && VLLM_IN_ARMS=1
+CARDS=$(card_count)
+
 echo "=== plan"
-echo "  host   ${HOSTNAME:-$(uname -n)}"
+echo "  host   ${HOSTNAME:-$(uname -n)}  spyre cards=$CARDS"
 echo "  model  $MODEL  input_len=$INPUT_LEN"
 echo "  arms   $ARMS  x$REPEAT"
+echo "  tp     vllm sweep: $TP  (hf is single-card, always TP1)"
 echo "  hf     OMP_NUM_THREADS=8 $HF_PY ttft.py --model $MODEL --input-len $INPUT_LEN"
-echo "  vllm   (cd ${SI_DIR:-<run dir>}) ${VLLM_CMD[*]} bench latency --model $MODEL ${VLLM_ARGS[*]}"
+echo "  vllm   (cd ${SI_DIR:-<run dir>}) ${VLLM_CMD[*]} bench latency --model $MODEL ${VLLM_ARGS[*]} --tensor-parallel-size {$TP}"
 echo "  out    $OUT"
 
 if [ "${N_ERR:-0}" != 0 ]; then
   die "$N_ERR ERROR finding(s): this environment cannot be benchmarked as is; fix it yourself and re-run" 1
+fi
+if [ "$VLLM_IN_ARMS" = 1 ] && [ "$MAX_TP" -gt 1 ] && [ "$CARDS" -lt "$MAX_TP" ]; then
+  die "requested TP up to $MAX_TP exceeds the $CARDS Spyre card(s) available on this host; adjust --tp" 1
 fi
 if [ "${N_WARN:-0}" != 0 ] && [ "$ACCEPT_WARNINGS" = 0 ]; then
   [ "$CHECK_ONLY" = 1 ] && exit 3
@@ -153,18 +179,19 @@ printf '%s\n' "${ARGS[@]+"${ARGS[@]}"}" > "$OUT/args.txt"
 {
   echo "host ${HOSTNAME:-$(uname -n)}  date $(date -Is)"
   echo "python $PY  hf-python $HF_PY"
+  echo "spyre cards=$CARDS  vllm tp sweep=$TP"
   rpm -qa 2>/dev/null | grep -E '^ibm-' | sort
 } > "$OUT/provenance.txt"
 
-run_arm() {  # run_arm <arm> <rep>
-  local arm=$1 rep=$2 dir log rc
-  dir=$OUT/${arm}_$rep; mkdir -p "$dir"; log=$dir/run.log
+run_arm() {  # run_arm <arm> <tp> <rep>
+  local arm=$1 tp=$2 rep=$3 dir log rc
+  dir=$OUT/${arm}_tp${tp}_$rep; mkdir -p "$dir"; log=$dir/run.log
   if card_busy; then
-    echo "!! /dev/vfio/vfio is held by another process; not starting $arm #$rep" | tee "$log"
-    echo "{\"arm\": \"$arm\", \"rep\": $rep, \"rc\": 3}" > "$dir/meta.json"
+    echo "!! /dev/vfio/vfio is held by another process; not starting $arm tp$tp #$rep" | tee "$log"
+    echo "{\"arm\": \"$arm\", \"tp\": $tp, \"rep\": $rep, \"rc\": 3}" > "$dir/meta.json"
     return
   fi
-  echo "=== $arm #$rep  $(date -Is)" | tee "$log"
+  echo "=== $arm tp$tp #$rep  $(date -Is)" | tee "$log"
   if [ "$arm" = hf ]; then
     (cd "$dir" && PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=8 "$HF_PY" "$SKILL_DIR/scripts/ttft.py" --model "$MODEL" \
       --input-len "$INPUT_LEN") >> "$log" 2>&1
@@ -172,17 +199,22 @@ run_arm() {  # run_arm <arm> <rep>
     local extra=()
     [ "$RECOMPILES" = 0 ] || extra=(TORCH_LOGS=recompiles)
     (cd "${SI_DIR:-$dir}" && env PYTHONDONTWRITEBYTECODE=1 "${extra[@]+"${extra[@]}"}" "${VLLM_CMD[@]}" bench latency \
-      --model "$MODEL" "${VLLM_ARGS[@]}" --output-json "$dir/latency.json") >> "$log" 2>&1
+      --model "$MODEL" "${VLLM_ARGS[@]}" --tensor-parallel-size "$tp" --output-json "$dir/latency.json") >> "$log" 2>&1
   fi
   rc=$?
-  echo "=== $arm #$rep finished rc=$rc $(date -Is)" | tee -a "$log"
+  echo "=== $arm tp$tp #$rep finished rc=$rc $(date -Is)" | tee -a "$log"
   [ "$rc" = 0 ] || tail -20 "$log" | sed 's/^/    /'
-  echo "{\"arm\": \"$arm\", \"rep\": $rep, \"rc\": $rc}" > "$dir/meta.json"
+  echo "{\"arm\": \"$arm\", \"tp\": $tp, \"rep\": $rep, \"rc\": $rc}" > "$dir/meta.json"
 }
 
+# hf is single-card (TP1); the vLLM arm sweeps every requested TP within each rep.
 for rep in $(seq 1 "$REPEAT"); do
   for arm in $ARMS; do
-    run_arm "$arm" "$rep"
+    if [ "$arm" = hf ]; then
+      run_arm hf 1 "$rep"
+    else
+      for tp in $TP; do run_arm vllm "$tp" "$rep"; done
+    fi
   done
 done
 

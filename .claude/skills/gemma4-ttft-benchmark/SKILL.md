@@ -1,6 +1,6 @@
 ---
 name: gemma4-ttft-benchmark
-description: "Reproduce the Gemma-4 26B-A4B prefill TTFT comparison from spyre-inference#1102 on any Spyre host, on the environment that is already installed - the maintainer's ttft.py on hf-adapters (pinned PR #620, 9b075e4) against `vllm bench latency` (1984-token prompt, 1 output token, TP1) on spyre-inference. Checks the environment read-only against the issue's pins (hf-adapters commit, torch-spyre e9d31328, profiler-free build, consistent Spyre runtime libraries, behaviour-changing env vars) and flags every inconsistency to the user instead of fixing it; never installs, syncs, rebuilds or checks anything out. Then runs both arms one at a time and reports TTFT plus the vLLM/hf ratio with provenance. Use when asked to benchmark or reproduce Gemma-4 / gemma-4-26B-A4B TTFT or prefill latency, reproduce #1102, compare spyre-inference with hf-adapters, or measure an MoE change's TTFT."
+description: "Reproduce the Gemma-4 26B-A4B prefill TTFT comparison from spyre-inference#1102 on any Spyre host, on the environment that is already installed - the maintainer's ttft.py on hf-adapters (pinned PR #620, 9b075e4) against `vllm bench latency` (1984-token prompt, 1 output token) on spyre-inference, with the vLLM arm optionally swept across tensor-parallel sizes via --tp (hf-adapters is single-card and always runs at TP1). Checks the environment read-only against the issue's pins (hf-adapters commit, torch-spyre e9d31328, profiler-free build, consistent Spyre runtime libraries, behaviour-changing env vars) and flags every inconsistency to the user instead of fixing it; never installs, syncs, rebuilds or checks anything out. Then runs the arms one at a time and reports TTFT, the vLLM/hf ratio per TP, and vLLM TP-scaling with provenance. Use when asked to benchmark or reproduce Gemma-4 / gemma-4-26B-A4B TTFT or prefill latency, benchmark it at different tensor-parallel sizes, reproduce #1102, compare spyre-inference with hf-adapters, or measure an MoE change's TTFT."
 ---
 
 # Gemma-4 TTFT benchmark (spyre-inference#1102)
@@ -32,6 +32,22 @@ is the user's call, made with their own tooling.
 The issue's setup steps (`git clone`, `uv sync`, `uv pip install torch-spyre...`) describe
 how the maintainer provisioned their host. They are **not** executed here.
 
+## Tensor parallelism
+
+`--tp "1 2 4"` sweeps the **vLLM arm** across tensor-parallel sizes (default `"1"`, the
+issue's recipe). Each size runs `vllm bench latency --tensor-parallel-size N`; spyre-inference
+supports TP≥1 in fp16 with a native `all_reduce`.
+
+- **hf-adapters is single-card.** Multi-device execution is out of scope upstream, so the hf
+  arm always runs once at TP1 and serves as the fixed reference. There is no hf baseline above TP1.
+- **The report** gives, per vLLM TP, the `vLLM/hf` ratio against that one hf-TP1 median, plus
+  a vLLM TP-scaling table (speedup and parallel efficiency vs vLLM-TP1). Include `1` in `--tp`
+  to get the scaling numbers; without it only absolute TTFT and the per-TP ratio are shown.
+- **Device-count gate.** A requested TP above the host's Spyre card count is a hard ERROR and
+  nothing runs — adjust `--tp`. The card count is `$SPYRE_DEVICES` if set, else the numbered
+  IOMMU-group nodes under `/dev/vfio`. TP uses N cards within the one benchmark process; the
+  one-process-at-a-time rule for the card is unchanged.
+
 ## Quick start
 
 ```bash
@@ -39,6 +55,7 @@ SKILL=<this skill dir>
 source <venv>/bin/activate                 # the environment to benchmark
 $SKILL/scripts/run_1102.sh --check         # read-only check + plan; exit 0 / 1 / 3
 $SKILL/scripts/run_1102.sh                 # benchmark (refuses on any ERROR, or on WARN without --accept-warnings)
+$SKILL/scripts/run_1102.sh --tp "1 2"      # sweep the vLLM arm across TP1 and TP2 (hf stays TP1)
 ```
 
 On dt-inductor pods: `--env-script /scratch/virtualenv/<env>/bin/activate`, or
@@ -64,12 +81,15 @@ On dt-inductor pods: `--env-script /scratch/virtualenv/<env>/bin/activate`, or
    - Cold cache, a vLLM run takes two to three times as long as an hf run, about half
      of it engine init; much of the hf run is its first warmup call, which compiles.
    - Use `--repeat 3` (arms alternate) for any decision; one replicate is indicative.
+   - For a TP sweep, pass `--tp "1 2 ..."`; vLLM runs each size per rep, hf runs once at TP1.
+     A size above the host's card count is refused at the gate (ERROR) before anything runs.
 5. **Gate, then report.** From `report.md`:
    - a `FAILED` row: report the failure with the tail of that arm's `run.log`, no number;
    - `LEAK` (max/min > 1.10): quote the median only and say the mean is compile-contaminated;
    - with `--recompiles`: a nonzero post-warmup recompile count means warmup missed a shape.
 
-   Report the package table, every WARN accepted, the per-arm rows and the headline ratio.
+   Report the package table, every WARN accepted, the per-run rows (arm × TP), the per-TP
+   `vLLM/hf` ratios, and — when TP1 is in the sweep — the vLLM TP-scaling table.
 
 ## What `--check` looks at (read-only)
 
@@ -129,7 +149,7 @@ The run itself also refuses a busy card (`fuser /dev/vfio/vfio`).
 ## Reference results
 
 From the dt-inductor2 pod, 2026-10-06/07, both arms on one profiler-free torch-spyre
-(`2ab31d08`, which contains `e9d3`). A ballpark, not a contract:
+(`2ab31d08`, which contains `e9d3`), **all at TP1**. A ballpark, not a contract:
 
 | arm | commit | median TTFT vs hf |
 |---|---|---|
@@ -137,12 +157,15 @@ From the dt-inductor2 pod, 2026-10-06/07, both arms on one profiler-free torch-s
 | spyre-inference main | `ad76a008` | 1.52x (1.54x issue metric) |
 | MoE stack (#1058 + #1154) | `ef206a2a` | 1.14x |
 
+TP-scaling numbers (TP2+) are host- and card-count-dependent; record them from your own
+`--tp` sweep rather than quoting a fixed figure here.
+
 ## Output layout
 
 `<out>/` (default `$HOME/gemma4-ttft-1102/<timestamp>/`):
 
 - `report.md` / `report.json`: package table, findings, per-arm rows, ratio.
-- `<arm>_<rep>/run.log`: full log; `vllm_<rep>/latency.json`: vLLM's JSON.
+- `<arm>_tp<N>_<rep>/run.log`: full log; `vllm_tp<N>_<rep>/latency.json`: vLLM's JSON.
 - `env_<arm>.json`: everything the check found, with its findings.
 - `provenance.txt`: host, date, interpreters, `ibm-*` RPMs. `args.txt`: the flags used.
 
