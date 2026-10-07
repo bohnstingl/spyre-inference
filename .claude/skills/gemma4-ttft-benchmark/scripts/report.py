@@ -1,3 +1,17 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Summarize a run_1102.sh output directory as Markdown.
 
 The headline is the issue's own comparison: `vllm bench latency` average latency (with
@@ -34,7 +48,9 @@ def _vllm_recompiles(log: str) -> int | None:
 
 def _row(run_dir: Path) -> dict:
     meta = _read_json(run_dir / "meta.json")
-    log = (run_dir / "run.log").read_text(errors="replace") if (run_dir / "run.log").exists() else ""
+    log = (
+        (run_dir / "run.log").read_text(errors="replace") if (run_dir / "run.log").exists() else ""
+    )
     row = {"arm": meta.get("arm"), "rep": meta.get("rep"), "rc": meta.get("rc")}
     if row["arm"] == "hf":
         if m := TTFT_RE.search(log):
@@ -43,8 +59,13 @@ def _row(run_dir: Path) -> dict:
     else:
         data = _read_json(run_dir / "latency.json")
         if lat := data.get("latencies"):
-            row.update(metric=data["avg_latency"], median=statistics.median(lat),
-                       min=min(lat), max=max(lat), n=len(lat))
+            row.update(
+                metric=data["avg_latency"],
+                median=statistics.median(lat),
+                min=min(lat),
+                max=max(lat),
+                n=len(lat),
+            )
         if m := THREADS_RE.search(log):
             row["threads"] = int(m.group(1))
         row["recompiles"] = _vllm_recompiles(log)
@@ -54,10 +75,16 @@ def _row(run_dir: Path) -> dict:
 
 
 def main(out: Path) -> int:
-    rows = sorted((_row(d) for d in out.glob("*_*/") if (d / "meta.json").exists()),
-                  key=lambda r: (r["rep"] or 0, r["arm"] or ""))
+    rows = sorted(
+        (_row(d) for d in out.glob("*_*/") if (d / "meta.json").exists()),
+        key=lambda r: (r["rep"] or 0, r["arm"] or ""),
+    )
     envs = {arm: env for arm in ("hf", "vllm") if (env := _read_json(out / f"env_{arm}.json"))}
-    prov = (out / "provenance.txt").read_text().splitlines() if (out / "provenance.txt").exists() else []
+    prov = (
+        (out / "provenance.txt").read_text().splitlines()
+        if (out / "provenance.txt").exists()
+        else []
+    )
 
     print("# Gemma-4 26B-A4B TTFT, spyre-inference#1102 recipe\n")
     print(f"Run: `{out}`\n")
@@ -74,11 +101,18 @@ def main(out: Path) -> int:
         dists += ["hf-adapters-spyre"] if arm == "hf" else ["vllm", "spyre-inference"]
         for dist in dists:
             info = env.get(dist) or {}
-            print(f"| {arm} | {dist} | {info.get('version', 'MISSING')} | "
-                  f"{(info.get('commit') or '')[:12]} | {info.get('checkout', '')} |")
-    findings = {(f["level"], f["message"]): f for env in envs.values() for f in env.get("findings", [])}
+            print(
+                f"| {arm} | {dist} | {info.get('version', 'MISSING')} | "
+                f"{(info.get('commit') or '')[:12]} | {info.get('checkout', '')} |"
+            )
+    findings = {
+        (f["level"], f["message"]): f for env in envs.values() for f in env.get("findings", [])
+    }
     if findings:
-        print("\nEnvironment findings (WARN = deviates from the issue's recipe, accepted for this run):\n")
+        print(
+            "\nEnvironment findings (WARN = deviates from the issue's recipe, "
+            "accepted for this run):\n"
+        )
         order = ["ERROR", "WARN", "INFO"]
         for (level, message), f in sorted(findings.items(), key=lambda kv: order.index(kv[0][0])):
             print(f"- **{level}** [{f['arm']}] {message}")
@@ -87,7 +121,10 @@ def main(out: Path) -> int:
     print("|---|---|---|---|---|---|---|---|")
     for r in rows:
         if "metric" not in r:
-            print(f"| {r['arm']} | {r['rep']} | FAILED rc={r['rc']} | | | | | see {r['arm']}_{r['rep']}/run.log |")
+            print(
+                f"| {r['arm']} | {r['rep']} | FAILED rc={r['rc']} | | | | | "
+                f"see {r['arm']}_{r['rep']}/run.log |"
+            )
             continue
         notes = []
         if r["spread"] > LEAK_SPREAD:
@@ -97,16 +134,20 @@ def main(out: Path) -> int:
         if r.get("recompiles") is not None:
             notes.append(f"{r['recompiles']} post-warmup recompiles")
         name = "TTFT median" if r["arm"] == "hf" else "avg latency"
-        print(f"| {r['arm']} | {r['rep']} | {name} {r['metric']:.3f} | {r['median']:.3f} | "
-              f"{r['min']:.3f} | {r['max']:.3f} | {r['spread']:.2f} | {'; '.join(notes)} |")
+        print(
+            f"| {r['arm']} | {r['rep']} | {name} {r['metric']:.3f} | {r['median']:.3f} | "
+            f"{r['min']:.3f} | {r['max']:.3f} | {r['spread']:.2f} | {'; '.join(notes)} |"
+        )
 
     by_arm = {arm: [r for r in rows if r["arm"] == arm and "metric" in r] for arm in ("hf", "vllm")}
     if by_arm["hf"] and by_arm["vllm"]:
         hf = statistics.median(r["metric"] for r in by_arm["hf"])
         v_avg = statistics.median(r["metric"] for r in by_arm["vllm"])
         v_med = statistics.median(r["median"] for r in by_arm["vllm"])
-        print(f"\n**vLLM / hf-adapters: {v_avg / hf:.2f}x** (issue metric: vLLM avg latency "
-              f"{v_avg:.3f} s / hf median TTFT {hf:.3f} s); median/median {v_med / hf:.2f}x")
+        print(
+            f"\n**vLLM / hf-adapters: {v_avg / hf:.2f}x** (issue metric: vLLM avg latency "
+            f"{v_avg:.3f} s / hf median TTFT {hf:.3f} s); median/median {v_med / hf:.2f}x"
+        )
         if len(by_arm["hf"]) < 3 or len(by_arm["vllm"]) < 3:
             print("\nFewer than 3 replicates per arm: indicative only, not an equivalence claim.")
     if any("libaiupti" in message for _, message in findings):
