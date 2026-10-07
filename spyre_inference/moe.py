@@ -30,6 +30,11 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    MoERunner,
+    _moe_forward,
+    _moe_forward_shared,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -294,20 +299,29 @@ def _moe_persistent(
     def expert_body(acc, tiles):
         x, route_tile, gate_tile, up_tile, down_tile = tiles
         activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
-        return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
+        return acc + torch.matmul(activated, down_tile) * route_tile, None
 
-    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}):
+    # Loop-body ops only see the hints of this scope, so the names work_div resolves T by go
+    # here too: inside a traced block graph nothing else names x. Each body op is kept at
+    # [1, T, C], with C standing for M or H.
+    init = torch.zeros_like(x).unsqueeze(0)
+    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}, named_dims=["ONE", "T", "C"]):
         result, _ = for_each_tile(
             expert_body,
             (x, route, gate, up, down),
             dims=(None, 0, 0, 0, 0),
             tile_size=1,
-            init=torch.zeros_like(x),
+            init=init,
         )
-    return result
+    return result.squeeze(0)
 
 
-def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+def _gathered(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    route_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
     return _moe_gathered(
         x,
@@ -317,19 +331,22 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         layer.spyre_moe_down,
         layer.top_k,
         layer.spyre_moe_stick,
-        layer.spyre_moe_route_dtype,
+        route_dtype or layer.spyre_moe_route_dtype,
         recipe.routing,
         recipe.activation,
     )
 
 
 def _gathered_tokens(
-    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    route_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     # The gathered kernel only lowers at one token. ``dynamic=False`` specializes this loop to
     # the packed bucket, so slicing, expert calls, and assembly stay in one compiled region.
     rows = [
-        _gathered(layer, x[token : token + 1], router_logits[token : token + 1])
+        _gathered(layer, x[token : token + 1], router_logits[token : token + 1], route_dtype)
         for token in range(x.shape[0])
     ]
     return torch.cat(rows)
@@ -464,6 +481,18 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     )
 
 
+@MoERunner.register_oot(name="MoERunner")
+class SpyreMoERunner(MoERunner):
+    """Takes vLLM's direct MoE entry, as upstream does on CPU and TPU.
+
+    A compiled block then compiles the MoE dispatch along with the rest of its graph,
+    rather than calling it through the opaque ``torch.ops.vllm.moe_forward`` op.
+    """
+
+    def _select_forward(self) -> Callable:
+        return _moe_forward if self.shared_experts is None else _moe_forward_shared
+
+
 @CustomOp.register_oot(name="UnquantizedFusedMoEMethod")
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """OOT bridge from vLLM's unquantized MoE method to ``SpyreMoERecipe``."""
@@ -482,6 +511,9 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "this architecture has not opted in."
             )
         _prepare_layer(cast("RoutedExperts", layer))
+        # MoERunner._forward_impl initializes this lazily. Traced, that check becomes a guard
+        # which warmup's first call flips, so the first real request would re-trace the block.
+        layer._ensure_moe_quant_config_init()
 
     def apply_monolithic(
         self,
@@ -491,8 +523,22 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
-        moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
+        if torch.compiler.is_compiling():
+            # Traced into the caller's graph: the forms run inline, without compiled regions or
+            # their compiler scopes. In-graph inputs are compiler-laid-out, so no offset check;
+            # an in-graph fp32 softmax hits a stick incompatibility, so routing stays in the
+            # logits' dtype.
+            if tokens == 1:
+                return _gathered(layer, x, router_logits, router_logits.dtype)
+            if tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS:
+                return _gathered_tokens(layer, x, router_logits, router_logits.dtype)
+            if layer.spyre_moe_recipe.routing == "full_softmax":
+                route = _route(layer, _probs(router_logits, router_logits.dtype))
+            else:
+                route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
+            return _experts(layer, x, route)
+        moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
         if tokens == 1 or (
             tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS

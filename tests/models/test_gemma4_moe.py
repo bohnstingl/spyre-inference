@@ -477,6 +477,74 @@ def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
     assert resets == [1], "the reset must survive a failing region"
 
 
+@pytest.mark.parametrize(
+    ("routing", "tokens", "expected"),
+    [
+        ("full_softmax", 1, ["_gathered"]),
+        ("full_softmax", 3, ["_gathered_tokens"]),
+        ("full_softmax", 8, ["_probs", "_route", "_experts"]),
+        ("topk_softmax", 8, ["_topk_probs", "_route_selected", "_experts"]),
+    ],
+)
+def test_traced_dispatch_inlines_forms_without_compiled_regions(
+    monkeypatch, routing, tokens, expected
+):
+    """Inside the block graph the forms are traced directly, routing in the logits' dtype."""
+    from spyre_inference import moe as moe_module
+
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(moe_module, "_region", lambda *args: pytest.fail("entered a region"))
+    calls = []
+    for name in ("_gathered", "_gathered_tokens", "_probs", "_topk_probs", "_route"):
+        monkeypatch.setattr(
+            moe_module, name, lambda *args, _name=name: calls.append((_name, args[-1]))
+        )
+    for name in ("_route_selected", "_experts"):
+        monkeypatch.setattr(moe_module, name, lambda *args, _name=name: calls.append((_name,)))
+
+    _apply(_dispatch_layer(routing), tokens=tokens)
+    assert [call[0] for call in calls] == expected
+    if expected[0] in ("_gathered", "_gathered_tokens", "_probs"):
+        assert calls[0][1] == torch.float32, "routing must stay in the logits' dtype in-graph"
+
+
+def test_moe_runner_takes_vllms_direct_entry():
+    """The opaque moe_forward op would keep the experts out of the compiled block graph."""
+    from vllm.model_executor.custom_op import op_registry_oot
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    from spyre_inference.moe import SpyreMoERunner
+
+    assert op_registry_oot["MoERunner"] is SpyreMoERunner
+    runner = object.__new__(SpyreMoERunner)
+    runner._shared_experts = None
+    assert runner._select_forward() is moe_runner._moe_forward
+    runner._shared_experts = object()
+    assert runner._select_forward() is moe_runner._moe_forward_shared
+
+
+def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypatch):
+    """Built lazily in a traced block, it becomes a guard warmup flips: a re-trace mid-serving."""
+    from types import MethodType
+
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+
+    monkeypatch.setattr(moe_module, "_prepare_layer", lambda layer: None)
+    method = object.__new__(SpyreUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace(has_bias=False)
+    method.moe_quant_config = None
+    layer = SimpleNamespace(spyre_moe_recipe=object(), quant_method=method)
+    init = RoutedExperts._ensure_moe_quant_config_init
+    layer._ensure_moe_quant_config_init = MethodType(init, layer)
+
+    method.process_weights_after_loading(layer)
+    assert method.moe_quant_config is not None
+
+
 def test_gathered_matches_dense_reference(moe_weights):
     """The decode form, at the single token whose combine has a legal device layout.
 
