@@ -15,13 +15,18 @@
 """Check an environment against the spyre-inference#1102 recipe. Changes nothing.
 
 Imports only torch and torch_spyre (to prove the runtime libraries load); every other
-package is located with find_spec and read through its metadata. Checkouts are read with
-`git rev-parse` / `git status` / `git merge-base --is-ancestor` only.
+package is located with find_spec and read through its metadata. Checkouts are only read:
+`git rev-parse` / `status` / `log` / `rev-list` / `remote` / `merge-base --is-ancestor`.
 
 Each finding is ERROR (cannot be benchmarked), WARN (deviates from the issue's recipe; the
 user must accept it) or INFO (recorded only).
 
-Usage: python -I check_env.py --out env.json --arms hf,vllm --model PATH [--allow-profiler]
+The main arm runs spyre-inference at --main-ref (default: <the torch-spyre/spyre-inference
+remote>/main), exported from the checkout with `git archive`; this script resolves that ref
+and compares it with GitHub's main via `git ls-remote` (a read).
+
+Usage: python -I check_env.py --out env.json --arms hf,main,branch --model PATH
+           [--main-ref REF] [--allow-profiler]
 Exit status: 0 = no ERROR, 1 = at least one ERROR.
 """
 
@@ -36,6 +41,7 @@ import sys
 
 # The issue's pins: hf-adapters #620 and the torch-spyre its hf-adapters env was built with.
 HF_SHA = "9b075e46bc9689671fb7ba546ef12b3e509bbdc5"
+UPSTREAM = "torch-spyre/spyre-inference"
 TS_SHA = "e9d31328345f55ead94d1a65736380e6e07513bc"
 PACKAGES = {
     "torch-spyre": "torch_spyre",
@@ -263,6 +269,54 @@ def _check_vllm(env: dict) -> None:
         )
 
 
+def _check_main(env: dict, ref: str) -> None:
+    checkout = (env.get("spyre-inference") or {}).get("checkout")
+    if not checkout:
+        flag("ERROR", "main", "the main arm needs spyre-inference installed from a git checkout")
+        return
+    git = ("git", "-C", checkout)
+    if ref == "auto":
+        remotes = (_run(*git, "remote", "-v") or "").splitlines()
+        names = sorted(
+            {r.split()[0] for r in remotes if re.search(rf"[/:]{UPSTREAM}(\.git)?\s", r)}
+        )
+        if not names:
+            flag("ERROR", "main", f"no remote of {checkout} points at {UPSTREAM}; pass --main-ref")
+            return
+        ref = f"{names[0]}/main"
+    sha = _run(*git, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    if not sha:
+        flag("ERROR", "main", f"--main-ref {ref} does not resolve in {checkout}")
+        return
+    main = {"ref": ref, "commit": sha, "subject": _run(*git, "log", "-1", "--format=%s", sha)}
+    env["spyre-inference-main"] = main
+    remote_head = _run(
+        "timeout", "20", "git", "ls-remote", f"https://github.com/{UPSTREAM}.git", "refs/heads/main"
+    )
+    if remote_head:
+        main["github_main"] = remote_head.split()[0]
+        if main["github_main"] != sha:
+            flag(
+                "WARN",
+                "main",
+                f"{ref} is {sha[:12]} but GitHub main is {main['github_main'][:12]}: "
+                "the main arm would measure a stale main (fetch it yourself)",
+            )
+    else:
+        flag("INFO", "main", f"could not reach GitHub to confirm {ref} is current")
+    head = env["spyre-inference"].get("commit")
+    if head and _run(*git, "merge-base", "--is-ancestor", sha, head) is None:
+        missing = _run(*git, "rev-list", "--count", f"{head}..{sha}")
+        flag(
+            "WARN",
+            "main",
+            f"the branch under test lacks {missing} commit(s) of {ref}: "
+            "main vs branch also measures those",
+        )
+    elif head:
+        main["branch_ahead"] = int(_run(*git, "rev-list", "--count", f"{sha}..{head}") or 0)
+
+
 def _check_host(args: argparse.Namespace) -> None:
     for key in sorted(os.environ):
         if KNOB_RE.match(key):
@@ -287,7 +341,8 @@ def _check_host(args: argparse.Namespace) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--out", required=True)
-    p.add_argument("--arms", default="hf,vllm")
+    p.add_argument("--arms", default="hf,main,branch")
+    p.add_argument("--main-ref", default="auto")
     p.add_argument("--model", required=True)
     p.add_argument("--allow-profiler", action="store_true")
     args = p.parse_args()
@@ -311,8 +366,15 @@ def main() -> int:
         _requirements(env, "torch-spyre", "torch", "both")
         if "hf" in arms:
             _check_hf(env)
-        if "vllm" in arms:
+        si = env.get("spyre-inference") or {}
+        if si.get("checkout"):
+            git = ("git", "-C", si["checkout"])
+            si["branch"] = _run(*git, "rev-parse", "--abbrev-ref", "HEAD")
+            si["subject"] = _run(*git, "log", "-1", "--format=%s")
+        if {"main", "branch"} & set(arms):
             _check_vllm(env)
+        if "main" in arms:
+            _check_main(env, args.main_ref)
     _check_host(args)
     env["findings"] = findings
     with open(args.out, "w") as f:
