@@ -38,9 +38,10 @@ from spyre_clickhouse_ingest import (
     base_artifact_id,
     benchmark_id_for,
     benchmarks_already_ingested,
+    ensure,
     gha_artifact_id,
+    insert_artifact_result,
     insert_benchmarks,
-    insert_gha_artifact_result,
     run_id_of,
     schema,
     tables_present,
@@ -512,24 +513,28 @@ def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> No
         aid = gha_artifact_id(BENCH_COMPONENT, base, installed, leg.arch)
         repo, gha = leg.repository, leg.gha_run_id
         run_url = f"https://github.com/{repo}/actions/runs/{gha}" if repo and gha else ""
-        wrote = insert_gha_artifact_result(
+        # The derive-gha-artifact-id record, so the leg registers as every GHA leg does.
+        ensure(
+            client,
+            db,
+            f"gha:{aid}|{base}|{installed}",
+            leg.arch,
+            component=BENCH_COMPONENT,
+            run_url=run_url,
+            sources=[(repo, leg.branch, leg.sha)],
+        )
+        wrote = insert_artifact_result(
             client,
             db,
             artifact_id=aid,
-            component=BENCH_COMPONENT,
-            arch=leg.arch,
             run_id=run_id_value,
             test_type=leg.test_type,
             state=leg.state,
+            arch=leg.arch,
             result_kind="performance",
             # Suite wall clock: each throughput run's own elapsed_time.
             duration_s=sum(r["actual"] for r in rows if r.get("metric") == "elapsed_time"),
-            base_artifact_id=base,
-            installed=installed,
-            repo=repo,
-            git_ref=leg.branch,
-            git_sha=leg.sha,
-            run_url=run_url,
+            props={"run_url": run_url, "source": "gha"},
         )
         if wrote:
             log.info("Linked artifact %s (base %s) to run_id=%s", aid, base, run_id_value)
