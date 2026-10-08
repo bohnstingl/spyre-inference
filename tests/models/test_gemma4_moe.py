@@ -478,21 +478,18 @@ def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("routing", "tokens", "expected"),
+    ("routing", "expected"),
     [
-        ("full_softmax", 1, ["_gathered"]),
-        ("full_softmax", 3, ["_gathered_tokens"]),
-        ("full_softmax", 8, ["_probs", "_route", "_experts"]),
-        ("topk_softmax", 8, ["_topk_probs", "_route_selected", "_experts"]),
+        ("full_softmax", ["_probs", "_route", "_moe_persistent_in_graph"]),
+        ("topk_softmax", ["_topk_probs", "_route_selected", "_moe_persistent_in_graph"]),
     ],
 )
-def test_traced_dispatch_inlines_forms_without_compiled_regions(
-    monkeypatch, routing, tokens, expected
+def test_traced_dispatch_inlines_the_persistent_form_without_compiled_regions(
+    monkeypatch, routing, expected
 ):
     """Inside the block graph the forms are traced directly, routing in the logits' dtype."""
     from spyre_inference import moe as moe_module
 
-    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     monkeypatch.setattr(moe_module, "_region", lambda *args: pytest.fail("entered a region"))
     calls = []
@@ -500,17 +497,18 @@ def test_traced_dispatch_inlines_forms_without_compiled_regions(
         monkeypatch.setattr(
             moe_module, name, lambda *args, _name=name: calls.append((_name, args[-1]))
         )
-    for name in ("_route_selected", "_experts"):
+    monkeypatch.setattr(moe_module, "_experts", lambda *args: pytest.fail("ran the region form"))
+    for name in ("_route_selected", "_moe_persistent_in_graph"):
         monkeypatch.setattr(moe_module, name, lambda *args, _name=name: calls.append((_name,)))
 
-    _apply(_dispatch_layer(routing), tokens=tokens)
+    _apply(_dispatch_layer(routing), tokens=64)
     assert [call[0] for call in calls] == expected
-    if expected[0] in ("_gathered", "_gathered_tokens", "_probs"):
+    if expected[0] == "_probs":
         assert calls[0][1] == torch.float32, "routing must stay in the logits' dtype in-graph"
 
 
-def test_moe_runner_takes_vllms_direct_entry():
-    """The opaque moe_forward op would keep the experts out of the compiled block graph."""
+def test_moe_runner_traces_only_stick_aligned_batches():
+    """In-graph routing only lowers at whole sticks; other batches keep the opaque op."""
     from vllm.model_executor.custom_op import op_registry_oot
     from vllm.model_executor.layers.fused_moe.runner import moe_runner
 
@@ -518,10 +516,14 @@ def test_moe_runner_takes_vllms_direct_entry():
 
     assert op_registry_oot["MoERunner"] is SpyreMoERunner
     runner = object.__new__(SpyreMoERunner)
+    runner.moe_config = SimpleNamespace(in_dtype=torch.float16)
     runner._shared_experts = None
-    assert runner._select_forward() is moe_runner._moe_forward
+    runner._select_forward()
+    assert runner._entry_for(512) is moe_runner._moe_forward
+    assert runner._entry_for(8) is torch.ops.vllm.moe_forward
     runner._shared_experts = object()
-    assert runner._select_forward() is moe_runner._moe_forward_shared
+    assert runner._entry_for(64) is moe_runner._moe_forward_shared
+    assert runner._entry_for(3) is torch.ops.vllm.moe_forward_shared
 
 
 def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypatch):
@@ -707,6 +709,39 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
         finally:
             reset_named_dims()
 
+    expected = _dense_reference(
+        x,
+        torch.softmax(logits, dim=-1),
+        host["gate"],
+        host["up"],
+        host["down"],
+        host["scale"],
+        TOP_K,
+    )
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_in_graph_persistent_matches_dense_reference(stick_aligned_moe_weights):
+    """Routing and experts traced into one graph, as in a block, with nothing naming x."""
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference.moe import _moe_persistent_in_graph, _moe_persistent_routing, _probs
+
+    host, device = stick_aligned_moe_weights
+    stick = get_elem_in_stick(torch.float16)
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(stick, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
+    logits = torch.randn(stick, STICK_EXPERTS, dtype=torch.float16, generator=gen)
+    identity = torch.eye(stick, dtype=torch.float16).to("spyre")
+
+    def block(x, logits):
+        route = _moe_persistent_routing(_probs(logits, logits.dtype), identity, TOP_K, stick)
+        return _moe_persistent_in_graph(
+            x, route, device["gate"], device["up"], device["down"], "gelu_tanh"
+        )
+
+    compiled = torch.compile(block, backend="inductor", fullgraph=True, dynamic=False)
+    actual = compiled(x.to("spyre"), logits.to("spyre"))
     expected = _dense_reference(
         x,
         torch.softmax(logits, dim=-1),
