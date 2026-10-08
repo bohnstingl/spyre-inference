@@ -564,6 +564,8 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             # batches: the persistent form runs inline, without compiled regions or their
             # scopes. An in-graph fp32 softmax cannot be lowered, so routing stays in the
             # logits' dtype.
+            # Note: This branching here is solely done to support eager and compiled
+            # execution of the experts.
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
                 route = _route(layer, _probs(router_logits, router_logits.dtype))
