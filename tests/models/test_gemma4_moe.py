@@ -721,36 +721,64 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-def test_in_graph_persistent_matches_dense_reference(stick_aligned_moe_weights):
-    """Routing and experts traced into one graph, as in a block, with nothing naming x."""
+def test_traced_persistent_dispatch_matches_dense_reference():
+    """Traced into one graph, as a compiled block does for a stick-aligned token bucket.
+
+    SpyreMoERunner only traces batches that span whole sticks of tokens; this is that path,
+    end to end through ``apply_monolithic``, at gemma-4's expert count and one stick of tokens.
+    """
+    from spyre_testing_plugin.pytest_plugin import spyre_available
     from torch_spyre._C import get_elem_in_stick
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+    from torch_spyre.ops.fallbacks import FallbackWarning
 
-    from spyre_inference.moe import _moe_persistent_in_graph, _moe_persistent_routing, _probs
+    from spyre_inference.moe import SpyreMoERecipe, SpyreUnquantizedFusedMoEMethod
 
-    host, device = stick_aligned_moe_weights
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    top_k = 8
+    torch.manual_seed(0)
+    host = {
+        "gate": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "up": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "down": torch.randn(GEMMA4_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
+    }
     stick = get_elem_in_stick(torch.float16)
-    gen = torch.Generator().manual_seed(0)
+    layer = SimpleNamespace(
+        spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
+        spyre_moe_gate=dma_moe_expert_weight_to_spyre(host["gate"]),
+        spyre_moe_up=dma_moe_expert_weight_to_spyre(host["up"]),
+        spyre_moe_down=dma_moe_expert_weight_to_spyre(host["down"]),
+        spyre_moe_stick=stick,
+        spyre_moe_route_identity=torch.eye(stick, dtype=torch.float16).to("spyre"),
+        top_k=top_k,
+    )
+    gen = torch.Generator().manual_seed(stick)
     x = torch.randn(stick, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
-    logits = torch.randn(stick, STICK_EXPERTS, dtype=torch.float16, generator=gen)
-    identity = torch.eye(stick, dtype=torch.float16).to("spyre")
+    logits = torch.randn(stick, GEMMA4_EXPERTS, dtype=torch.float16, generator=gen)
 
     def block(x, logits):
-        route = _moe_persistent_routing(_probs(logits, logits.dtype), identity, TOP_K, stick)
-        return _moe_persistent_in_graph(
-            x, route, device["gate"], device["up"], device["down"], "gelu_tanh"
-        )
+        # In-graph producers, so the MoE inputs are compiler-laid-out as in a decoder block.
+        return SpyreUnquantizedFusedMoEMethod.apply_monolithic(None, layer, x * 1.0, logits * 1.0)
 
-    compiled = torch.compile(block, backend="inductor", fullgraph=True, dynamic=False)
-    actual = compiled(x.to("spyre"), logits.to("spyre"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        compiled = torch.compile(block, backend="inductor", fullgraph=True, dynamic=False)
+        actual = compiled(x.to("spyre"), logits.to("spyre"))
+
+    fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not fallbacks, f"the traced dispatch fell back to CPU: {fallbacks}"
     expected = _dense_reference(
         x,
         torch.softmax(logits, dim=-1),
         host["gate"],
         host["up"],
         host["down"],
-        host["scale"],
-        TOP_K,
+        torch.ones(GEMMA4_EXPERTS),
+        top_k,
     )
+    assert actual.shape == x.shape
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
