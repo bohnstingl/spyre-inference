@@ -374,6 +374,7 @@ class _SpyreModelWrapper:
         shape_bucketer: SpyreShapeBucketer | None = None,
         *,
         model_dtype: torch.dtype,
+        inputs_embeds_buffer: torch.Tensor | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -382,6 +383,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
+        object.__setattr__(self, "_inputs_embeds_buffer", inputs_embeds_buffer)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -510,6 +512,10 @@ class _SpyreModelWrapper:
         on device makes the same copy d2d, which the check allows. It also avoids
         a D2H that upstream's H2D immediately undoes.
 
+        The result is staged in that buffer at the bucket's shape and returned as its
+        prefix view: upstream's copy is then a self-copy torch-spyre skips, instead of
+        a `copy_from_d2d` compiled for every distinct `n`.
+
         A merged result previously came back on CPU because the merge's
         `torch.where` output layout did not survive that d2d `copy_`. If a merged
         multimodal prompt starts producing garbage rather than failing, suspect
@@ -525,8 +531,6 @@ class _SpyreModelWrapper:
             input_ids = F.pad(input_ids, (0, padded_tokens - num_tokens))
             if is_multimodal is not None:
                 is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
-        else:
-            padded_tokens = None
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
         is_multimodal = self._to_spyre(is_multimodal)
@@ -535,7 +539,18 @@ class _SpyreModelWrapper:
         result = self._model.embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
         )
-        if padded_tokens is not None:
+        buf = self._inputs_embeds_buffer
+        if (
+            padded_tokens is not None
+            and buf is not None
+            and isinstance(result, torch.Tensor)
+            and result.shape[0] == padded_tokens <= buf.shape[0]
+            and result.shape[1:] == buf.shape[1:]
+            and result.dtype == buf.dtype
+        ):
+            buf[:padded_tokens].copy_(result)
+            return buf[:num_tokens]
+        if padded_tokens is not None and padded_tokens != num_tokens:
             # A plain prefix slice, not select_rows: the padding above always
             # appends at the end, so the real rows are always 0..num_tokens
             # contiguously -- no gather needed, and a merged result's torch.where
@@ -723,6 +738,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             ),
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
+            inputs_embeds_buffer=self.inputs_embeds.gpu,
         )
 
     @staticmethod
