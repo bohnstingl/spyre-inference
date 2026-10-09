@@ -127,12 +127,23 @@ runs:
       run: |
         find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
 
+    # The build_kernels job built the kernels wheel once for this run; setup.py takes the compiled
+    # extensions from it (SPYRE_KERNELS_WHEEL_DIR) instead of compiling. A missing artifact fails
+    # here rather than falling back.
+    - name: Download kernels wheel
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: sampling-kernels-wheel
+        path: ${{ runner.temp }}/kernels-wheel
+
     # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
     - name: Build spyre-inference
       if: ${{ inputs.use_prebaked_image != 'true' }}
       shell: bash
       env:
         TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        SPYRE_KERNELS_WHEEL_DIR: ${{ runner.temp }}/kernels-wheel
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
@@ -147,6 +158,13 @@ runs:
         # Print the resolved torch install for log visibility.
         uv pip show torch
         uv pip freeze
+
+    # The kernel tests skip when the extension is absent, so a run that builds the workspace must check it here.
+    - name: Check the csrc/ kernels load
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      shell: bash
+      run: |
+        .venv/bin/python -c "from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels; assert has_sampling_kernels(), 'the sampling kernels did not build or load; see the Build spyre-inference step'"
 
     # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
     - name: Activate the freshly-built venv
