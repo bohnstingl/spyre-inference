@@ -70,10 +70,10 @@ def force_disable_chunked_prefill(engine_args: EngineArgs) -> None:
     logger.info("CLIP: disabling chunked prefill (unsupported with token-level pooling).")
 
 
-# Mixed image+text steps: vLLM 0.28's CLIPEmbeddingModel treats a step holding any
-# image as image-only, so its text requests skip the text tower. Backport of
-# vllm-project/vllm#53165 (in vLLM >= 0.29). Remove this, and the spyre_align_token_mask
-# call in TorchSpyreModelRunner._preprocess, once the vLLM pin reaches 0.29.
+# Mixed image+text steps: vLLM 0.28 skips the text tower for a step holding any image.
+# vllm-project/vllm#53165 (0.29) fixes that, but restores the image rows with the packed
+# mask, unsqueezed on the device: wrong on the encoder grid, and a card fault
+# (torch-spyre#5230). So SpyreCLIPEmbeddingModel routes them itself on every version.
 
 
 def _has_mm(multimodal_embeddings) -> bool:
@@ -131,19 +131,27 @@ class SpyreCLIPEmbeddingModel(CLIPEmbeddingModel):
         finally:
             vllm_clip.Attention = attention
         self._spyre_mm_token_mask: torch.Tensor | None = None
+        self._spyre_has_text_tokens = True
 
     def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
-        out = super().embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
         self._spyre_mm_token_mask = is_multimodal if _has_mm(multimodal_embeddings) else None
-        self._is_text_input = has_text_tokens(multimodal_embeddings, is_multimodal)
-        return out
+        self._spyre_has_text_tokens = has_text_tokens(multimodal_embeddings, is_multimodal)
+        return super().embed_input_ids(
+            input_ids, multimodal_embeddings, is_multimodal=is_multimodal
+        )
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None, **kw):
-        out = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kw)
-        mask = self._spyre_mm_token_mask
-        if self._is_text_input and mask is not None and inputs_embeds is not None:
-            out = merge_text_and_vision(out, inputs_embeds, mask)
-        return out
+        # Not super().forward(): see the mixed-step note above.
+        if intermediate_tensors is not None:
+            raise RuntimeError("PP is not supported for this model")
+        assert inputs_embeds is not None
+        if not self._spyre_has_text_tokens:
+            return inputs_embeds
+        text_embeds = inputs_embeds
+        if text_embeds.shape[1] > self.text_embed_dim:
+            text_embeds = text_embeds[:, : self.text_embed_dim]
+        text = self.get_text_features(input_ids, positions, text_embeds)
+        return merge_text_and_vision(text, inputs_embeds, self._spyre_mm_token_mask)
 
     def spyre_align_token_mask(self, num_tokens: int, grid) -> None:
         """Trim the mask to the step's real rows, then lay it out as the grid, if any.
@@ -154,7 +162,7 @@ class SpyreCLIPEmbeddingModel(CLIPEmbeddingModel):
         if mask is None:
             return
         mask = convert(mask, device="cpu")[:num_tokens]
-        self._is_text_input = bool((~mask).any())
+        self._spyre_has_text_tokens = bool((~mask).any())
         if grid is not None:
             extent, width, query_lens = grid
             grid_mask = expand_packed_embeds_to_encoder_grid(

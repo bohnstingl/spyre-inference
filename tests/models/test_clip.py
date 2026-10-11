@@ -175,7 +175,7 @@ def test_select_class_rows_matches_the_class_token_slice(batch):
 
 
 def _align(mask: torch.Tensor, num_tokens: int, grid=None) -> types.SimpleNamespace:
-    model = types.SimpleNamespace(_spyre_mm_token_mask=mask, _is_text_input=True)
+    model = types.SimpleNamespace(_spyre_mm_token_mask=mask, _spyre_has_text_tokens=True)
     SpyreCLIPEmbeddingModel.spyre_align_token_mask(model, num_tokens, grid)
     return model
 
@@ -183,13 +183,13 @@ def _align(mask: torch.Tensor, num_tokens: int, grid=None) -> types.SimpleNamesp
 def test_padding_rows_do_not_count_as_text():
     # Two image rows, then bucket padding: the step is image-only.
     model = _align(torch.tensor([True, True, False, False]), num_tokens=2)
-    assert model._is_text_input is False
+    assert model._spyre_has_text_tokens is False
     assert torch.equal(model._spyre_mm_token_mask, torch.tensor([True, True]))
 
 
 def test_a_real_text_row_keeps_the_text_tower():
     model = _align(torch.tensor([True, False, False, False]), num_tokens=3)
-    assert model._is_text_input is True
+    assert model._spyre_has_text_tokens is True
 
 
 def test_mask_is_laid_out_like_the_grid():
@@ -198,6 +198,23 @@ def test_mask_is_laid_out_like_the_grid():
     model = _align(torch.tensor([False, False, True, False]), 3, grid=(4, 2, [2, 1]))
     expected = torch.tensor([False, False, False, False, True, False, False, False])
     assert torch.equal(model._spyre_mm_token_mask, expected)
+
+
+def test_forward_routes_each_row_itself():
+    """Text-tower output on text rows and the vision embedding on image rows, without
+    upstream's ``forward``, whose image-row handling differs across vLLM versions."""
+    embeds = torch.arange(8.0).view(4, 2)
+    model = types.SimpleNamespace(
+        _spyre_has_text_tokens=True,
+        _spyre_mm_token_mask=torch.tensor([False, True, False, False]),
+        text_embed_dim=2,
+        get_text_features=lambda ids, pos, emb: -emb,
+    )
+    out = SpyreCLIPEmbeddingModel.forward(model, None, None, inputs_embeds=embeds)
+    assert torch.equal(out, torch.where(model._spyre_mm_token_mask[:, None], embeds, -embeds))
+
+    model._spyre_has_text_tokens = False
+    assert SpyreCLIPEmbeddingModel.forward(model, None, None, inputs_embeds=embeds) is embeds
 
 
 if __name__ == "__main__":
