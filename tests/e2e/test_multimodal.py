@@ -220,7 +220,7 @@ def test_clip_mixed_image_text_step_matches_each_request_alone():
     """One image and two texts of different lengths in one step embed as they do alone.
 
     vLLM 0.28 treated a step holding any image as image-only, so its texts skipped the
-    text tower (the ``multimodal/clip.py`` workaround). One image only: batched images
+    text tower (the ``models/clip.py`` workaround). One image only: batched images
     take a different conv path.
     """
     if spyre_device_count() == 0:

@@ -492,7 +492,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     Causality is per attention group, read off the metadata's ``apply_causal_mask``:
     ``EncoderOnlyAttention`` layers arrive bidirectional, and a plain ENCODER_ONLY
-    ``Attention`` (CLIP text, ``custom_ops/clip_attn_type.py``) arrives causal.
+    ``Attention`` (CLIP text, ``models/clip.py``) arrives causal.
     """
 
     def __init__(self, *args, **kwargs) -> None:

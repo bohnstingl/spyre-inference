@@ -38,6 +38,7 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
+    "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
     # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM builds
     # its language model through the registry as Gemma4ForCausalLM, which resolves here,
     # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
@@ -105,8 +106,14 @@ def register_models() -> None:
 
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
-    builds the ModelConfig (e.g. text-only backbone selection)."""
+    builds the ModelConfig (e.g. text-only backbone selection).
+
+    Also registers the Spyre architectures: a ``VLLM_PLUGINS`` allowlist without the ops
+    plugin leaves that to the worker, too late for an in-process engine, which by then
+    has cached the upstream class of a multimodal architecture such as CLIP.
+    """
     from spyre_inference.models import clip, gemma4
 
+    register_models()
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)

@@ -1538,7 +1538,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
-        # A model that masks multimodal rows after embedding (CLIP, multimodal/clip.py)
+        # A model that masks multimodal rows after embedding (CLIP, models/clip.py)
         # needs its mask in the same row layout as the embeddings.
         align_token_mask = getattr(self.model, "spyre_align_token_mask", None)
         if grid is None:
