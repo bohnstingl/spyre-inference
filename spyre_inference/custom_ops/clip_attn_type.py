@@ -16,10 +16,12 @@
 
 vLLM builds CLIP's text ``Attention`` as plain ``DECODER`` by default, even though a
 pooling model never reuses a KV cache -- so Spyre pays for an unused per-sequence KV
-path. This builds it ``ENCODER_ONLY`` instead and marks the impl ``causal``, before the
-model is constructed (``Attention.__init__`` picks the backend from ``attn_type``).
-Only the module-local ``Attention`` name in vLLM's ``clip`` module is patched; the
-vision tower uses ``MMEncoderAttention`` and is unaffected.
+path. This builds it ``ENCODER_ONLY`` instead, before the model is constructed
+(``Attention.__init__`` picks the backend from ``attn_type``). It stays causal: the
+attention metadata vLLM builds is causal unless the layer is an ``EncoderOnlyAttention``,
+whose builder clears the flag. Only the module-local ``Attention`` name in vLLM's
+``clip`` module is patched; the vision tower uses ``MMEncoderAttention`` and is
+unaffected.
 """
 
 from __future__ import annotations
@@ -39,7 +41,5 @@ def register() -> None:
         def __init__(self, *args, **kwargs) -> None:
             kwargs.setdefault("attn_type", AttentionType.ENCODER_ONLY)
             super().__init__(*args, **kwargs)
-            if kwargs["attn_type"] == AttentionType.ENCODER_ONLY:
-                self.impl.causal = True
 
     clip_mod.Attention = _SpyreClipTextAttention  # ty: ignore[invalid-assignment]

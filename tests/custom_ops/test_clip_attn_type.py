@@ -57,10 +57,9 @@ def test_register_defaults_to_causal_encoder_only(monkeypatch):
     monkeypatch.setattr(Attention, "__init__", _stub_init(captured))
 
     clip_attn_type.register()
-    layer = clip_mod.Attention(8, 64, 1.0, prefix="text_model.encoder.layers.0.self_attn.attn")
+    clip_mod.Attention(8, 64, 1.0, prefix="text_model.encoder.layers.0.self_attn.attn")
 
     assert captured["attn_type"] is AttentionType.ENCODER_ONLY
-    assert layer.impl.causal is True
 
 
 def test_register_does_not_override_an_explicit_attn_type(monkeypatch):

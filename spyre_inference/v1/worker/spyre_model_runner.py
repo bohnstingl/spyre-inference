@@ -55,7 +55,6 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
-from vllm.v1.attention.backend import AttentionType
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -595,7 +594,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Warmup only; see _warm_encoder_inline_paths.
         self._forced_encoder_rect: tuple[int, int] | None = None
         self._force_encoder_ragged = False
-        self._encoder_causal = False
         self.spyre_encoder_rect_steps = 0
         self.spyre_encoder_ragged_steps = 0
         self.spyre_encoder_real_tokens = 0
@@ -706,14 +704,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
                 self.model, self._spyre_device, encoder_len_ladder(self.vllm_config)
-            )
-            # A causal tower (e.g. CLIP text) patched onto the encoder backend needs
-            # causal masks on its attention plans.
-            self._encoder_causal = any(
-                getattr(m.impl, "causal", False)
-                for m in self.model.modules()
-                if isinstance(m, Attention)
-                and m.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
             )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
@@ -1156,7 +1146,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 seen.add(id(md))
                 if md.encoder_plan is None:
                     encoder_md = cast(SpyreAttentionMetadata, md)
-                    plan = self._forced_encoder_plan() or build_encoder_plan(
+                    plan = self._forced_encoder_plan(encoder_md) or build_encoder_plan(
                         encoder_md,
                         rectangles=rectangles,
                         width_cap_for=self._encoder_width_caps,
@@ -1167,7 +1157,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         # Grouping only pays off through the compiled kernels; the
                         # eager per-request loop has no launch overhead to amortise.
                         batched=self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE,
-                        causal=self._encoder_causal,
                     )
                     encoder_md.encoder_plan = plan
                 else:
@@ -1192,13 +1181,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
         return out
 
-    def _forced_encoder_plan(self):
+    def _forced_encoder_plan(self, md: SpyreAttentionMetadata):
         """Warmup's declared rectangle, ignoring the dummy batch's own shape.
 
         Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
         ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
         ``sum(query_lens)`` the body row count, which keeps ``_preprocess``'s expansion an
-        identity.
+        identity. The mask takes ``md``'s causality, as the group's real plans do.
         """
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
@@ -1213,7 +1202,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             width=width,
             mask=convert(
                 encoder_key_pad_mask(
-                    extent, [extent] * width, self._model_dtype(), self._encoder_causal
+                    extent, [extent] * width, self._model_dtype(), md.apply_causal_mask
                 ),
                 self._spyre_device,
             ),

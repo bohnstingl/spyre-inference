@@ -393,7 +393,6 @@ def build_encoder_plan(
     device: torch.device,
     dtype: torch.dtype,
     batched: bool,
-    causal: bool = False,
 ) -> EncoderRectPlan | list[EncoderGroupPlan]:
     """Choose the path for this step and build what its kernels need.
 
@@ -402,7 +401,10 @@ def build_encoder_plan(
 
     ``query_start_loc``, not ``seq_lens``: query length *is* kv length here, and
     upstream's ``_dummy_run`` puts the whole padded token count in ``seq_lens``.
+
+    The masks are causal iff the metadata's ``apply_causal_mask`` is set.
     """
+    causal = attn_metadata.apply_causal_mask
     query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
     seq_lens = attn_metadata.seq_lens.cpu().tolist()
     # The body pads past num_actual_tokens; those rows are not a request.
@@ -488,11 +490,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     off the metadata and runs the path that plan's type names; it never decides the
     path itself, so every layer in the stack agrees.
 
-    ``causal`` is set by the model patch that routes a causal pooling tower here (CLIP
-    text, ``custom_ops/clip_attn_type.py``); vLLM has no causal encoder-only type.
+    Causality is per attention group, read off the metadata's ``apply_causal_mask``:
+    ``EncoderOnlyAttention`` layers arrive bidirectional, and a plain ENCODER_ONLY
+    ``Attention`` (CLIP text, ``custom_ops/clip_attn_type.py``) arrives causal.
     """
-
-    causal: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -589,6 +590,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
+        causal: bool = False,
     ) -> int:
         """Trace every declared shape, on the caller's own tensors.
 
@@ -599,6 +601,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         A buffer that is not the declared body shape warms nothing -- every declared
         shape is sized against that one buffer, so a smaller one indexes out of bounds.
+
+        ``causal`` is the group's ``apply_causal_mask``: a causal mask is
+        ``[N, 1, L, L]`` rather than ``[N, 1, 1, L]``, a different compiled variant.
         """
         if self._warmed or query.shape[0] != self._buffer_rows:
             return 0
@@ -611,9 +616,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # per-rectangle dummy runs; tracing it here would compile a kernel nothing calls.
         rectangles = [] if encoder_inline_active() else self._rectangles
         for extent, width in rectangles:
-            mask = convert(
-                encoder_key_pad_mask(extent, [extent] * width, dtype, self.causal), device
-            )
+            mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device)
             self._run_rect(
                 output, query, key, value, mask, width, extent, num_heads, num_kv_heads, head_size
             )
@@ -624,9 +627,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * width),
                 device,
             )
-            mask = convert(
-                encoder_key_pad_mask(extent, [extent] * width, dtype, self.causal), device
-            )
+            mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device)
             self._run_fused(
                 output,
                 rows,
@@ -681,7 +682,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 device=query.device,
                 dtype=query.dtype,
                 batched=self._compile_attn,
-                causal=self.causal,
             )
             attn_metadata.encoder_plan = plan
 
@@ -709,7 +709,16 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             # Here, not in the runner's warmup: a Spyre tensor's device layout is part of
             # the compile cache key, so the declared shapes must be traced against these
             # buffers. Self-guarded, so only the first call of the run does the work.
-            self.warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
+            self.warm_kernels(
+                query,
+                key,
+                value,
+                output,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                attn_metadata.apply_causal_mask,
+            )
 
         if isinstance(plan, EncoderRectPlan):
             self._forward_rect(plan, query, key, value, output, fused_store_ok, head_size)
