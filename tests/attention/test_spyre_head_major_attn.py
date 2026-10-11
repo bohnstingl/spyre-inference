@@ -485,9 +485,9 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
 
 
 _SHAPES = [
-    pytest.param([(1, 128)], id="decode_single"),
+    pytest.param([(1, 128)], id="decode_single", marks=pytest.mark.attention_smoke),
     pytest.param([(1, 300), (1, 64), (1, 512)], id="decode_batch"),
-    pytest.param([(64, 64)], id="prefill_single"),
+    pytest.param([(64, 64)], id="prefill_single", marks=pytest.mark.attention_smoke),
     pytest.param([(128, 128), (64, 200)], id="prefill_batch"),
     pytest.param([(64, 300), (1, 128)], id="mixed_batch"),
 ]
@@ -932,8 +932,9 @@ def test_head_major_decode_body_matches_fp32_reference(
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
     kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
+    from test_spyre_attn import _decode_reference_fp32
+
     from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
-    from tests.attention.test_spyre_attn import _decode_reference_fp32
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
@@ -1047,7 +1048,7 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
     with num_kv_heads times the gather entries, which measured ~2x the kernel time.
     """
-    from tests.attention.test_spyre_attn import _build_metadata
+    from spyre_testing_plugin.attn_helpers import _build_metadata
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 4, 64, 64
@@ -1100,7 +1101,7 @@ def test_dispatch_declines_a_gather_spanning_the_cache(default_vllm_config, conf
     Two decode seqs of two blocks each over a three-page cache is the TP2 gemma-4 shape
     that compiled the skipped variant mid-serving and hit a torch-spyre codegen assert.
     """
-    from tests.attention.test_spyre_attn import _build_metadata
+    from spyre_testing_plugin.attn_helpers import _build_metadata
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64

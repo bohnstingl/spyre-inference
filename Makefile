@@ -127,7 +127,7 @@ RESULTS_DIR ?= .
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-smoke-shard test-quality test-quality-shard \
         test-probes test-probes-shard \
-        test-attention test-attention-shard \
+        test-attention test-attention-shard test-attention-smoke \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
         test-upstream-distributed \
         tests-single-card tests-multi-card
@@ -277,6 +277,12 @@ test-attention-shard-%:
 test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
+# Small decoder-attention subset; the full attention suite is excluded from the integration
+# tier, so this is the only attention the upstream dispatch exercises. Also marked `attention`,
+# so the same cases still run inside the full shards under the other tiers.
+test-attention-smoke: ## Run the small attention smoke subset (integration-tier attention coverage). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='attention_smoke and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
 test-distributed: ## Run the distributed marker combo (excludes probes; they run in test-probes), unsharded.
 	$(MAKE) run-one MARK_OVERRIDE='distributed and not (upstream or probe)' JUNIT_XML=$(JUNIT_XML)
 
@@ -389,8 +395,8 @@ coverage: ## Combine COVERAGE=1 data (COVERAGE_DATA=dir) into report + coverage.
 # WITHOUT torch, so every benchmark then dies with "No module named 'torch'".
 # No combination of --active/--no-sync/--frozen/--inexact/--no-project avoids
 # this. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv entirely and invoke the
-# already-activated venv's python3 directly (the setup sourced above exports
-# $VIRTUAL_ENV, so plain python3 is the baked interpreter). Empty/unset keeps
+# active venv's python3 directly (AIU_SETUP_CMD prefers the project .venv when
+# present, otherwise keeping the profile-selected venv). Empty/unset keeps
 # the uv path, correct on arches with a resolvable lockfile (amd64, ppc64le).
 SKIP_UV_FOR_BENCHMARKING ?=
 ifeq ($(strip $(SKIP_UV_FOR_BENCHMARKING)),)
