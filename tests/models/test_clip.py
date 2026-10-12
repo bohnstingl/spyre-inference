@@ -164,6 +164,9 @@ def test_text_attention_mask_is_causal_whatever_the_runner_passes(
         batched=False,
     )
     assert [tuple(p.mask.shape) for p in plans] == [(1, 1, 64, 64)] * 2
+    for plan in plans:
+        assert plan.mask[0, 0, 0, 1] < 0, "query 0 sees key 1"
+        assert plan.mask[0, 0, 1, 0] == 0, "query 1 does not see key 0"
 
 
 def test_text_only_step_runs_text_tower():
