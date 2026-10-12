@@ -74,6 +74,9 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     runner._encoder_budget = 8
     runner._encoder_rectangles = []
     runner._spyre_kv_caches = []
+    # load_model sets this. The fake runner skips load_model, and the compiled
+    # pooling path reads it before deciding whether to warm the embed gather.
+    runner._pooling_on_spyre = False
     runner.spyre_shape_bucketer = _Bucketer()
     runner.mm_budget = (
         types.SimpleNamespace(mm_max_items_per_batch=max_items) if max_items is not None else None
@@ -90,6 +93,23 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     runner._warm_encoder_unpack = lambda hidden_states: None
     runner._get_mm_dummy_batch = lambda modality, n: {"modality": modality, "n": n}
     return runner, vision
+
+
+def test_eager_pooling_does_not_run_the_vision_tower():
+    """An eager pooling load does not run the vision tower.
+
+    Those blocks crash, and a text-only load would die in the engine core
+    before the first prompt.
+    """
+    runner, vision = _runner("pooling", multimodal=True, max_items={"image": 4})
+    runner.model_config.enforce_eager = True
+    runner.max_num_reqs = 4
+    runner.scheduler_config = types.SimpleNamespace(max_num_batched_tokens=64)
+
+    runner.warming_up_model()
+
+    assert vision.batches == []
+    assert runner.spyre_shape_bucketer.warmed_up
 
 
 def test_pooling_warmup_runs_every_image_batch_width(monkeypatch):

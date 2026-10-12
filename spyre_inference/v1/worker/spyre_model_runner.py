@@ -121,12 +121,12 @@ from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
+    encoder_grid_source_rows,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
     encoder_rectangles,
     encoder_shape_tables,
-    expand_packed_embeds_to_encoder_grid,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
     logits_row_buckets,
@@ -896,8 +896,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         token budget. That single forward traces the body, the pooler, and (through
         ``SpyreEncoderAttentionImpl.warm_kernels``, which runs on its first attention
         call) every declared rectangle and every declared ``(width, extent)`` group.
-        Eager pooling: one short dummy, then ``mark_warmed_up()``.
-        A pooling model with a vision tower also runs ``embed_multimodal`` at every
+        Eager pooling: one short dummy, then ``mark_warmed_up()``. It does not run the
+        vision tower: those blocks crash while the tower is still eager, and a
+        text-only load would die at startup.
+        Compiled pooling with a vision tower also runs ``embed_multimodal`` at every
         image-batch width up to ``mm_max_items_per_batch``; profile_run only traces
         the widest one, and the tower stays eager.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
@@ -924,6 +926,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._warm_pooler_row_widths(hidden_states)
                         self._warm_encoder_unpack(hidden_states)
                     self._warm_encoder_inline_paths()
+                    self._warm_encoder_embed_gather()
                     self.spyre_shape_bucketer.mark_warmed_up()
                 if self._spyre_kv_caches:
                     # A decoder-type text tower (e.g. CLIP's) has a real KV cache;
@@ -951,8 +954,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
                 self._warmup_input_embedding(num_tokens)
-                if is_pooling:
-                    self._warmup_multimodal_encoder()
+                # No vision warmup here. enforce_eager reaches this branch, and the
+                # eager vision blocks crash. A text load would otherwise die in
+                # embed_multimodal before the first prompt.
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -1542,6 +1546,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return
         select_rows(hidden_states, torch.zeros(hidden_states.shape[0], dtype=torch.int64))
 
+    @torch.inference_mode()
+    def _warm_encoder_embed_gather(self) -> None:
+        """Compile ``_preprocess``'s embeddings-to-grid gather once per rectangle.
+
+        Only a multimodal pooling model (e.g. CLIP) reaches it, and ``_dummy_run`` hands
+        the model its own ``inputs_embeds`` without going through ``_preprocess``.
+        """
+        buffer = getattr(self, "inputs_embeds", None)
+        if (
+            not self.supports_mm_inputs
+            or not self._pooling_on_spyre
+            or not self._encoder_rectangles
+            or buffer is None
+        ):
+            return
+        body = buffer.gpu[: self._encoder_budget]
+        for extent, width in self._encoder_rectangles:
+            select_rows(body, torch.zeros(width * extent, dtype=torch.int64))
+
     def _unpad_encoder_hidden(
         self, hidden_states: torch.Tensor, num_scheduled_tokens: int
     ) -> torch.Tensor:
@@ -1579,9 +1602,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Upstream writes rows contiguously and the padding hook only sets the trailing
         pad count, so the interior per-sequence padding a rectangle needs has to
-        happen here. Integer tensors only, tens of KB -- which is why this
-        once-per-step pack is cheap where a per-layer gather of the activations is
-        not.
+        happen here. The `input_ids` path packs only integer tensors (tens of KB),
+        avoiding a per-layer activation gather. Multimodal pooling with only
+        `inputs_embeds` instead gathers the embeddings into the grid on the device,
+        with an index built on the host, so they never round-trip through the host.
 
         ``query_start_loc`` and ``seq_lens`` keep the real ragged lengths, which
         attention's mask needs.
@@ -1623,11 +1647,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 position_offset=position_offset,
             )
             grid_ids = None
-            grid_embeds = convert(
-                expand_packed_embeds_to_encoder_grid(
-                    inputs_embeds[:num_tokens].cpu(), query_lens, width, extent
+            # Gathered from the whole body buffer, not a `[:num_tokens]` slice: the
+            # gather specialises on its source's row count, which then stays fixed.
+            grid_embeds = select_rows(
+                inputs_embeds,
+                torch.tensor(
+                    encoder_grid_source_rows(query_lens, width, extent), dtype=torch.int64
                 ),
-                inputs_embeds.device,
             )
             assert grid_embeds.shape[0] == width * extent, (grid_embeds.shape[0], width * extent)
 
