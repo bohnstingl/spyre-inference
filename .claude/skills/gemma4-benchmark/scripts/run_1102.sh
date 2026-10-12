@@ -1,9 +1,9 @@
 #!/bin/bash
-# Gemma-4 26B-A4B on Spyre, one workload at one tensor-parallel size: hf-adapters (#620) vs
-# `vllm bench latency` on spyre-inference main and on the branch under test. Runs on an
+# Gemma-4 26B-A4B on Spyre, one workload at one tensor-parallel size: the installed hf-adapters
+# vs `vllm bench latency` on spyre-inference main and on the branch under test. Runs on an
 # environment that already has everything installed. It never installs, syncs, rebuilds or
-# checks anything out: it checks the environment, reports what deviates from the recipe, and
-# stops for anything the user has not accepted. Ends with a shareable report.md.
+# checks anything out: it checks the environment (a checkout behind its upstream main is a
+# WARN), and stops for anything the user has not accepted. Ends with a shareable report.md.
 #   TTFT (default): the maintainer's commands from spyre-inference#1102 (TP1 there)
 #     https://github.com/torch-spyre/spyre-inference/issues/1102#issuecomment-6001115830
 #   ITL (--itl): decode latency on the same prompt, ITL = (lat64 - lat1) / 63, the method of
@@ -213,7 +213,7 @@ if [ "$TP" -gt 1 ] && [ "$CARDS" -lt "$TP" ]; then
 fi
 if [ "${N_WARN:-0}" != 0 ] && [ "$ACCEPT_WARNINGS" = 0 ]; then
   [ "$CHECK_ONLY" = 1 ] && exit 3
-  die "$N_WARN WARN finding(s) deviate from the issue's recipe; review them, then re-run with --accept-warnings" 3
+  die "$N_WARN WARN finding(s); review them, then re-run with --accept-warnings" 3
 fi
 [ "$CHECK_ONLY" = 1 ] && exit 0
 card_busy() { [ -e /dev/vfio/vfio ] && fuser /dev/vfio/vfio >/dev/null 2>&1; }

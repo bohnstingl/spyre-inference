@@ -393,7 +393,7 @@ def env_items(runs: list[dict]) -> list[str]:
     if "hf" in arms and hf:
         items.append(
             f"<b>hf-adapters</b>: <code>{esc(hf.get('commit'))}</code> "
-            f"(<code>{esc(hf.get('version'))}</code>)"
+            f"(<code>{esc(hf.get('version'))}</code>{esc(report._upstream(hf))})"
         )
     if "main" in arms and main:
         items.append(
@@ -408,7 +408,8 @@ def env_items(runs: list[dict]) -> list[str]:
         )
     items.append(
         f"<b>torch-spyre</b>: <code>{esc(ts.get('commit'))}</code> "
-        f"(<code>{esc(ts.get('version'))}</code>), one build for every arm"
+        f"(<code>{esc(ts.get('version'))}</code>{esc(report._upstream(ts))}), "
+        "one build for every arm"
     )
     items.append(
         ", ".join(
@@ -659,8 +660,7 @@ def page(top: Path, narrative: dict) -> str:
     <h3>Environment</h3>
     <ul class="plain">{env_list}</ul>
     <h3>Environment check</h3>
-    <p class="sub">WARN deviates from spyre-inference#1102's recipe and was accepted for this
-    run; INFO is recorded only.</p>
+    <p class="sub">WARN was reviewed and accepted for this run; INFO is recorded only.</p>
     {env_findings(runs)}
     <details>
       <summary>Every run ({total}), seconds per request</summary>
