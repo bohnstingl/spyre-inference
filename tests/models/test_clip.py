@@ -24,16 +24,20 @@ import pytest
 import torch
 import vllm.model_executor.models.clip as vllm_clip
 from spyre_testing_plugin.pytest_plugin import spyre_available
+from vllm.config import get_current_vllm_config
 from vllm.model_executor.models.clip import CLIPEmbeddingModel
-from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
 
 from spyre_inference.models.clip import (
+    CausalEncoderOnlyAttention,
     SpyreCLIPEmbeddingModel,
     force_disable_chunked_prefill,
     has_text_tokens,
     merge_text_and_vision,
     select_class_rows,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import build_encoder_plan
 
 
 def _fake_engine_args(model_type: str | None, enable_chunked_prefill=None):
@@ -101,7 +105,7 @@ def test_tolerates_config_load_failure(monkeypatch):
     assert args.enable_chunked_prefill is None
 
 
-def test_text_tower_attention_is_built_encoder_only(monkeypatch):
+def test_text_tower_is_built_with_causal_encoder_attention(monkeypatch):
     """The text tower takes its layers from the clip module's ``Attention``, and the
     swap is undone once the model is built."""
     upstream = vllm_clip.Attention
@@ -114,9 +118,52 @@ def test_text_tower_attention_is_built_encoder_only(monkeypatch):
     monkeypatch.setattr(CLIPEmbeddingModel, "__init__", init)
     SpyreCLIPEmbeddingModel(vllm_config=None)
 
-    assert seen["attention"].func is upstream
-    assert seen["attention"].keywords == {"attn_type": AttentionType.ENCODER_ONLY}
+    assert seen["attention"] is CausalEncoderOnlyAttention
     assert vllm_clip.Attention is upstream
+
+
+@pytest.mark.parametrize("runner_causal", [True, False])
+def test_text_attention_mask_is_causal_whatever_the_runner_passes(
+    default_vllm_config, monkeypatch, runner_causal
+):
+    """CLIP text gets a causal ``[N, 1, L, L]`` mask from its own builder, so a change to
+    vLLM's ``causal=True`` default cannot make it bidirectional."""
+    layer = CausalEncoderOnlyAttention(4, 64, 64**-0.5, prefix="text_model.layers.0.attn")
+    cfg = get_current_vllm_config()
+    monkeypatch.setattr(cfg.model_config, "get_num_attention_heads", lambda *a: 4)
+    monkeypatch.setattr(cfg.model_config, "get_num_kv_heads", lambda *a: 4)
+    monkeypatch.setattr(cfg.cache_config, "block_size", 64)
+    spec = EncoderOnlyAttentionSpec(
+        block_size=64, num_kv_heads=4, head_size=64, dtype=torch.float16
+    )
+    builder_cls = layer.get_attn_backend().get_builder_cls()
+    builder = builder_cls(spec, [layer.layer_name], cfg, torch.device("cpu"))
+    cu = torch.tensor([0, 9, 39], dtype=torch.int32)
+    metadata = builder.build(
+        0,
+        CommonAttentionMetadata(
+            query_start_loc=cu,
+            query_start_loc_cpu=cu,
+            seq_lens=torch.tensor([9, 30], dtype=torch.int32),
+            num_reqs=2,
+            num_actual_tokens=39,
+            max_query_len=30,
+            max_seq_len=30,
+            block_table_tensor=torch.zeros(2, 1, dtype=torch.int32),
+            slot_mapping=torch.arange(39, dtype=torch.int64),
+            causal=runner_causal,
+        ),
+    )
+
+    plans = build_encoder_plan(
+        metadata,
+        rectangles=(),
+        width_cap_for={},
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        batched=False,
+    )
+    assert [tuple(p.mask.shape) for p in plans] == [(1, 1, 64, 64)] * 2
 
 
 def test_text_only_step_runs_text_tower():

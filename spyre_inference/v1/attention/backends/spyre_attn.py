@@ -700,8 +700,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # max_num_batched_tokens, and warmup profiles every sequence at the full
             # body size (a 256-token sentence-transformer asks for 512).
             #
-            # Causality is upstream's per-group flag: EncoderOnlyAttention's builder
-            # clears it, while a plain ENCODER_ONLY Attention (CLIP text) keeps it.
+            # Causality is the group's flag: EncoderOnlyAttention's builder clears it,
+            # CausalEncoderOnlyAttention's (CLIP text, models/clip.py) sets it.
             return SpyreAttentionMetadata(
                 num_actual_tokens=common_attn_metadata.num_actual_tokens,
                 num_seqs=common_attn_metadata.num_reqs,
