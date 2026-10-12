@@ -31,6 +31,8 @@ import torch
 import torch.nn.functional as F
 
 EXPERTS, HIDDEN, INTER, TOP_K = 16, 256, 128, 4
+# Gemma 4 26B A4B expert width, split across TP ranks.
+GEMMA4_EXPERT_INTER = 704
 # gemma-4-26B-A4B's expert count: a whole number of fp16 sticks, so its routing promotes.
 GEMMA4_EXPERTS = 128
 
@@ -136,9 +138,12 @@ def test_dense_reference_uses_cpu_weights_for_the_selected_experts():
     )
 
 
-# A whole number of sticks, and a TP shard that lands mid-stick with the same remainder
-# gemma-4-26B-A4B leaves at TP=2 (704 // 2 = 352).
-@pytest.fixture(scope="module", params=[INTER, INTER - 32], ids=["native", "widened"])
+# Exercise the Gemma 4 expert widths for TP=1/2/4, including stick padding on TP shards.
+@pytest.fixture(
+    scope="module",
+    params=[GEMMA4_EXPERT_INTER, GEMMA4_EXPERT_INTER // 2, GEMMA4_EXPERT_INTER // 4],
+    ids=["tp1", "tp2", "tp4"],
+)
 def moe_weights(request):
     """Random expert stacks in the device layout, plus their host copies.
 
@@ -147,11 +152,18 @@ def moe_weights(request):
     added lanes must not reach the result: that inertness is what lets TP narrow ``M``.
     """
     from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
 
-    from spyre_inference.moe import _to_spyre_expert_weight
+    from spyre_inference.moe import (
+        _chunk_pool_alias,
+        _derive_moe_chunks,
+        _down_chunk_pool_alias,
+        _to_spyre_expert_weight,
+    )
 
     inter = request.param
-    pad = -inter % get_elem_in_stick(torch.float16)
+    stick = get_elem_in_stick(torch.float16)
+    pad = -inter % stick
     torch.manual_seed(0)
     host = {
         "gate": torch.randn(EXPERTS, HIDDEN, inter, dtype=torch.float16) * 0.05,
@@ -165,13 +177,19 @@ def moe_weights(request):
         "down": host["down"] * host["scale"].view(EXPERTS, 1, 1),
     }
     if pad:
-        # The same widening, on the same axes, that ``_prepare_layer`` applies.
         stacks["gate"] = F.pad(stacks["gate"], (0, pad))
         stacks["up"] = F.pad(stacks["up"], (0, pad))
         stacks["down"] = F.pad(stacks["down"], (0, 0, 0, pad))
+    chunks = _derive_moe_chunks(HIDDEN, TOP_K, stick, spyre_config.sencores)
     device = {
-        k: _to_spyre_expert_weight(v, (), kernel_order=k == "down") for k, v in stacks.items()
+        name: _to_spyre_expert_weight(stacks[name], (), kernel_order=False)
+        for name in ("gate", "up")
     }
+    device["down"] = _to_spyre_expert_weight(stacks["down"], (), kernel_order=True)
+    device["down_alias"] = _down_chunk_pool_alias(device["down"], chunks)
+    device["gate_alias"] = _chunk_pool_alias(device["gate"], chunks)
+    device["up_alias"] = _chunk_pool_alias(device["up"], chunks)
+    device["chunks"] = chunks
     return host, device
 
 
@@ -480,8 +498,10 @@ def _dispatch_layer(routing):
         spyre_moe_gate=None,
         spyre_moe_up=None,
         spyre_moe_down=None,
+        spyre_moe_down_alias=None,
         # Divides both widths ``_apply`` builds, so these tests hit the token bound, not the guard.
         spyre_moe_stick=16,
+        spyre_moe_chunks=4,
         spyre_moe_route_dtype=torch.float16,
         top_k=TOP_K,
     )
@@ -549,6 +569,17 @@ def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatc
     _apply(_dispatch_layer("full_softmax"), tokens=3)
     assert calls == [("probs", "_probs"), ("route", "_route"), ("experts", "_experts")]
     assert resets == [1]
+
+
+def test_single_chunk_layout_uses_gathered_dispatch(monkeypatch):
+    calls, resets = _dispatch_recorder(monkeypatch)
+    layer = _dispatch_layer("full_softmax")
+    layer.spyre_moe_chunks = 1
+
+    _apply(layer, tokens=1)
+
+    assert calls == [("gathered", "_gathered")]
+    assert resets == []
 
 
 @pytest.mark.parametrize(
@@ -647,33 +678,54 @@ def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypa
     assert method.moe_quant_config is not None
 
 
-def test_gathered_matches_dense_reference(moe_weights):
-    """The decode form, at the single token whose combine has a legal device layout.
+@pytest.mark.parametrize(
+    "chunks_override", [None, 1, 2], ids=["derived", "single_chunk", "override"]
+)
+def test_gathered_matches_dense_reference(moe_weights, chunks_override):
+    """The gathered form matches the dense reference at its derived and override layouts.
 
     ``EXPERTS`` does not span whole sticks, so routing reduces in the transport dtype.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
 
-    from spyre_inference.moe import _moe_gathered
+    from spyre_inference.moe import (
+        _chunk_entry_constants,
+        _chunk_pool_alias,
+        _down_chunk_pool_alias,
+        _moe_gathered,
+    )
 
     host, device = moe_weights
     x, logits = _inputs(1)
     stick = get_elem_in_stick(torch.float16)
+    chunks = device["chunks"] if chunks_override is None else chunks_override
+    if chunks == device["chunks"]:
+        gate_alias = device["gate_alias"]
+        up_alias = device["up_alias"]
+        down_alias = device["down_alias"]
+    else:
+        gate_alias = _chunk_pool_alias(device["gate"], chunks)
+        up_alias = _chunk_pool_alias(device["up"], chunks)
+        down_alias = _down_chunk_pool_alias(device["down"], chunks)
 
+    chunk_scale, chunk_offsets = _chunk_entry_constants(chunks)
     region = torch.compile(_moe_gathered, backend="inductor", fullgraph=True, dynamic=False)
     with spyre_config.patch({"frontend_pool_allocation": True}):
         actual = region(
             x.to("spyre"),
             logits.to("spyre"),
-            device["gate"],
-            device["up"],
-            device["down"],
+            gate_alias,
+            up_alias,
+            down_alias,
             TOP_K,
+            chunks,
             stick,
             logits.dtype,
             "full_softmax",
             "gelu_tanh",
+            chunk_scale=chunk_scale,
+            chunk_offsets=chunk_offsets,
         )
 
     expected = _dense_reference(
@@ -688,6 +740,32 @@ def test_gathered_matches_dense_reference(moe_weights):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
+def test_gathered_rejects_whole_expert_down_pool():
+    from spyre_inference.moe import _moe_gathered
+
+    x = torch.zeros((1, 8), dtype=torch.float16)
+    logits = torch.zeros((1, 1), dtype=torch.float16)
+    gate = torch.zeros((4, 2, 3), dtype=torch.float16)
+    down = torch.zeros((1, 3, 8), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="gathered down pool"):
+        _moe_gathered(
+            x,
+            logits,
+            gate,
+            gate,
+            down,
+            1,
+            4,
+            4,
+            torch.float16,
+            "full_softmax",
+            "gelu_tanh",
+            chunk_scale=None,
+            chunk_offsets=None,
+        )
+
+
 # Row ``t`` of the router logits starts at ``t * num_experts``, which must span whole sticks to
 # be addressable. ``EXPERTS`` above deliberately does not, so the fallback is covered too.
 STICK_EXPERTS = 64
@@ -696,7 +774,16 @@ STICK_EXPERTS = 64
 @pytest.fixture(scope="module")
 def stick_aligned_moe_weights():
     """Expert stacks whose count spans whole sticks, so a row slice is addressable."""
-    from spyre_inference.moe import _to_spyre_expert_weight
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference.moe import (
+        _chunk_entry_constants,
+        _chunk_pool_alias,
+        _derive_moe_chunks,
+        _down_chunk_pool_alias,
+        _to_spyre_expert_weight,
+    )
 
     torch.manual_seed(0)
     host = {
@@ -705,10 +792,18 @@ def stick_aligned_moe_weights():
         "down": torch.randn(STICK_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
     host["scale"] = torch.ones(STICK_EXPERTS, dtype=torch.float16)
+    stick = get_elem_in_stick(torch.float16)
+    chunks = _derive_moe_chunks(HIDDEN, TOP_K, stick, spyre_config.sencores)
     device = {
-        k: _to_spyre_expert_weight(host[k], (), kernel_order=k == "down")
-        for k in ("gate", "up", "down")
+        "gate": _to_spyre_expert_weight(host["gate"], ()),
+        "up": _to_spyre_expert_weight(host["up"], ()),
+        "down": _to_spyre_expert_weight(host["down"], (), kernel_order=True),
     }
+    device["down_alias"] = _down_chunk_pool_alias(device["down"], chunks)
+    device["gate_alias"] = _chunk_pool_alias(device["gate"], chunks)
+    device["up_alias"] = _chunk_pool_alias(device["up"], chunks)
+    device["chunks"] = chunks
+    device["chunk_scale"], device["chunk_offsets"] = _chunk_entry_constants(chunks)
     return host, device
 
 
@@ -732,14 +827,20 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
     logits = torch.randn(num_tokens, STICK_EXPERTS, dtype=torch.float16, generator=gen)
     layer = SimpleNamespace(
         spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
+        spyre_moe_gate_alias=device["gate_alias"],
+        spyre_moe_up_alias=device["up_alias"],
         spyre_moe_gate=device["gate"],
         spyre_moe_up=device["up"],
         spyre_moe_down=device["down"],
+        spyre_moe_down_alias=device["down_alias"],
         spyre_moe_stick=get_elem_in_stick(torch.float16),
         # The transport dtype, so the routing softmax matches the reference exactly.
         spyre_moe_route_dtype=torch.float16,
         spyre_moe_regions={},
         top_k=TOP_K,
+        spyre_moe_chunks=device["chunks"],
+        spyre_moe_chunk_scale=device["chunk_scale"],
+        spyre_moe_chunk_offsets=device["chunk_offsets"],
     )
 
     with warnings.catch_warnings(record=True) as caught:
@@ -767,7 +868,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# 8 and 16: decode batches above SPYRE_MOE_GATHERED_MAX_TOKENS; 512: one prefill chunk.
+# 8 and 16: decode beyond the gathered bound; 512: prefill.
 @pytest.mark.parametrize(
     ("num_tokens", "routing_margin"),
     [(8, True), (16, True), (24, True), (32, True), (512, True), (512, False)],
@@ -809,7 +910,12 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens, routing_mar
         try:
             with spyre_config.patch({"allow_all_ops_in_lx_planning": True}):
                 actual = experts(
-                    x_dev, route, device["gate"], device["up"], device["down"], "gelu_tanh"
+                    x_dev,
+                    route,
+                    device["gate"],
+                    device["up"],
+                    device["down"],
+                    "gelu_tanh",
                 )
         finally:
             reset_named_dims()
@@ -939,22 +1045,49 @@ class _RoutedExperts(torch.nn.Module):
         super().__init__()
         self.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
         self.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        self.top_k = TOP_K
 
 
-def test_prepare_layer_rejects_an_unaligned_hidden_size_before_relayout():
+def test_moe_chunk_derivation_takes_the_fewest_chunks_that_fill_the_most_cores():
+    from spyre_inference.moe import _derive_moe_chunks
+
+    # Gemma 4: 8 experts × 4 hidden chunks fills 32 cores.
+    assert _derive_moe_chunks(2816, 8, 64, 32) == 4
+    # Five hidden sticks can use five equal chunks; no power-of-two assumption is needed.
+    assert _derive_moe_chunks(320, 4, 64, 32) == 5
+    # Fewer cores or a larger top_k need fewer chunks; more would only stack entries per core.
+    assert _derive_moe_chunks(2816, 8, 64, 16) == 2
+    assert _derive_moe_chunks(2816, 16, 64, 32) == 2
+
+
+def test_moe_chunk_override_is_read_and_shape_validated(monkeypatch):
+    from spyre_inference import envs
+    from spyre_inference.moe import _derive_moe_chunks
+
+    monkeypatch.setenv("SPYRE_MOE_CHUNKS", "2")
+    assert envs.SPYRE_MOE_CHUNKS == 2
+    assert _derive_moe_chunks(2816, 8, 64, 32, envs.SPYRE_MOE_CHUNKS) == 2
+
+    monkeypatch.setenv("SPYRE_MOE_CHUNKS", "3")
+    envs.clear_env_cache()
+    with pytest.raises(ValueError, match=r"SPYRE_MOE_CHUNKS=3 requires hidden size 2816"):
+        _derive_moe_chunks(2816, 8, 64, 32, envs.SPYRE_MOE_CHUNKS)
+
+
+@pytest.mark.parametrize("hidden", [HIDDEN - 1], ids=["not_stick_aligned"])
+def test_prepare_layer_rejects_a_non_stick_aligned_hidden_before_relayout(hidden, monkeypatch):
     from torch_spyre._C import get_elem_in_stick
 
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 
+    monkeypatch.delenv("SPYRE_MOE_CHUNKS", raising=False)
     stick = get_elem_in_stick(torch.float16)
-    hidden = HIDDEN - 1
     w13 = torch.empty(EXPERTS, 2 * INTER, hidden, dtype=torch.float16)
     w2 = torch.empty(EXPERTS, hidden, INTER, dtype=torch.float16)
     layer = _RoutedExperts(w13, w2)
     layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
 
-    match = rf"down expert-stack free dim {hidden}.*{stick}-element stick.*hidden_size"
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(ValueError, match=rf"hidden size {hidden} must be a multiple of {stick}"):
         _prepare_layer(layer)
 
     assert hasattr(layer, "w13_weight")
@@ -962,16 +1095,41 @@ def test_prepare_layer_rejects_an_unaligned_hidden_size_before_relayout():
     assert not hasattr(layer, "spyre_moe_gate")
 
 
-# A whole number of sticks, and a TP shard that lands mid-stick (704 // 2 = 352 for
-# gemma-4-26B-A4B, scaled down here).
-@pytest.mark.parametrize("inter", [INTER, INTER - 32])
-def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
+def test_prepare_layer_honors_chunk_override(monkeypatch):
+    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
+
+    monkeypatch.setenv("SPYRE_MOE_CHUNKS", "2")
+    layer = _RoutedExperts(
+        torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16),
+        torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16),
+    )
+    layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
+
+    _prepare_layer(layer)
+
+    assert layer.spyre_moe_chunks == 2
+    assert layer.spyre_moe_gate_alias is not None
+    assert layer.spyre_moe_up_alias is not None
+    assert layer.spyre_moe_down_alias is not None
+    assert layer.spyre_moe_gate_alias.shape == (EXPERTS * 2, HIDDEN // 2, INTER)
+    assert layer.spyre_moe_down_alias.shape == (EXPERTS * 2, INTER, HIDDEN // 2)
+
+
+# Exercise the actual Gemma 4 TP=2 and TP=4 expert widths with the reduced test hidden size.
+@pytest.mark.parametrize(
+    "inter",
+    [INTER, GEMMA4_EXPERT_INTER // 2, GEMMA4_EXPERT_INTER // 4],
+    ids=["baseline", "tp2", "tp4"],
+)
+def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter, monkeypatch):
     """A model recipe may prepare down weights before generic relayout."""
 
     from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer, _to_spyre_expert_weight
+
+    monkeypatch.delenv("SPYRE_MOE_CHUNKS", raising=False)
 
     torch.manual_seed(0)
     w13 = torch.randn(EXPERTS, 2 * inter, HIDDEN, dtype=torch.float16) * 0.05
@@ -990,8 +1148,15 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     width = inter + -inter % stick
     assert not hasattr(layer, "w13_weight"), "the fused stacks must be freed, not kept"
     assert not hasattr(layer, "w2_weight")
+    chunks = layer.spyre_moe_chunks
+    assert chunks is not None
+    assert layer.spyre_moe_gate_alias is not None
+    assert layer.spyre_moe_up_alias is not None
+    assert layer.spyre_moe_down_alias is not None
     assert layer.spyre_moe_gate.shape == (EXPERTS, HIDDEN, width)
     assert layer.spyre_moe_up.shape == (EXPERTS, HIDDEN, width)
+    assert layer.spyre_moe_gate_alias.shape == (EXPERTS * chunks, HIDDEN // chunks, width)
+    assert layer.spyre_moe_up_alias.shape == (EXPERTS * chunks, HIDDEN // chunks, width)
     assert layer.spyre_moe_down.shape == (EXPERTS, width, HIDDEN)
     assert layer.spyre_moe_route_identity.shape == (layer.spyre_moe_stick, layer.spyre_moe_stick)
     # Both follow the stacks' dtype, not a literal: a stick's element count changes with
@@ -999,33 +1164,69 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     assert layer.spyre_moe_stick == stick
     assert layer.spyre_moe_route_identity.dtype == w13.dtype
 
+    # Gate/up retain gather layouts; the down decode view splits output chunks by expert.
     gather_layout = [EXPERTS, HIDDEN, width // stick, stick]
     for stack in (layer.spyre_moe_gate, layer.spyre_moe_up):
         assert get_spyre_tensor_layout(stack).device_size == gather_layout
     down_layout = get_spyre_tensor_layout(layer.spyre_moe_down)
     assert down_layout.device_size == [EXPERTS, HIDDEN // stick, width, stick]
     assert down_layout.stride_map == [width * HIDDEN, stick, HIDDEN, 1]
+    down_decode_layout = get_spyre_tensor_layout(layer.spyre_moe_down_alias)
+    assert layer.spyre_moe_down_alias.shape == (EXPERTS * chunks, width, HIDDEN // chunks)
+    assert down_decode_layout.device_size == [
+        EXPERTS * chunks,
+        HIDDEN // chunks // stick,
+        width,
+        stick,
+    ]
+    assert down_decode_layout.stride_map == [width * (HIDDEN // chunks), stick, HIDDEN // chunks, 1]
 
     close = {"atol": 1e-4, "rtol": 1e-2}
     gate, up = (t.cpu() for t in (layer.spyre_moe_gate, layer.spyre_moe_up))
-    down = layer.spyre_moe_down.cpu()
+    down = layer.spyre_moe_down_alias.cpu()
+    down_persist = layer.spyre_moe_down.cpu()
+    down_ref = F.pad(
+        (w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2),
+        (0, 0, 0, width - inter),
+    )
+    down_chunks = torch.stack(
+        [
+            down_ref[..., c * (HIDDEN // chunks) : (c + 1) * (HIDDEN // chunks)]
+            for c in range(chunks)
+        ],
+        dim=1,
+    ).reshape(EXPERTS * chunks, width, HIDDEN // chunks)
     torch.testing.assert_close(gate[..., :inter], w13[:, :inter, :].transpose(1, 2), **close)
     torch.testing.assert_close(up[..., :inter], w13[:, inter:, :].transpose(1, 2), **close)
-    torch.testing.assert_close(
-        down[:, :inter], (w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), **close
-    )
-    # The added lanes must be zero, which is what makes the widening inert.
-    for padded in (gate[..., inter:], up[..., inter:], down[:, inter:]):
+    torch.testing.assert_close(down_persist, down_ref, **close)
+    torch.testing.assert_close(down, down_chunks, **close)
+    for padded in (gate[..., inter:], up[..., inter:], down[:, inter:], down_persist[:, inter:]):
         assert not padded.count_nonzero()
 
-    # Only the layout differs, so both moves must read back bit for bit.
-    host_down = F.pad((w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), (0, 0, 0, width - inter))
-    control = dma_moe_expert_weight_to_spyre(host_down)
-    candidate = _to_spyre_expert_weight(host_down, (), kernel_order=True)
+    # The alternate device layouts read back the same padded expert stack.
+    control = dma_moe_expert_weight_to_spyre(down_ref)
+    candidate = _to_spyre_expert_weight(down_ref, (), kernel_order=True)
     assert control is not None
     assert get_spyre_tensor_layout(candidate).device_size == down_layout.device_size
     assert torch.equal(control.cpu(), candidate.cpu())
-    assert torch.equal(candidate.cpu(), down)
+    assert torch.equal(candidate.cpu(), down_persist)
+
+
+def test_chunk_aliases_reject_a_pool_in_the_other_layout():
+    """Each alias reinterprets one assumed layout; the other would silently read wrong weights."""
+    from spyre_inference.moe import (
+        _chunk_pool_alias,
+        _down_chunk_pool_alias,
+        _to_spyre_expert_weight,
+    )
+
+    stack = torch.zeros(EXPERTS, HIDDEN, HIDDEN, dtype=torch.float16)
+    gather = _to_spyre_expert_weight(stack, ())
+    kernel = _to_spyre_expert_weight(stack, (), kernel_order=True)
+    with pytest.raises(RuntimeError, match="its chunk alias reinterprets"):
+        _chunk_pool_alias(kernel, 4)
+    with pytest.raises(RuntimeError, match="its chunk alias reinterprets"):
+        _down_chunk_pool_alias(gather, 4)
 
 
 @pytest.mark.parametrize(("contract", "free"), [(6, 4), (7, 4), (6, 1), (1, 3)])
