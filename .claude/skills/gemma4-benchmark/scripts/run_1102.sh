@@ -287,4 +287,7 @@ for rep in $(seq 1 "$REPEAT"); do
 done
 
 "$PY" -I -B "$SKILL_DIR/scripts/report.py" "$OUT" | tee "$OUT/report.md"
-[ "${PIPESTATUS[0]}" = 0 ] || exit 4
+md_rc=${PIPESTATUS[0]}
+"$PY" -I -B "$SKILL_DIR/scripts/html_report.py" "$OUT" > "$OUT/report.html" \
+  || echo "run_1102.sh: report.html failed" >&2
+[ "$md_rc" = 0 ] || exit 4

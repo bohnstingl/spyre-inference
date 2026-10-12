@@ -1,6 +1,6 @@
 ---
 name: gemma4-benchmark
-description: "Benchmark Gemma-4 26B-A4B on Spyre: hf-adapters (pinned PR #620, 9b075e4) against spyre-inference main and the spyre-inference branch under test, on the already installed environment. Two workloads on the same 1984-token prompt, each at whichever of TP1, TP2 and TP4 the user picks: the prefill TTFT of spyre-inference#1102 (the maintainer's ttft.py vs `vllm bench latency`) and decode ITL as the granite TP4 ITL report measured it ((lat64 - lat1) / 63). Every arm runs at the same TP (vLLM --tensor-parallel-size, hf-adapters under torchrun). Checks the environment read-only (pins, profiler-free build, consistent Spyre libraries, env knobs, a stale main, enough cards) and flags every inconsistency to the user instead of fixing it; never installs, syncs, rebuilds, fetches or checks anything out. Runs the arms one at a time and ends with a shareable Markdown report, TP scaling included. Use when asked to benchmark or reproduce Gemma-4 / gemma-4-26B-A4B TTFT, prefill or decode latency or ITL, at one or several tensor-parallel sizes, reproduce #1102, compare spyre-inference with hf-adapters, or measure a branch or an MoE change against main."
+description: "Benchmark Gemma-4 26B-A4B on Spyre: hf-adapters (pinned PR #620, 9b075e4) against spyre-inference main and the spyre-inference branch under test, on the already installed environment. Two workloads on the same 1984-token prompt, each at whichever of TP1, TP2 and TP4 the user picks: the prefill TTFT of spyre-inference#1102 (the maintainer's ttft.py vs `vllm bench latency`) and decode ITL as the granite TP4 ITL report measured it ((lat64 - lat1) / 63). Every arm runs at the same TP (vLLM --tensor-parallel-size, hf-adapters under torchrun). Checks the environment read-only (pins, profiler-free build, consistent Spyre libraries, env knobs, a stale main, enough cards) and flags every inconsistency to the user instead of fixing it; never installs, syncs, rebuilds, fetches or checks anything out. Runs the arms one at a time and ends with a shareable Markdown report and HTML page, TP scaling included. Use when asked to benchmark or reproduce Gemma-4 / gemma-4-26B-A4B TTFT, prefill or decode latency or ITL, at one or several tensor-parallel sizes, reproduce #1102, compare spyre-inference with hf-adapters, or measure a branch or an MoE change against main."
 ---
 
 # Gemma-4 benchmark: hf-adapters vs spyre-inference main vs the branch under test
@@ -17,7 +17,7 @@ Two workloads on the same 1984-token prompt, batch 1, each at TP1, TP2 or TP4:
 Three arms, alternating: **hf** (hf-adapters), **main** (spyre-inference at `--main-ref`),
 **branch** (the spyre-inference checkout installed in the environment). At TP N every arm
 runs on N cards, so every comparison is at equal card count. Every run ends with a
-`report.md` meant to be shared as is.
+`report.md` and a `report.html` meant to be shared as is.
 
 ## The one rule: never alter the environment
 
@@ -83,8 +83,12 @@ On dt-inductor pods: `--env-script /scratch/virtualenv/<env>/bin/activate`, or
    - TP scaling compares sizes that ran one after another: fine for scaling, not for small
      differences.
 
-   Hand the user the report's path; it already holds the headline, TP scaling, method,
-   commands, raw results, environment and accepted findings.
+   Both reports already hold the headline, TP scaling, method, commands, raw results,
+   environment and accepted findings. Then write `<suite>/narrative.json` with what needs
+   judgement: the recommendation, what the gates above turned up, and anything the user should
+   not miss (keys in [HTML report](#html-report)). Re-render the page with
+   `python -I -B $SKILL/scripts/html_report.py <suite> > <suite>/report.html` and hand the
+   user both paths. When the session can publish artifacts, publish `report.html` too.
 
 ## Workloads
 
@@ -228,17 +232,39 @@ ITL and TP2+ depend on the host and its cards: take them from your own runs.
 ## Output layout
 
 `run_suite.sh` writes `<suite>/report.md` (all combinations in one shareable page, TP
-scaling included) and `report.json`, plus one `run_1102.sh` directory per combination
+scaling included), the same as `report.html` (see [HTML report](#html-report)) and
+`report.json`, plus one `run_1102.sh` directory per combination
 (`ttft_tp1/`, `ttft_tp2/`, `itl_tp4/`, ...). The suite dir defaults to
 `${GEMMA4_BENCH_OUT:-~/gemma4-benchmark}/suite_<timestamp>`. Each combination holds:
 
-- `report.md` / `report.json`: headline, method with the exact commands, raw
-  avg/p10/p50/p90/p99 per run, environment (commits, versions, cards, RPMs), findings.
+- `report.md` / `report.html` / `report.json`: headline, method with the exact commands,
+  raw avg/p10/p50/p90/p99 per run, environment (commits, versions, cards, RPMs), findings.
 - `<arm>_out<len>_<rep>/`: `run.log`, `meta.json`, and `latency.json` (vLLM's JSON, or
   `hf_latency.py`'s; `ttft.py`'s median is read from `run.log`).
 - `env_<arm>.json`: everything the check found, with its findings.
 - `workload.json`, `plan.txt` (the commands), `provenance.txt` (host, date, interpreters,
   CPU, cards, `ibm-*` RPMs), `args.txt` (the flags used).
+
+## HTML report
+
+`html_report.py` renders the same data as `report.md` into one self-contained page: a verdict
+row, bar panels per TP size, tables with every replicate, TP scaling, run-integrity checks,
+method, environment and every run. Each spyre-inference arm gets a pill against the arm above
+it: main, or a lone branch, against hf-adapters as a ratio, and the branch against main as a
+change. The pill is outlined when the two replicate ranges overlap. Each arm has one colour,
+validated for colour-blind separation in both themes: hf-adapters violet, main orange,
+branch blue. An ITL workload with a LEAK run is charted from p50s, the gate's rule, with the
+averages alongside.
+
+Without a narrative the page derives its title, references and one verdict tile per workload
+and TP size: the branch against main, or else against hf-adapters. `<dir>/narrative.json`, or
+`--narrative FILE`, adds the judgement. All keys are optional, and their values are HTML:
+`title`, `eyebrow`, `h1`, `lede`, `refs`, `verdict` (`[{"big": ..., "lab": ...}]`),
+`recommendation`, `itl_sub`, `ttft_sub`, `itl_notes`, `ttft_notes`, `scaling_notes`,
+`findings` (`[{"sev": "major" | "minor" | "nit", "title": ..., "loc": ..., "dl": [[term, html],
+...]}]`), `checks`, `method`, `not_covered`, `footer`. `checks` and `method` add to the
+generated lists; every other key replaces its default. The page loads its fonts from Google
+Fonts; everything else, data included, is inline.
 
 ## Installing this skill on another host
 

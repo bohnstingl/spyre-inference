@@ -94,5 +94,7 @@ PY=$(sed -n 's/^python \([^ ]*\) .*/\1/p' "$OUT"/*/provenance.txt 2>/dev/null | 
 if [ -n "$PY" ]; then
   "$PY" -I -B "$HERE/report.py" --suite "$OUT" > "$OUT/report.md" || { [ "$rc" != 0 ] || rc=4; }
   echo "=== suite report: $OUT/report.md"
+  "$PY" -I -B "$HERE/html_report.py" "$OUT" > "$OUT/report.html" \
+    && echo "=== suite report: $OUT/report.html" || echo "=== suite: report.html failed"
 fi
 exit "$rc"
