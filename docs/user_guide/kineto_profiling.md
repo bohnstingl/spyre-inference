@@ -223,7 +223,7 @@ Contents of the script and why each entry matters:
 | Variable / action | Value | Purpose |
 |---|---|---|
 | (venv activation) | `source /opt/spyre-inference/bin/activate` | Puts the venv's `python` and packages on `PATH`. This is a deployment-style path; for a local `uv sync` install use `source .venv/bin/activate`. |
-| `VLLM_PLUGINS` | `spyre_inference` | Required for vLLM to load the Spyre platform plugin |
+| `VLLM_PLUGINS` | `spyre_inference` | Allowlists the platform plugin and the general plugin, which share this name; the general plugin registers the ops and model adaptations in every process. |
 | (AIUPTI check) | — | Warns if `torch_spyre/_C.so` was not built with `USE_SPYRE_PROFILER=1` — verify via `ldd .../_C.so \| grep libaiupti` and presence of `AiuptiActivityProfilerSession` symbols. Do **not** inspect `torch.__version__` for a `+aiu.kineto` suffix; that flow was retired by torch-spyre PR #1856. See §1.3. |
 | `OMP_NUM_THREADS` | `1` | Pin OpenMP thread pool so BLAS work does not compete with Spyre dispatch |
 | `OPENBLAS_NUM_THREADS` | `1` | Pin OpenBLAS thread pool (same rationale) |
