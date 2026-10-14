@@ -1,10 +1,16 @@
 ---
 name: cherry-pick-to-release
-description: "Cherry-pick a commit (usually a squash-merged PR) from main into a release branch such as release-0.5, without committing. Fetches, branches `<release>-<sha7>-cp` off the latest upstream release branch, runs `git cherry-pick --no-commit`, resolves conflicts by applying only the commit's own changes, stages everything with a ready commit message (the original PR message, a cherry-pick note and links), runs the tests the commit added or changed, and verifies the staged diff against the original commit so that nothing else slips in. Use when the user asks to cherry-pick, backport or port a commit or PR to a release branch, or gives a sha or PR number together with a release-X.Y branch. Stops before committing."
-argument-hint: "<commit-sha | PR number> <release-branch, e.g. release-0.5>"
+description: "Cherry-pick a commit (usually a squash-merged PR) from main into a release branch, without committing. Fetches, branches `<release>-<sha7>-cp` off the latest upstream release branch, runs `git cherry-pick --no-commit`, resolves conflicts by applying only the commit's own changes, stages everything with a ready commit message (the original PR message, a cherry-pick note and links), runs the tests the commit added or changed, and verifies the staged diff against the original commit so that nothing else slips in. Use when the user asks to cherry-pick, backport or port a commit or PR to a release branch, or gives a sha or PR number together with a release branch. Stops before committing."
+argument-hint: "<commit-sha | PR number> <release-branch>"
 ---
 
+<!-- Keep a "$" followed by a digit out of this file (awk fields, shell positional
+     parameters): the skill loader replaces it with an invocation argument. -->
+
 # Cherry-pick a commit into a release branch
+
+Arguments: `$ARGUMENTS` (the commit, as a sha or PR number, then the release branch). If
+this is empty, take both from the user's request.
 
 Port one commit from `main` onto a release branch and stop with everything staged and
 nothing committed. The user reviews and commits. The result:
@@ -39,8 +45,8 @@ every command:
 
 | Value | How to get it |
 | --- | --- |
-| `<remote>` | The remote for `torch-spyre/spyre-inference`. Its name differs per checkout (`remote`, `upstream`, `origin`): `git remote -v \| awk '$2 ~ /[:\/]torch-spyre\/spyre-inference(\.git)?$/ && $3 == "(fetch)" {print $1; exit}'` |
-| `<release>` | The branch the user named, for example `release-0.5`. If they named none, list `git branch -r --list '<remote>/release-*'` and ask. |
+| `<remote>` | The remote for `torch-spyre/spyre-inference`. Its name differs per checkout (`remote`, `upstream`, `origin`): `git remote -v \| grep -m1 -E '[:/]torch-spyre/spyre-inference(\.git)? \(fetch\)' \| cut -f1` |
+| `<release>` | The branch the user named. If they named none, list `git branch -r --list '<remote>/release-*'` and ask. |
 | `<sha>`, `<short>` | The full sha from `git rev-parse --verify '<input>^{commit}'`, and its first 7 characters. For a PR number, `git log <remote>/main --format='%H %s' --grep='(#<N>)$'`; confirm the subject with the user. |
 | `<pr>` | The `(#NNNN)` at the end of the commit's subject, if there is one. |
 | `<tools>` | A temporary copy of this skill's `scripts/` directory (step 0). |
@@ -50,11 +56,11 @@ every command:
 1. The tracked tree must be clean: `git status --porcelain --untracked-files=no` prints
    nothing. Otherwise stop and ask; don't stash the user's work.
 2. Copy the helper script out of the tree, because step 2 switches to a release branch
-   that may not carry this skill:
+   that may not carry this skill. On such a branch the skill's files are gone and it drops
+   out of the skill list; keep following this text and use the copy:
 
     ```bash
-    mktemp -d /tmp/cherry-pick-tools.XXXX     # -> <tools>
-    cp <this skill's base directory>/scripts/cherry_pick.py <tools>/
+    T=$(mktemp -d /tmp/cherry-pick-tools.XXXX) && cp <this skill's base directory>/scripts/cherry_pick.py "$T"/ && echo "$T"   # -> <tools>
     ```
 
 ## 1. Fetch and inspect the commit
@@ -73,6 +79,7 @@ git log --oneline <remote>/<release> --grep='<sha>' --grep='(#<pr>)'
 - **Not on `<remote>/main`:** stop and ask. It may be a commit from a PR branch or a fork.
 - **A merge commit:** ask before picking it with `-m 1`. PRs here land as squash commits.
 - **Already on the release branch** (the last command prints a commit): show it and ask.
+  Drop its `--grep='(#<pr>)'` when the subject carries no PR number.
 - The `--stat` list is what gets picked. If the user expects a different number of files,
   look at the PR's history (`git fetch <remote> pull/<pr>/head`): a PR can grow in its
   last commits. Never drop files to match an expectation.
@@ -112,9 +119,18 @@ If it applies cleanly, go to step 4. Otherwise, for each file that
 4. Write one note per file: `<path>: <what conflicted>; <what you kept and applied>`.
 5. `git add <file>`.
 
-A clean merge can still be wrong: a hunk can apply without conflict and call code that
-exists only on `main`. For each helper the commit's added lines call, check that it exists
-on the release branch: `git grep -n -e 'def <name>' -e 'class <name>' HEAD`.
+A clean merge can still be wrong, in two ways:
+
+- **Code that exists only on `main`.** A hunk can apply without conflict and call a
+  helper the release branch lacks. For each helper the commit's added lines call, check
+  that it exists on the release branch: `git grep -n -e 'def <name>' -e 'class <name>' HEAD`.
+- **The wrong place.** Git applies a hunk wherever its context lines match, nearest to the
+  original line number. In a file with repeated blocks, such as the per-model entries of
+  `spyre_inference/config/model_configs.yaml`, YAML or TOML tables, or parametrize lists,
+  the same context matches in many places. For such a file, read each hunk with wider
+  context on both sides and confirm it sits in the same section (model, table, function)
+  as on `main`: `git show -U15 --format= <sha> -- <file>` against
+  `git diff --cached -U15 -- <file>`.
 
 ## 4. Stage with the commit message
 
@@ -148,7 +164,7 @@ Cherry-pick notes for <release>:      (or: Applied cleanly; ...)
 ```
 
 The title follows the release branch's convention: when the cherry-pick PR is squashed,
-GitHub appends its number, giving `[release-0.5] <title> (#<pr>) (#<cp-pr>)`. If the
+GitHub appends its number, giving `[<release>] <title> (#<pr>) (#<cp-pr>)`. If the
 original body is only a list of the PR's commit subjects, ask whether to use the PR
 description instead.
 
@@ -190,9 +206,9 @@ The user commits with `git commit -s -F "$(git rev-parse --git-path MERGE_MSG)"`
     uv run --active --no-sync pytest -m "not upstream" -ra <file>
     ```
 
-    vLLM startup makes each run take minutes, so use a long Bash timeout, or run it in
-    the background and wait for it to finish. Never start a second Spyre run while one is
-    still going. Don't add `-p no:...` or other flags to force skipped tests to run.
+    Each run starts vLLM, so use a long Bash timeout, or run it in the background and
+    wait for it to finish. Never start a second Spyre run while one is still going.
+    Don't add `-p no:...` or other flags to force skipped tests to run.
 
 4. Report the results as they are. Tests guarded by `spyre_available()` skip on a host
    without Spyre, and a skipped test is not a verified one, so say which tests skipped and
@@ -241,11 +257,13 @@ rerun `message`. Typical justified differences:
 - `commit only -` and `staged only -` lines, where the release branch had other text in
   the lines the commit replaces;
 - an import the release branch needs because `main` got it from an earlier PR (for
-  example `from pathlib import Path` in `f416576e`).
+  example `from pathlib import Path`).
 
-Where the release branch's file differs from the one the commit started from, the
-comparison cannot see a correct line in the wrong place. Read every conflict hunk once
-more in `git diff --cached`.
+The comparison catches a line in the wrong place only when the release branch's file is
+the one the commit started from (`identical` would turn into `DIFFERS`). Otherwise it
+reports `same change` either way. So read every conflict hunk once more in
+`git diff --cached`, and repeat the step-3 placement check for every file with repeated
+blocks that `verify` reports as `same change`.
 
 Then lint the staged Python files without changing them, with the ruff version that
 `.pre-commit-config.yaml` pins:

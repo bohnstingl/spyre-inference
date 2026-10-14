@@ -339,7 +339,7 @@ def main() -> int:
 
     p = sub.add_parser("message", help="compose the commit message into MERGE_MSG")
     p.add_argument("commit")
-    p.add_argument("--into", required=True, help="release branch, e.g. release-0.5")
+    p.add_argument("--into", required=True, help="the release branch to pick into")
     p.add_argument("--repo", default="torch-spyre/spyre-inference")
     how = p.add_mutually_exclusive_group(required=True)
     how.add_argument("--clean", action="store_true", help="the pick applied with no changes")
