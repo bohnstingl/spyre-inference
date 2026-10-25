@@ -331,6 +331,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
+                sinks=self._device_sinks(query_dev.device),
             )
 
     def _run_page_attn(
@@ -378,6 +379,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.logits_soft_cap,
                     out,
                     *v_args,
+                    sinks=self._device_sinks(query.device),
                 )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
@@ -403,6 +405,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
+                sinks=self._device_sinks(query.device),
             )
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list
