@@ -14,7 +14,6 @@
 
 import functools
 import importlib.metadata
-import math
 import multiprocessing
 import os
 import sys
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
     from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionBackend
 else:
     VllmConfig = None
 
@@ -157,9 +157,6 @@ class TorchSpyrePlatform(CpuPlatform):
     # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
-
-    # Measured throughput argmax across pooling models; they regress above it.
-    _POOLING_MAX_BATCHED_TOKENS = 2048
 
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
@@ -368,15 +365,16 @@ class TorchSpyrePlatform(CpuPlatform):
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
 
-        The token budget ``R`` is the only input. Both other limits are written back
-        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
-        shape every encoder path runs on.
+        ``max_num_seqs`` is lowered to the widest short rectangle. ``compile_sizes`` is
+        one entry when the model fits in the 2048-row body, and one entry per body when
+        ``max_model_len`` is longer — a step pads to the smallest of those.
 
-        The scheduler is left alone -- the ragged path means no batch upstream can form
-        has to be refused.
+        The scheduler token cap stays the largest body, so one max-length sequence can
+        be scheduled. The ragged path still covers a batch no rectangle holds.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
+            POOLING_FAST_BODY_ROWS,
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
@@ -389,18 +387,17 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_num_seqs = scheduler_config.max_num_seqs
 
         # vLLM's verify_max_model_len runs before this hook, so the floor
-        # `encoder_budget_rows` applies is not checked for us.
-        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        # `encoder_budget_rows` applies is not checked for us. The 2048 cap is the
+        # fast body; `encoder_budget_rows` then floors back up to max_model_len when
+        # the model is longer, which is the scheduler cap.
+        scheduler_config.max_num_batched_tokens = min(prev_budget, POOLING_FAST_BODY_ROWS)
+        full_budget = encoder_budget_rows(
+            max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+        )
 
         # The shortest length carries the widest rectangle, so no batch ever needs more
         # width than the ladder offers.
-        widest = max(
-            1,
-            encoder_budget_rows(
-                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
-            )
-            // ENCODER_SEQ_ALIGNMENT,
-        )
+        widest = max(1, full_budget // ENCODER_SEQ_ALIGNMENT)
         if prev_num_seqs > widest:
             logger.warning(
                 "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
@@ -411,24 +408,24 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             scheduler_config.max_num_seqs = widest
 
-        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
-        budget = encoder_shape_tables(vllm_config).budget
-        scheduler_config.max_num_batched_tokens = budget
-
-        # One body shape: every rectangle is exactly `budget` rows and the ragged path
-        # packs into the same buffer, so the attention kernels key on sequence shapes
-        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        # Restore the scheduler cap before the tables are memoised. The worker reads
+        # the same limits, and a table built against the temporary 2048 cap would be a
+        # different cache entry from the one serving uses. That restored cap is the
+        # largest body, so the tables do not change it again.
+        scheduler_config.max_num_batched_tokens = full_budget
+        tables = encoder_shape_tables(vllm_config)
+        # A user-set list still wins, including an empty one to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
-            vllm_config.compilation_config.compile_sizes = [budget]
+            vllm_config.compilation_config.compile_sizes = list(tables.budgets)
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
-            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
-            "(L, B) %s; ragged groups (width, extent) %s.",
+            "max_num_batched_tokens=%d: bodies %s; rectangles (L, B) %s; "
+            "ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
-            budget,
-            budget,
+            tables.budget,
+            list(tables.budgets),
             encoder_rectangles(vllm_config),
             encoder_group_shapes(vllm_config) or "none reachable",
         )
@@ -475,7 +472,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        # Linear layers use SpyreFp8LinearKernel (spyre.scaled_mm).
         return True
 
     @classmethod
@@ -691,8 +688,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
-            # weights included.
+            # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(
@@ -823,16 +819,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
         # KV-cache manager gives every layer its own buffer; SWA is still computed, per
         # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
-        scheduler_config.disable_hybrid_kv_cache_manager = True
-
-        # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
-        # math in CpuPlatform.check_and_update_config is meaningless for us.
-        # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
-        # populate `cache_config.kv_cache_memory_bytes`, which
-        # TorchSpyreWorker.determine_available_memory returns directly.
-        # Skip when the user has explicitly supplied --kv-cache-memory-bytes.
-        if vllm_config.cache_config.kv_cache_memory_bytes is None:
-            os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
+        # Mamba hybrids keep it: their state specs cannot be unified with attention,
+        # and kv_cache_setup gives every layer its own buffer anyway.
+        is_mamba_hybrid = (
+            vllm_config.model_config is not None and vllm_config.model_config.is_hybrid
+        )
+        scheduler_config.disable_hybrid_kv_cache_manager = not is_mamba_hybrid
 
         # CpuPlatform turns "uni" into "mp"; remember what was asked for (see _maybe_uniproc).
         requested_backend = parallel_config.distributed_executor_backend
@@ -841,39 +833,84 @@ class TorchSpyrePlatform(CpuPlatform):
         super().check_and_update_config(vllm_config)
         _maybe_uniproc(parallel_config, requested_backend)
 
-        # Must run after super(), which sets a block_size default of its own, and before
-        # the num_gpu_blocks_override math below, which reads block_size.
+        # Must run after super(), which sets a block_size default of its own.
         cls._align_block_size(vllm_config)
 
-        # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
-        # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
-        # a single group drawing from the single global BlockPool.
-        # Pooling / encoder-only models have no KV cache — do not size one.
+        # The KV cache is sized from measured device memory via determine_available_memory.
+        # The arguments --num-gpu-blocks-override and --kv-cache-memory-bytes
+        # can still bypass the measurement.
         cache_config = vllm_config.cache_config
         # Prefix caching on a zero-group config makes vLLM pick HybridKVCacheCoordinator,
         # which asserts it has ≥2 attention groups.
         if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
             logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
             cache_config.enable_prefix_caching = False
+        # After super(): CpuPlatform resets an SSM state dtype its CPU kernels lack to fp32.
+        if is_mamba_hybrid:
+            cls._apply_mamba_defaults(vllm_config)
 
-        if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
-            if cls._is_pooling_model(vllm_config):
+    @staticmethod
+    def _apply_mamba_defaults(vllm_config: VllmConfig) -> None:
+        """Mamba state settings the Spyre ``MambaMixer2`` supports.
+
+        Upstream's model hooks run before any platform hook and pick the ``align`` cache
+        mode under prefix caching and, for NemotronH, an fp32 SSM state.
+        """
+        from vllm.model_executor.models.config import MambaModelConfig
+
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            # Prefix caching needs the `align` mode's per-block state checkpoints,
+            # which the Spyre mixer does not write.
+            # TODO: Enable prefix caching
+            logger.info(
+                "Disabling prefix caching: Mamba state caching is not yet supported on Spyre."
+            )
+            cache_config.enable_prefix_caching = False
+
+            # Let upstream derive the `none` mode's one Mamba block per request again.
+            cache_config.mamba_block_size = None
+            MambaModelConfig.verify_and_update_config(vllm_config)
+        # fp32 tensors next to the fp16 state update do not lower on Spyre (mixed
+        # element arrangements); an fp16 state stays accurate over long decodes.
+        for field in ("mamba_cache_dtype", "mamba_ssm_cache_dtype"):
+            if getattr(cache_config, field) not in ("auto", "float16"):
                 logger.info(
-                    "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
+                    "Overriding %s=%s to float16 for Spyre.", field, getattr(cache_config, field)
                 )
-            else:
-                max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-                max_model_len = vllm_config.model_config.max_model_len
-                blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-                # +1 for BlockPool's reserved null block, which is never allocatable.
-                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1
-                logger.info(
-                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq + 1 null block)",
-                    cache_config.num_gpu_blocks_override,
-                    max_num_seqs,
-                    blocks_per_seq,
+            setattr(cache_config, field, "float16")
+
+    @classmethod
+    def _align_hybrid_block_size(
+        cls, vllm_config: VllmConfig, backend_cls: "type[AttentionBackend]"
+    ) -> None:
+        """Upstream's attention/Mamba page alignment, rounded up to a power-of-two block.
+
+        The Spyre attention buckets need one. As in XPUPlatform's rounding, the padded
+        Mamba page scales with the block, so it still equals an attention page. The
+        caller's ``_check_aligned_block_size`` validates the rounded size.
+        """
+        super()._align_hybrid_block_size(vllm_config, backend_cls)
+        cache_config = vllm_config.cache_config
+        block_size = cache_config.block_size
+        aligned = 1 << (block_size - 1).bit_length()
+        if aligned != block_size:
+            if cache_config.mamba_page_size_padded is not None:
+                cache_config.mamba_page_size_padded = (
+                    cache_config.mamba_page_size_padded // block_size * aligned
                 )
+            logger.info(
+                "Rounding the hybrid KV block size %d up to %d tokens for the Spyre "
+                "attention buckets.",
+                block_size,
+                aligned,
+            )
+            cache_config.block_size = aligned
+        # The engine takes the smallest group block size as the global one, which the
+        # attention builder checks against. Raising only a smaller Mamba block keeps one
+        # Mamba block per request, which is all the `none` cache mode's block table holds.
+        if cache_config.mamba_block_size is not None and cache_config.mamba_block_size < aligned:
+            cache_config.mamba_block_size = aligned
 
     @staticmethod
     def _is_pooling_model(vllm_config: VllmConfig) -> bool:

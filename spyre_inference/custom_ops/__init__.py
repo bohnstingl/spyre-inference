@@ -29,8 +29,10 @@ from . import (
     layer_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
+    mamba_mixer2,  # noqa: F401
     multimodal_embeddings,
     parallel_lm_head,
+    rms_norm,  # noqa: F401
     rotary_embedding,
     utils,
     vit_attn,  # noqa: F401

@@ -1406,6 +1406,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         return output
 
+    def graph_key(self) -> tuple:
+        """The kernel arguments that may differ between layers of one attention group."""
+        alibi = None if self.alibi_slopes is None else tuple(self.alibi_slopes.flatten().tolist())
+        return (self.num_heads, self.scale, self.logits_soft_cap, alibi, self._kv_scales)
+
     def record_graphs(
         self,
         layer: AttentionLayer,
@@ -1642,15 +1647,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
-        # Host-allocated then transferred: only .to() takes a device_layout.
         dtype = spec.dtype
         layout = slot_major_kv_layout(
             num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, dtype
         )
         shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
         return SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
-            v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            k_pages=torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_(),  # ty: ignore[no-matching-overload]
+            v_pages=torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_(),  # ty: ignore[no-matching-overload]
         )
 
     def kv_write_index(self, slot_mapping: torch.Tensor, device: torch.device):
@@ -1901,7 +1905,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
-        index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
 
@@ -1912,6 +1915,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if num_decode_seqs == num_seqs:
                 return output
             batched_done = True
+
+        # Past the early return: only the per-sequence loop reads these tables.
+        index_tables = self.index_tables(attn_metadata, _target_device)
 
         # Past the early return, so a step the batched kernel fully served pays nothing.
         # Entries are filled at their read site below: in a mixed batch, the decode

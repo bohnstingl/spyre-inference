@@ -14,7 +14,6 @@
 
 """Unit tests for platform.py configuration logic."""
 
-import math
 import os
 from types import SimpleNamespace
 
@@ -115,95 +114,92 @@ def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
     assert torch.accelerator.get_memory_info() == (123, 456)
 
 
-def test_num_gpu_blocks_override_homogeneous():
-    """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
+@pytest.mark.parametrize("runner_type", ["generate", "pooling"])
+def test_kv_cache_size_is_left_to_the_worker(monkeypatch, runner_type):
+    """Neither the block count nor the KV budget is fixed here: the worker measures the
+    card (spyre-inference#901), and both flags stay user bypasses."""
     from spyre_inference.platform import TorchSpyrePlatform
 
+    monkeypatch.delenv("VLLM_CPU_KVCACHE_SPACE", raising=False)
     model_config = ModelConfig(
         model="Qwen/Qwen3-0.6B",
         max_model_len=1024,
         dtype=torch.float16,
         trust_remote_code=True,
     )
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
+    object.__setattr__(model_config, "runner_type", runner_type)
     vllm_config = VllmConfig(
         model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-    blocks_per_seq = math.ceil(
-        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
-    )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
-
-
-def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
-    """Hybrid models get the same block count: one collapsed KV cache group.
-
-    ``disable_hybrid_kv_cache_manager`` merges every layer into a single group, so the
-    single-group formula applies unchanged.
-    """
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    # Simulate a hybrid model with two interleaved attention types.
-    interleaved = ["sliding_attention", "full_attention"] * 13
-    model_config.hf_config.layer_types = interleaved
-    model_config.hf_text_config.layer_types = interleaved
-
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-    blocks_per_seq = math.ceil(
-        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
-    )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
-
-
-def test_num_gpu_blocks_override_skipped_for_pooling():
-    """Encoder/pooling models have no KV cache — do not invent a block count."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1024,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    object.__setattr__(model_config, "runner_type", "pooling")
-
-    cache_config = CacheConfig(block_size=64)
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
     )
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.num_gpu_blocks_override is None
+    assert vllm_config.cache_config.kv_cache_memory_bytes is None
+    assert "VLLM_CPU_KVCACHE_SPACE" not in os.environ
+
+
+def _mamba_hybrid_config(max_model_len, **cache_kwargs):
+    return VllmConfig(
+        model_config=ModelConfig(
+            model="nvidia/Nemotron-H-8B-Base-8K", max_model_len=max_model_len, dtype=torch.float16
+        ),
+        cache_config=CacheConfig(**cache_kwargs),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+
+def test_mamba_hybrid_drops_prefix_caching_for_fp16_state():
+    """The Spyre mixer writes no `align` checkpoints and runs an fp16 state only."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Upstream's model hooks pick `align` and an fp32 state for this config; VllmConfig
+    # then runs the platform hook. Running it again must not change the result.
+    vllm_config = _mamba_hybrid_config(1024, enable_prefix_caching=True)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    cache_config = vllm_config.cache_config
+    assert not cache_config.enable_prefix_caching
+    assert cache_config.mamba_cache_mode == "none"
+    assert cache_config.mamba_block_size == 1024
+    assert cache_config.mamba_ssm_cache_dtype == "float16"
+    assert cache_config.mamba_cache_dtype == "float16"
+    assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "mamba_block_size"),
+    [
+        # Below the rounded block: raised to it, or the engine would take it as the
+        # block size the attention builder checks against.
+        (512, 1024),
+        # Above: kept at max_model_len, so a request still holds one Mamba block.
+        (8192, 8192),
+    ],
+)
+def test_mamba_hybrid_block_size_is_a_power_of_two(monkeypatch, max_model_len, mamba_block_size):
+    """Upstream aligns Nemotron-H-8B at 576 tokens; the Spyre attention buckets need 1024."""
+    from vllm.platforms.interface import Platform
+
+    from spyre_inference.platform import TorchSpyrePlatform
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+
+    vllm_config = _mamba_hybrid_config(max_model_len, block_size=64)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    # The attention backend is only known once the model is built.
+    monkeypatch.setattr(
+        Platform, "_find_non_ssm_backends", classmethod(lambda cls, c: [SpyreAttentionBackend])
+    )
+
+    TorchSpyrePlatform.update_block_size_for_backend(vllm_config)
+
+    cache_config = vllm_config.cache_config
+    assert cache_config.block_size == 1024
+    assert cache_config.mamba_block_size == mamba_block_size
+    # The Mamba page still equals an attention page: K and V, 8 heads of 128, fp16.
+    assert cache_config.mamba_page_size_padded == 1024 * 2 * 8 * 128 * 2
 
 
 def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):
@@ -263,6 +259,19 @@ def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
     assert vllm_config.compilation_config.compile_sizes == [512]
+
+
+def test_apply_config_keeps_a_fast_body_when_the_model_is_longer_than_2k():
+    """bge-reranker-v2-m3 at 8K. The scheduler can still accept one 8K sequence,
+    but compile sizes include the 2K and 4K bodies so shorter steps do not pad to 8K."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(
+        max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [2048, 4096, 8192]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 8192
 
 
 def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
