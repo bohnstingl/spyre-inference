@@ -166,13 +166,6 @@ def test_quantized_kv_b_proj_is_rejected(tp_group):
         _build(modules, "model.layers.2.self_attn")
 
 
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        ({"g_proj": torch.nn.Identity()}, "output gate"),
-        ({"is_sparse": True}, "sparse attention"),
-    ],
-)
-def test_unsupported_upstream_options_raise(tp_group, overrides, match):
-    with pytest.raises(NotImplementedError, match=match):
-        _build(_modules(**overrides), "model.layers.3.self_attn")
+def test_output_gate_is_rejected(tp_group):
+    with pytest.raises(NotImplementedError, match="output gate"):
+        _build(_modules(g_proj=torch.nn.Identity()), "model.layers.3.self_attn")

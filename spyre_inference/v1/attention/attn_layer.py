@@ -20,6 +20,7 @@ each eligible layer instance; every other ``Attention`` keeps upstream's forward
 cannot be captured with ``fullgraph=True``.
 """
 
+import functools
 import types
 import weakref
 from collections.abc import Iterable
@@ -27,8 +28,13 @@ from typing import cast
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention.attention import Attention
-from vllm.utils.torch_utils import _encode_layer_name
+from vllm.model_executor.layers.attention.attention import Attention, get_attention_context
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backend import AttentionType
 
 logger = init_logger(__name__)
@@ -93,6 +99,48 @@ def publish_null_slots(num_tokens: int) -> None:
         holder.publish_null(num_tokens)
 
 
+def _attention_with_extra_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    extra_inputs: list[torch.Tensor],
+    layer_name: LayerNameType,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    """``unified_attention_with_output`` plus tensors the impl reads beside q, k and v.
+
+    Passing them as op arguments orders their in-graph writes before the opaque read.
+    """
+    del kv_cache_dummy_dep
+    attn_metadata, layer, kv_cache, _ = get_attention_context(_resolve_layer_name(layer_name))
+    layer.impl.forward(  # ty: ignore[unknown-argument]
+        layer, query, key, value, kv_cache, attn_metadata, output=output, extra_inputs=extra_inputs
+    )
+
+
+def _attention_with_extra_inputs_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    extra_inputs: list[torch.Tensor],
+    layer_name: LayerNameType,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+@functools.cache
+def _register_extra_inputs_op() -> None:
+    direct_register_custom_op(
+        op_name="spyre_attention_with_extra_inputs",
+        op_func=_attention_with_extra_inputs,
+        mutates_args=["output"],
+        fake_impl=_attention_with_extra_inputs_fake,
+    )
+
+
 def _spyre_attention_forward(
     self: Attention,
     query: torch.Tensor,
@@ -100,6 +148,7 @@ def _spyre_attention_forward(
     value: torch.Tensor,
     output_shape: torch.Size | None = None,
     output_dtype: torch.dtype | None = None,
+    extra_inputs: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     if output_dtype is None:
         output_dtype = query.dtype
@@ -133,14 +182,25 @@ def _spyre_attention_forward(
         q_in, out_buf = buffers
         q_in[:rows] = query
 
-    torch.ops.vllm.unified_attention_with_output(
-        q_in,  # ty: ignore[invalid-argument-type]
-        key,  # ty: ignore[invalid-argument-type]
-        value,  # ty: ignore[invalid-argument-type]
-        out_buf,  # ty: ignore[invalid-argument-type]
-        _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
-        kv_cache_dummy_dep=dep,  # ty: ignore[invalid-argument-type]
-    )
+    if extra_inputs:
+        torch.ops.vllm.spyre_attention_with_extra_inputs(
+            q_in,  # ty: ignore[invalid-argument-type]
+            key,  # ty: ignore[invalid-argument-type]
+            value,  # ty: ignore[invalid-argument-type]
+            out_buf,  # ty: ignore[invalid-argument-type]
+            extra_inputs,  # ty: ignore[invalid-argument-type]
+            _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
+            kv_cache_dummy_dep=dep,  # ty: ignore[invalid-argument-type]
+        )
+    else:
+        torch.ops.vllm.unified_attention_with_output(
+            q_in,  # ty: ignore[invalid-argument-type]
+            key,  # ty: ignore[invalid-argument-type]
+            value,  # ty: ignore[invalid-argument-type]
+            out_buf,  # ty: ignore[invalid-argument-type]
+            _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
+            kv_cache_dummy_dep=dep,  # ty: ignore[invalid-argument-type]
+        )
     if buffers is not None:
         output.copy_(out_buf[:rows])
     return output.view(-1, hidden_size)
@@ -161,6 +221,7 @@ def _can_split(layer: Attention) -> bool:
 def install(layers: Iterable[Attention]) -> SlotMapping:
     """Opt eligible layers into the traced KV write; returns their shared slot holder."""
     split = [layer for layer in layers if _can_split(layer)]
+    _register_extra_inputs_op()
     slot_mapping = SlotMapping(split)
     _holders.add(slot_mapping)
 

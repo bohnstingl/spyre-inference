@@ -306,6 +306,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
 
+    # DSA top-k masks, keyed by the id of a sequence's query row table: written by a layer
+    # with an indexer, read by the layers that share its selection (see attention.dsa).
+    dsa_mask_stacks: dict[int, torch.Tensor] = field(default_factory=dict)
+
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
     # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
     # backend imports from this module, not the other way round.

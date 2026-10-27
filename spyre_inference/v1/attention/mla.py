@@ -28,6 +28,10 @@ Spyre backend, its KV store, buckets and warmup recorder unchanged. The page hol
 576-wide latent once as K; V is the same latent, stored again because the kernels read V
 from its own pages (the latent is 1/16 of an expanded GLM-5 K+V even so). The upstream
 ``MLAAttention`` layer and its CUDA/CPU backends are not built.
+
+DSA (``index_topk`` configs) reuses upstream's ``Indexer`` projections and applies the
+selected top-k as an additive mask on the same attention; see
+``spyre_inference.v1.attention.dsa``.
 """
 
 from __future__ import annotations
@@ -45,6 +49,8 @@ if TYPE_CHECKING:
     from vllm.config import CacheConfig
     from vllm.model_executor.layers.mla import MLAModules
     from vllm.model_executor.layers.quantization import QuantizationConfig
+
+    from spyre_inference.v1.attention.dsa import SpyreDsaIndexer
 
 logger = init_logger(__name__)
 
@@ -65,6 +71,7 @@ class SpyreLatentAttention(Attention):
         *args,
         mla_dims: tuple[int, int, int, int],
         kv_b_proj,
+        dsa_indexer: SpyreDsaIndexer | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -73,8 +80,9 @@ class SpyreLatentAttention(Attention):
             raise NotImplementedError(
                 f"Spyre MLA needs an unquantized kv_b_proj, got {type(kv_b_proj.quant_method)}."
             )
-        # A plain attribute, not a submodule: kv_b_proj is registered on the wrapper.
+        # Plain attributes, not submodules: both are registered on the wrapper.
         self.__dict__["_kv_b_proj"] = kv_b_proj
+        self.__dict__["_dsa_indexer"] = dsa_indexer
         self.W_UK_T: torch.Tensor | None = None
         self.W_UV: torch.Tensor | None = None
 
@@ -89,6 +97,8 @@ class SpyreLatentAttention(Attention):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         super().process_weights_after_loading(act_dtype)
+        if self._dsa_indexer is not None:
+            self._dsa_indexer.split_projections()
         # kv_b_proj.weight is already Wᵀ [L, N * (P + V)], the layout upstream's
         # split_kv_b_proj transposes its [out, in] weight into.
         weight = self._kv_b_proj.weight.data.to(act_dtype)
@@ -125,7 +135,8 @@ class SpyreMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         # Skip MultiHeadLatentAttentionWrapper.__init__: it builds upstream's MLAAttention,
-        # which has no Spyre backend. skip_topk and the scoring skip only concern DSA.
+        # which has no Spyre backend (and raises for sparse configs). The scoring skip is
+        # upstream's short-prefill one; the DSA mask skips short walks by itself.
         torch.nn.Module.__init__(self)
         q_proj = mla_modules.q_b_proj if q_lora_rank is not None else mla_modules.q_proj
         unsupported = {
@@ -133,7 +144,6 @@ class SpyreMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             "fuse_qkv_rmsnorm": fuse_qkv_rmsnorm,
             "DCP query replication": getattr(q_proj, "qrep_active", False),
             "an attention output gate (g_proj)": mla_modules.g_proj is not None,
-            "sparse attention (DSA)": mla_modules.is_sparse,
         }
         if any(unsupported.values()):
             names = ", ".join(name for name, on in unsupported.items() if on)
@@ -155,8 +165,49 @@ class SpyreMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         self.kv_b_proj = mla_modules.kv_b_proj
         self.rotary_emb = mla_modules.rotary_emb
         self.o_proj = mla_modules.o_proj
+        self.indexer = mla_modules.indexer
+        self.indexer_rope_emb = mla_modules.indexer_rotary_emb
+        self.is_sparse = mla_modules.is_sparse
+        # Upstream builds an indexer exactly on the layers that select their own top-k; the
+        # others (GLM-5's IndexCache "shared" layers) reuse the full layer's before them.
+        assert not self.is_sparse or skip_topk == (self.indexer is None), (
+            f"{prefix}: skip_topk={skip_topk} with indexer={self.indexer is not None}"
+        )
 
         latent = kv_lora_rank + qk_rope_head_dim
+        attn_kwargs: dict = {}
+        self.dsa = None
+        if self.is_sparse:
+            from vllm.config import get_current_vllm_config
+
+            from spyre_inference.v1.attention.dsa import (
+                DsaStaging,
+                SpyreDsaAttentionBackend,
+                SpyreDsaConfig,
+                SpyreDsaIndexer,
+            )
+
+            vllm_config = get_current_vllm_config()
+            dsa = SpyreDsaConfig.from_hf(vllm_config.model_config.hf_text_config, latent)
+            # Every sparse layer is sized for the indexer key, so all of them share one
+            # KV cache group, and with it the step's metadata the shared layers read.
+            latent += dsa.head_dim
+            staging = None
+            if self.indexer is not None:
+                assert self.indexer_rope_emb is not None
+                staging = DsaStaging.shared(
+                    vllm_config.scheduler_config.max_num_batched_tokens + 1,
+                    dsa.n_heads,
+                    dsa.head_dim,
+                    vllm_config.model_config.dtype,
+                )
+                self.dsa = SpyreDsaIndexer(self.indexer, self.indexer_rope_emb, dsa, staging)
+            attn_kwargs = {
+                "attn_backend": SpyreDsaAttentionBackend,
+                "dsa_indexer": self.dsa,
+                "dsa": dsa,
+                "dsa_staging": staging,
+            }
         self.latent_head_size = -(-latent // _STICK) * _STICK
         if self.fused_qkv_a_proj is not None:
             # A MergedColumnParallelLinear subclass the OOT linear registry does not name.
@@ -176,6 +227,7 @@ class SpyreMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             prefix=f"{prefix}.attn",
             mla_dims=(kv_lora_rank, qk_nope_head_dim, v_head_dim, num_heads),
             kv_b_proj=self.kv_b_proj,
+            **attn_kwargs,
         )
         self.prefix = prefix
 
@@ -189,6 +241,7 @@ class SpyreMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        q_c = None
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None and self.q_b_proj is not None
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
@@ -211,14 +264,21 @@ class SpyreMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
             q_nope = q_nope * llama_4_scaling
             q_pe = q_pe * llama_4_scaling
 
+        latent_parts = [kv_c, k_pe.reshape(-1, self.qk_rope_head_dim)]
+        attn_kwargs = {}
+        if self.dsa is not None:
+            assert q_c is not None
+            index_k, attn_kwargs["extra_inputs"] = self.dsa(hidden_states, q_c, positions)
+            latent_parts.append(index_k)
+
         attn = self.mla_attn
         assert attn.W_UK_T is not None and attn.W_UV is not None
         # [H, T, P] @ [H, P, L] -> [T, H, L]
         ql_nope = torch.matmul(q_nope.transpose(0, 1), attn.W_UK_T).transpose(0, 1)
+        # Zero beyond the latent, so the indexer key adds nothing to the scores.
         mqa_q = self._pad_latent(torch.cat([ql_nope, q_pe], dim=-1))
-        latent = torch.cat([kv_c, k_pe.reshape(-1, self.qk_rope_head_dim)], dim=-1)
-        latent = self._pad_latent(latent).unsqueeze(1)
-        o_lat = attn(mqa_q, latent, latent)
+        latent = self._pad_latent(torch.cat(latent_parts, dim=-1)).unsqueeze(1)
+        o_lat = attn(mqa_q, latent, latent, **attn_kwargs)
         o_lat = o_lat.view(-1, self.num_heads, self.latent_head_size)[..., : self.kv_lora_rank]
         # [H, T, L] @ [H, L, V] -> [T, H * V]
         out = torch.matmul(o_lat.transpose(0, 1), attn.W_UV).transpose(0, 1)
