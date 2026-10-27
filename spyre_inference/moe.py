@@ -128,7 +128,10 @@ class SpyreMoERecipe:
     activation: Literal["gelu_tanh", "silu"]
     # "sigmoid_bias" is DeepSeek-V3's noaux_tc: sigmoid scores, the correction bias
     # added for selection only, the unbiased scores of the selected experts renormalized.
-    routing: Literal["full_softmax", "topk_softmax", "sigmoid_bias"]
+    # "dense_routes": router_logits already is the renormalized [tokens, experts] routing
+    # table, zero off the top-k. Used by the TEMPORARY host router for GLM
+    # (models/glm_cpu_router.py), which computes noaux_tc in fp32 on the CPU.
+    routing: Literal["full_softmax", "topk_softmax", "sigmoid_bias", "dense_routes"]
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
@@ -141,7 +144,10 @@ def _validate_recipe(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> None:
     # would load and route wrongly rather than fail.
     scoring = getattr(layer, "scoring_func", "softmax")
     bias = getattr(layer, "e_score_correction_bias", None)
-    if recipe.routing == "sigmoid_bias":
+    if recipe.routing == "dense_routes":
+        # Whatever computes the routing table implements these fields.
+        pass
+    elif recipe.routing == "sigmoid_bias":
         if scoring != "sigmoid" or bias is None:
             raise NotImplementedError(
                 "sigmoid_bias routing needs scoring_func='sigmoid' and an "
@@ -294,7 +300,10 @@ def _routing_weights(
     reduce_dtype: torch.dtype,
     selection_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if routing == "sigmoid_bias":
+    if routing == "dense_routes":
+        # The table holds exactly top_k positive weights per row, already renormalized.
+        weights, indices = _topk(router_logits, top_k)
+    elif routing == "sigmoid_bias":
         assert selection_bias is not None
         # Sigmoid scores are positive, so a -1 fill keeps the unselected experts last
         # and the second top-k returns exactly the selected ones with their weights.
@@ -872,6 +881,8 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 route = _route(layer, _probs(router_logits, router_logits.dtype))
             elif recipe.routing == "sigmoid_bias":
                 route = _route_selected(layer, _layer_sigmoid_bias_probs(layer, router_logits))
+            elif recipe.routing == "dense_routes":
+                route = _route_selected(layer, router_logits)
             else:
                 route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
             return _moe_persistent_in_graph(
@@ -902,6 +913,8 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     layer, router_logits
                 )
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
+            elif recipe.routing == "dense_routes":
+                route = _region(layer, "route_selected", _route_selected)(layer, router_logits)
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)

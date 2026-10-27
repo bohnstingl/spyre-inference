@@ -641,20 +641,35 @@ def test_single_chunk_layout_uses_gathered_dispatch(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("routing", "routing_fn", "route_fn"),
-    [("full_softmax", "_probs", "_route"), ("topk_softmax", "_topk_probs", "_route_selected")],
+    ("routing", "expected"),
+    [
+        ("full_softmax", [("probs", "_probs"), ("route", "_route")]),
+        ("topk_softmax", [("topk_probs", "_topk_probs"), ("route_selected", "_route_selected")]),
+        # The host router's table already is the dense routing weights.
+        ("dense_routes", [("route_selected", "_route_selected")]),
+    ],
 )
-def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, routing_fn, route_fn):
+def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, expected):
     """The persistent form runs routing -> route -> experts for the selected recipe."""
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch)
     _apply(_dispatch_layer(routing), tokens=8)
-    assert calls == [
-        ("probs" if routing == "full_softmax" else "topk_probs", routing_fn),
-        ("route" if routing == "full_softmax" else "route_selected", route_fn),
-        ("experts", "_experts"),
-    ]
+    assert calls == [*expected, ("experts", "_experts")]
     assert resets == [1]
+
+
+def test_dense_routes_table_round_trips_through_the_gathered_routing():
+    """The gathered form reads the host router's [tokens, experts] table back as top-k."""
+    from spyre_inference.moe import _routing_weights
+
+    torch.manual_seed(0)
+    ids = torch.stack([torch.randperm(EXPERTS)[:TOP_K] for _ in range(5)])
+    weights = torch.rand(5, TOP_K) + 0.1
+    weights = weights / weights.sum(-1, keepdim=True)
+    table = torch.zeros(5, EXPERTS).scatter(1, ids, weights)
+    got_w, got_ids = _routing_weights(table, TOP_K, "dense_routes", table.dtype)
+    assert torch.equal(got_ids.sort(-1).values, ids.sort(-1).values)
+    torch.testing.assert_close(torch.zeros_like(table).scatter(1, got_ids, got_w), table)
 
 
 def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
