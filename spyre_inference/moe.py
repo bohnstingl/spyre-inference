@@ -62,6 +62,7 @@ if TYPE_CHECKING:
         spyre_moe_chunk_scale: torch.Tensor
         spyre_moe_chunk_offsets: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
+        spyre_moe_selection_bias: torch.Tensor | None
 
 
 logger = init_logger(__name__)
@@ -125,7 +126,9 @@ class SpyreMoERecipe:
     """
 
     activation: Literal["gelu_tanh", "silu"]
-    routing: Literal["full_softmax", "topk_softmax"]
+    # "sigmoid_bias" is DeepSeek-V3's noaux_tc: sigmoid scores, the correction bias
+    # added for selection only, the unbiased scores of the selected experts renormalized.
+    routing: Literal["full_softmax", "topk_softmax", "sigmoid_bias"]
     prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
@@ -133,6 +136,31 @@ def _validate_recipe(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> None:
     if recipe.routing == "full_softmax" and layer.custom_routing_function is None:
         raise NotImplementedError(
             "Full-softmax routing requires a model-specific Spyre MoE recipe."
+        )
+    # The recipe replaces upstream's router, so a routing field it does not implement
+    # would load and route wrongly rather than fail.
+    scoring = getattr(layer, "scoring_func", "softmax")
+    bias = getattr(layer, "e_score_correction_bias", None)
+    if recipe.routing == "sigmoid_bias":
+        if scoring != "sigmoid" or bias is None:
+            raise NotImplementedError(
+                "sigmoid_bias routing needs scoring_func='sigmoid' and an "
+                f"e_score_correction_bias, got scoring_func={scoring!r}, bias={bias is not None}."
+            )
+        groups = (getattr(layer, "num_expert_group", None), getattr(layer, "topk_group", None))
+        if any(g not in (None, 1) for g in groups):
+            raise NotImplementedError(
+                f"Spyre MoE does not support grouped top-k (num_expert_group, topk_group)={groups}."
+            )
+    elif scoring != "softmax" or bias is not None:
+        raise NotImplementedError(
+            f"Spyre {recipe.routing} routing does not implement scoring_func={scoring!r} "
+            f"with e_score_correction_bias={bias is not None}."
+        )
+    if getattr(layer, "routed_scaling_factor", 1.0) != 1.0:
+        raise NotImplementedError(
+            "Spyre MoE recipes leave routed_scaling_factor to MoERunner "
+            "(apply_routed_scale_to_output=True) or to prepare_down_weight."
         )
 
 
@@ -224,13 +252,58 @@ def _probs(router_logits: torch.Tensor, reduce_dtype: torch.dtype) -> torch.Tens
     return torch.softmax(router_logits.to(reduce_dtype), dim=-1).to(router_logits.dtype)
 
 
+def _sigmoid_bias_kept(
+    router_logits: torch.Tensor,
+    selection_bias: torch.Tensor,
+    top_k: int,
+    fill: float,
+) -> torch.Tensor:
+    """Sigmoid scores at the experts the biased scores select, ``fill`` elsewhere.
+
+    Selection runs in the logits' dtype: an fp32 sigmoid plus bias does not lower
+    ("Multi-arg pointwise with mixed EA"), nor does an fp32 top-k. A gather by the top-k
+    indices fails too (they come back in the input dtype), hence ``keep_by_index``.
+    Rows stay padded to two, as ``_topk`` pads them.
+    """
+    tokens = router_logits.shape[0]
+    scores = torch.sigmoid(router_logits)
+    if tokens == 1:
+        scores = scores.expand(2, -1).contiguous()
+    _, selected = torch.topk(scores + selection_bias, top_k, dim=-1)
+    return torch.ops.spyre.keep_by_index(
+        scores,  # ty: ignore[invalid-argument-type]
+        selected,  # ty: ignore[invalid-argument-type]
+        -1,  # ty: ignore[invalid-argument-type]
+        fill,  # ty: ignore[invalid-argument-type]
+    )
+
+
+def _sigmoid_bias_probs(
+    router_logits: torch.Tensor, selection_bias: torch.Tensor, top_k: int
+) -> torch.Tensor:
+    """Renormalized sigmoid_bias weights in dense expert order."""
+    dense = _sigmoid_bias_kept(router_logits, selection_bias, top_k, 0.0)
+    dense = dense[: router_logits.shape[0]]
+    return dense / dense.sum(-1, keepdim=True)
+
+
 def _routing_weights(
     router_logits: torch.Tensor,
     top_k: int,
     routing: str,
     reduce_dtype: torch.dtype,
+    selection_bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if routing == "full_softmax":
+    if routing == "sigmoid_bias":
+        assert selection_bias is not None
+        # Sigmoid scores are positive, so a -1 fill keeps the unselected experts last
+        # and the second top-k returns exactly the selected ones with their weights.
+        kept = _sigmoid_bias_kept(router_logits, selection_bias, top_k, -1.0)
+        selected_values, indices = torch.topk(kept, top_k, dim=-1)
+        tokens = router_logits.shape[0]
+        selected_values, indices = selected_values[:tokens], indices[:tokens]
+        weights = selected_values / selected_values.sum(-1, keepdim=True)
+    elif routing == "full_softmax":
         selected_values, indices = _topk(_probs(router_logits, reduce_dtype), top_k)
         weights = selected_values / selected_values.sum(-1, keepdim=True)
     else:
@@ -261,6 +334,7 @@ def _moe_gathered(
     *,
     chunk_scale: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    selection_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
     if hidden % chunks:
@@ -286,7 +360,9 @@ def _moe_gathered(
             f"gathered down pool must have chunked shape {expected_down_shape}, "
             f"got {tuple(down.shape)}"
         )
-    weights, raw_indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
+    weights, raw_indices = _routing_weights(
+        router_logits, top_k, routing, reduce_dtype, selection_bias
+    )
     rows = tokens * top_k
     # Entry e*chunks+c selects chunk c of expert e, in (row, chunk) order. Broadcasting against
     # the [1, chunks, 1] device offsets, not a cat of per-chunk index tensors, keeps the region
@@ -459,6 +535,7 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         recipe.activation,
         chunk_scale=layer.spyre_moe_chunk_scale,
         chunk_offsets=layer.spyre_moe_chunk_offsets,
+        selection_bias=getattr(layer, "spyre_moe_selection_bias", None),
     )
 
 
@@ -488,6 +565,11 @@ def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
         router_logits, top_k, "topk_softmax", router_logits.dtype
     )
     return torch.zeros_like(router_logits).scatter(-1, topk_ids, topk_weights)
+
+
+def _layer_sigmoid_bias_probs(layer: RoutedExperts, router_logits: torch.Tensor) -> torch.Tensor:
+    assert layer.spyre_moe_selection_bias is not None
+    return _sigmoid_bias_probs(router_logits, layer.spyre_moe_selection_bias, layer.top_k)
 
 
 def _route(layer: RoutedExperts, probs: torch.Tensor) -> torch.Tensor:
@@ -703,6 +785,13 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         else dtype
     )
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
+    layer.spyre_moe_selection_bias = None
+    if layer.spyre_moe_recipe.routing == "sigmoid_bias":
+        bias = cast(torch.Tensor, layer.e_score_correction_bias).detach().float()
+        # A shared offset does not change the selection, and these biases sit near a
+        # large common value (about 9 for GLM-4.7-Flash): centred, their per-expert
+        # spread survives the cast to the selection dtype.
+        layer.spyre_moe_selection_bias = (bias - bias.mean()).to(dtype).to("spyre")
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
         experts,
@@ -781,6 +870,8 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
                 route = _route(layer, _probs(router_logits, router_logits.dtype))
+            elif recipe.routing == "sigmoid_bias":
+                route = _route_selected(layer, _layer_sigmoid_bias_probs(layer, router_logits))
             else:
                 route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
             return _moe_persistent_in_graph(
@@ -806,6 +897,11 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             if recipe.routing == "full_softmax":
                 probs = _region(layer, "probs", _probs)(router_logits, layer.spyre_moe_route_dtype)
                 route = _region(layer, "route", _route)(layer, probs)
+            elif recipe.routing == "sigmoid_bias":
+                topk_probs = _region(layer, "sigmoid_bias_probs", _layer_sigmoid_bias_probs)(
+                    layer, router_logits
+                )
+                route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
                 route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
