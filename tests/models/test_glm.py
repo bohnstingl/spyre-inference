@@ -111,3 +111,101 @@ def test_host_router_switch_selects_the_routing_recipe(monkeypatch, host_router)
         envs.clear_env_cache()
     assert recipes[0].routing == ("dense_routes" if host_router else "sigmoid_bias")
     assert len(installed) == int(host_router)
+
+
+class _Norm:
+    def __init__(self, eps: float) -> None:
+        self.variance_epsilon = eps
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+
+
+def _model(num_layers: int, eps: float):
+    layers = [
+        SimpleNamespace(
+            layer_idx=i, input_layernorm=_Norm(eps), post_attention_layernorm=_Norm(eps)
+        )
+        for i in range(num_layers)
+    ]
+    return SimpleNamespace(layers=layers, norm=_Norm(eps))
+
+
+def test_fp16_residual_scale_keeps_every_stream_norm_exact():
+    """DeepseekV2DecoderLayer divides the residual stream by the routed scale in fp16; with
+    the epsilon compensated, each norm reading it returns what it would on the true stream.
+
+    GLM-5.2's early stream is small enough (RMS about 0.007) that the uncompensated epsilon
+    moves the logits by over a nat.
+    """
+    eps, scale = 1e-5, 2.5
+    reference, model = _model(4, eps), _model(4, eps)
+    glm.compensate_fp16_residual_scale(model, scale)
+
+    stream = torch.randn(3, 6144, dtype=torch.float64) * 0.007
+    for ref_layer, layer in zip(reference.layers, model.layers):
+        torch.testing.assert_close(
+            layer.post_attention_layernorm(stream / scale),
+            ref_layer.post_attention_layernorm(stream),
+        )
+        if layer.layer_idx == 0:
+            # Reads the embedding before the decoder scales it.
+            assert layer.input_layernorm.variance_epsilon == eps
+        else:
+            torch.testing.assert_close(
+                layer.input_layernorm(stream / scale), ref_layer.input_layernorm(stream)
+            )
+    torch.testing.assert_close(model.norm(stream / scale), reference.norm(stream))
+
+
+def test_fp16_residual_scale_is_a_no_op_without_a_routed_scale():
+    model = _model(2, 1e-5)
+    glm.compensate_fp16_residual_scale(model, 1.0)
+    assert all(layer.post_attention_layernorm.variance_epsilon == 1e-5 for layer in model.layers)
+
+
+def test_mla_off_attention_matches_upstream_forward(tp_group):
+    """The MLA-off prologue built with torch.cat gives upstream DeepseekV2Attention's
+    q, k and v, which it writes into empty_like buffers Spyre cannot store."""
+    from vllm.config import CacheConfig, get_current_vllm_config
+    from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    config = SimpleNamespace(rms_norm_eps=1e-6, rope_parameters={"rope_type": "default"})
+    get_current_vllm_config().compilation_config.static_forward_context.pop(
+        "model.layers.0.self_attn.attn", None
+    )
+    torch.manual_seed(0)
+    with set_default_torch_dtype(torch.float32):
+        attn = DeepseekV2Attention(
+            get_current_vllm_config(),
+            config,
+            256,
+            4,
+            64,
+            64,
+            128,
+            None,
+            128,
+            max_position_embeddings=256,
+            cache_config=CacheConfig(block_size=128),
+            prefix="model.layers.0.self_attn",
+        )
+        for module in attn.modules():
+            if hasattr(module, "quant_method") and hasattr(module, "weight"):
+                module.weight.data.normal_(std=0.05)
+                module.quant_method.process_weights_after_loading(module)
+
+    class Recorder(torch.nn.Module):
+        def forward(self, q, k, v):
+            seen.append((q, k, v))
+            return v
+
+    seen = []
+    attn.attn = Recorder()
+    positions, hidden = torch.arange(6), torch.randn(6, 256)
+    want = DeepseekV2Attention.forward(attn, positions, hidden, None)
+    got = glm._spyre_mha_forward(attn, positions, hidden, None)
+    torch.testing.assert_close(got, want)
+    for ours, theirs in zip(seen[1], seen[0]):
+        torch.testing.assert_close(ours.reshape(theirs.shape), theirs)
