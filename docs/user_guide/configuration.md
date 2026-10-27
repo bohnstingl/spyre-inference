@@ -170,10 +170,20 @@ extra lever there, and the same keep-it-short advice applies.
 The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
 card's free memory (`torch.accelerator.get_memory_info`) and gives the KV cache what is
 left of `--gpu-memory-utilization` (default 0.92) × total. Spyre then caps it at what a
-full batch can use, `--max-num-seqs` × `ceil(--max-model-len / block_size)` blocks, since
-the single block pool could not hand out more. When memory runs out before the batch area
-is full, a warning names the knobs and requests wait for pages instead of all running at
-full length.
+full batch can use: `--max-num-seqs` requests at `--max-model-len`, plus the null block.
+
+A request's share comes from vLLM's own KV cache groups:
+
+- `ceil(--max-model-len / block_size)` blocks per full-attention group;
+- the window's blocks per sliding-window group, when the hybrid KV cache manager keeps
+  the window;
+- one block per Mamba group.
+
+Each Spyre layer allocates its own page per block, so the budget is converted into blocks
+at the device cost of all layers' pages. That is more than vLLM's shared pool counts when
+groups would overlay one buffer, as Mamba groups do. When memory runs out before the batch
+area is full, a warning names the knobs, and requests wait for pages instead of all
+running at full length.
 
 The profile run is skipped, as the first forward on Spyre would trace the model before
 the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`
