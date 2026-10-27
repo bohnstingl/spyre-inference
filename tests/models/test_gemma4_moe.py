@@ -440,7 +440,6 @@ _STANDARD = ("silu", "topk_softmax")
         ({"apply_router_weight_on_input": True}, _STANDARD, "input-weighted"),
         ({"quant_method": object()}, _STANDARD, "quantized experts"),
         ({"moe_config": {"is_lora_enabled": True}}, _STANDARD, "LoRA experts"),
-        ({"moe_config": {"has_bias": True}}, _STANDARD, "expert biases"),
         # The recipe's activation must be the one the layer actually asks for.
         ({}, ("gelu_tanh", "topk_softmax"), "requires activation="),
         # Only model adapters may request a non-standard upstream routing recipe.
