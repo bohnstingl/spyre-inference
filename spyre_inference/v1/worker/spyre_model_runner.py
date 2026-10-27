@@ -35,8 +35,9 @@ Data flow in the current WIP version:
 from __future__ import annotations
 
 import bisect
+import gc
 import time
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from typing import Any, cast
 
 import numpy as np
@@ -46,6 +47,7 @@ import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
@@ -118,7 +120,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
 )
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
-from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker import compile_guard, load_gate
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
     encoder_pad_token_id,
@@ -723,6 +725,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         install_head_pad_weight_loader(model_loader, text_config, self.model_config)
         install_mlp_pad_weight_loader(model_loader, text_config, self.model_config)
 
+        # Held from the host load until the weights are on the card (SPYRE_MAX_CONCURRENT_LOADS).
+        host_copy = ExitStack()
+        host_copy.enter_context(
+            load_gate.load_slot(
+                get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+            )
+        )
+
         # Load model on CPU
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
@@ -764,6 +774,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         for module in self.model.modules():
             if isinstance(module, SpyreConv2d):
                 module.process_weights_after_loading()
+        gc.collect()
+        host_copy.close()
 
         # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
         # falls back to the host elsewhere. FP32 linear heads stay on CPU.

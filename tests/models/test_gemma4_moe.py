@@ -25,6 +25,7 @@ lowering needs the card.
 
 import warnings
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -444,6 +445,21 @@ _STANDARD = ("silu", "topk_softmax")
         ({}, ("gelu_tanh", "topk_softmax"), "requires activation="),
         # Only model adapters may request a non-standard upstream routing recipe.
         ({}, ("silu", "full_softmax"), "model-specific"),
+        # A router field the recipe ignores would load and route wrongly, not fail.
+        ({"scoring_func": "sigmoid"}, _STANDARD, "scoring_func='sigmoid'"),
+        ({"e_score_correction_bias": torch.zeros(EXPERTS)}, _STANDARD, "e_score_correction_bias"),
+        ({"routed_scaling_factor": 2.5}, _STANDARD, "routed_scaling_factor"),
+        ({}, ("silu", "sigmoid_bias"), "needs scoring_func='sigmoid'"),
+        (
+            {
+                "scoring_func": "sigmoid",
+                "e_score_correction_bias": torch.zeros(EXPERTS),
+                "num_expert_group": 8,
+                "topk_group": 4,
+            },
+            ("silu", "sigmoid_bias"),
+            "grouped top-k",
+        ),
     ],
 )
 def test_configure_rejects_what_the_spyre_forms_cannot_express(overrides, recipe_args, match):
@@ -453,6 +469,39 @@ def test_configure_rejects_what_the_spyre_forms_cannot_express(overrides, recipe
     layer = _generic_layer(**overrides)
     with pytest.raises(NotImplementedError, match=match):
         configure_spyre_moe_layer(layer, SpyreMoERecipe(*recipe_args))
+
+
+def test_sigmoid_bias_routing_matches_upstream_grouped_topk():
+    """GLM / DeepSeek-V3 noaux_tc: the correction bias picks the experts, the unbiased
+    sigmoid scores weigh them. Both Spyre forms against vLLM's fp32 CPU router."""
+    from vllm.model_executor.layers.fused_moe.router.cpu_router import _grouped_topk
+
+    from spyre_inference.moe import _routing_weights, _sigmoid_bias_probs
+
+    torch.manual_seed(0)
+    logits = torch.randn(5, EXPERTS) * 2
+    # A large shared offset, as GLM-4.7-Flash's biases carry; only the spread selects.
+    bias = torch.randn(EXPERTS) * 0.5 + 9.0
+    ref_weights, ref_ids = _grouped_topk(logits, 2, True, 1, 1, "sigmoid", 1.0, bias)
+    expected = torch.zeros_like(logits).scatter(1, ref_ids.long(), ref_weights)
+
+    centred = bias - bias.mean()
+    keep_by_index = lambda values, selected, dim, fill: torch.full_like(values, fill).scatter(  # noqa: E731
+        dim, selected, values.gather(dim, selected)
+    )
+    with mock.patch.object(torch.ops.spyre, "keep_by_index", keep_by_index, create=True):
+        dense = _sigmoid_bias_probs(logits, centred, 2)
+        weights, ids = _routing_weights(logits, 2, "sigmoid_bias", logits.dtype, centred)
+    torch.testing.assert_close(dense, expected)
+    torch.testing.assert_close(torch.zeros_like(logits).scatter(1, ids, weights), expected)
+
+
+def test_configure_accepts_sigmoid_bias_routing():
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer(scoring_func="sigmoid", e_score_correction_bias=torch.zeros(EXPERTS))
+    configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "sigmoid_bias"))
+    assert layer.spyre_moe_recipe.routing == "sigmoid_bias"
 
 
 def test_configure_accepts_tensor_parallel_experts():

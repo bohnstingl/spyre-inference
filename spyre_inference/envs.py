@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
+    SPYRE_MAX_CONCURRENT_LOADS: int = 0
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -142,6 +143,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MOE_CHUNKS": lambda: (
         int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
     ),
+    # How many TP ranks may load their weights into host RAM at once. A rank holds its whole
+    # host copy until the move to its card, so a model larger than host RAM must stagger the
+    # ranks (MiniMax-M3 at TP16: about 57 GB per rank against 755 GB). "0" (default) loads
+    # every rank at once; vLLM's max_parallel_loading_workers is not implemented upstream.
+    "SPYRE_MAX_CONCURRENT_LOADS": lambda: int(os.getenv("SPYRE_MAX_CONCURRENT_LOADS", "0")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

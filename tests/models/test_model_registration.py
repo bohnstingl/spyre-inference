@@ -50,7 +50,10 @@ def _load(target: str) -> type:
 
 def _upstream_class(arch: str) -> type:
     module, cls_name = _VLLM_MODELS[arch]
-    return getattr(importlib.import_module(f"vllm.model_executor.models.{module}"), cls_name)
+    # New-layout entries (vllm.models.<name>) carry their full module path.
+    if not module.startswith("vllm."):
+        module = f"vllm.model_executor.models.{module}"
+    return getattr(importlib.import_module(module), cls_name)
 
 
 def test_every_spyre_arch_is_known_to_vllm():

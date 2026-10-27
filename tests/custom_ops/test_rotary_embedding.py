@@ -310,32 +310,76 @@ def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_
 
 
 @pytest.mark.rotary
-@pytest.mark.parametrize(
-    "head_size,partial_rotary_factor",
-    [
-        (128, 0.5),  # partial AND unaligned: rotary_dim=64 -> inner dim 32
-        (256, 0.5),  # partial but inner-aligned: rotary_dim=128 -> rejected for being partial
-    ],
-)
-def test_rotary_partial_config_raises(default_vllm_config, head_size, partial_rotary_factor):
-    """Partial rotary raises NotImplementedError at construction (no CPU fallback),
-    whether or not its inner dim is stick-aligned."""
+@pytest.mark.parametrize("head_size,partial_rotary_factor", [(128, 0.5), (256, 0.5)])
+@pytest.mark.parametrize("flatten", [True, False])
+def test_rotary_partial_forward_oot_on_spyre(
+    default_vllm_config, head_size, partial_rotary_factor, flatten
+):
+    """Neox partial rotary (MiniMax-M3: 64 of 128 dims) runs split-free on Spyre, leaves
+    the dims past rotary_dim untouched, and matches forward_native."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
-    with pytest.raises(NotImplementedError):
-        get_rope(
-            head_size=head_size,
-            max_position=2048,
-            is_neox_style=True,
-            rope_parameters={"partial_rotary_factor": partial_rotary_factor},
-            dtype=torch.float16,
-        )
+    torch.manual_seed(42)
+    max_position, num_tokens = 2048, 32
+    rope = get_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters={"partial_rotary_factor": partial_rotary_factor},
+        dtype=torch.float16,
+    )
+    assert rope.rotary_dim < head_size
+    rope.to("spyre")
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query, key = _make_qk(num_tokens, 4, 1, head_size, flatten)
+    actual_query, actual_key = rope.forward_oot(
+        positions.to("spyre"), query.to("spyre"), key.to("spyre")
+    )
+
+    expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.rotary
-def test_rotary_non_neox_config_raises(default_vllm_config):
-    """gptj/interleaved (is_neox_style=False) full rotary is rejected at construction:
-    only the neox 2x2 kernel is implemented."""
+@pytest.mark.parametrize("head_size", [64, 128])
+def test_rotary_interleaved_forward_oot_on_spyre(default_vllm_config, head_size):
+    """Interleaved (is_neox_style=False) RoPE, GLM's and DeepSeek's MLA rotary, runs on
+    Spyre through the pair-swap form and matches forward_native."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    torch.manual_seed(42)
+    max_position, num_tokens = 2048, 32
+    rope = get_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=False,
+        dtype=torch.float16,
+    )
+    rope.to("spyre")
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    # MLA rotates one shared key head ([T, 1, D]) against every query head.
+    query, key = _make_qk(num_tokens, 4, 1, head_size, flatten=False)
+    actual_query, actual_key = rope.forward_oot(
+        positions.to("spyre"), query.to("spyre"), key.to("spyre")
+    )
+
+    expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+def test_rotary_interleaved_partial_config_raises(default_vllm_config):
+    """Interleaved partial rotary is rejected at construction, as neox partial rotary is."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     with pytest.raises(NotImplementedError):
@@ -343,6 +387,7 @@ def test_rotary_non_neox_config_raises(default_vllm_config):
             head_size=128,
             max_position=2048,
             is_neox_style=False,
+            rope_parameters={"partial_rotary_factor": 0.5},
             dtype=torch.float16,
         )
 

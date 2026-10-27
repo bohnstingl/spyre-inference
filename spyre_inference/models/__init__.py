@@ -47,6 +47,13 @@ _ADAPTED_ARCHS: dict[str, str] = {
         "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
     ),
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Glm4MoeLiteForCausalLM": "spyre_inference.models.glm:SpyreGlm4MoeLiteForCausalLM",
+    "GlmMoeDsaForCausalLM": "spyre_inference.models.glm:SpyreGlmMoeDsaForCausalLM",
+    "GptOssForCausalLM": "spyre_inference.models.gpt_oss:SpyreGptOssForCausalLM",
+    # Text only: upstream builds the language model through the registry, as Gemma-4.
+    "MiniMaxM3SparseForCausalLM": (
+        "spyre_inference.models.minimax_m3:SpyreMiniMaxM3SparseForCausalLM"
+    ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".

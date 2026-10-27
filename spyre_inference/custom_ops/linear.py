@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    MinimaxM3QKVParallelLinearWithIndexer,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -240,3 +241,11 @@ class SpyreQKVParallelLinear(_SpyreTransposedLinearMixin, QKVParallelLinear):
             f"{self.__class__.__name__} requires gather_output=False; "
             "all_gather is not yet supported on Spyre"
         )
+
+
+# OOT dispatch keys on the exact class name, so a QKVParallelLinear subclass needs its own.
+@QKVParallelLinear.register_oot(name="MinimaxM3QKVParallelLinearWithIndexer")
+class SpyreMinimaxM3QKVParallelLinearWithIndexer(
+    _SpyreTransposedLinearMixin, MinimaxM3QKVParallelLinearWithIndexer
+):
+    """OOT MiniMax-M3 ``[q | k | v | index_q | index_k]`` projection storing `Wᵀ`."""
