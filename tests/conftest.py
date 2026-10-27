@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+import torch
 from spyre_testing_plugin.tags import result_tags
 
 from spyre_inference import envs
@@ -55,6 +56,15 @@ def _clear_env_cache():
     envs.clear_env_cache()
     yield
     envs.clear_env_cache()
+
+
+@pytest.fixture
+def fp32_model_dtype(monkeypatch):
+    """Run the session VllmConfig in fp32, for layers a test builds in fp32: SpyreRoPE
+    casts its cache to the model dtype, fp16 by default."""
+    from vllm.config import get_current_vllm_config
+
+    monkeypatch.setattr(get_current_vllm_config().model_config, "dtype", torch.float32)
 
 
 @pytest.fixture(autouse=True)

@@ -119,7 +119,7 @@ def _dense_latent_attention(scale):
     return attend
 
 
-def test_absorbed_mla_matches_expanded_attention(tp_group, monkeypatch):
+def test_absorbed_mla_matches_expanded_attention(tp_group, monkeypatch, fp32_model_dtype):
     """Absorbing kv_b_proj into the query and output projections, and attending over the
     one latent head, gives upstream's expanded multi-head attention."""
     torch.manual_seed(0)

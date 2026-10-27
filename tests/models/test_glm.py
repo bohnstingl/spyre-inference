@@ -164,7 +164,7 @@ def test_fp16_residual_scale_is_a_no_op_without_a_routed_scale():
     assert all(layer.post_attention_layernorm.variance_epsilon == 1e-5 for layer in model.layers)
 
 
-def test_mla_off_attention_matches_upstream_forward(tp_group):
+def test_mla_off_attention_matches_upstream_forward(tp_group, fp32_model_dtype):
     """The MLA-off prologue built with torch.cat gives upstream DeepseekV2Attention's
     q, k and v, which it writes into empty_like buffers Spyre cannot store."""
     from vllm.config import CacheConfig, get_current_vllm_config

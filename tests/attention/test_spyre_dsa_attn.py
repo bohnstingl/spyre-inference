@@ -138,7 +138,7 @@ def _tiny_indexer():
     return indexer, rope, SpyreDsaIndexer(indexer, rope, cfg, staging)
 
 
-def test_indexer_projections_match_upstream_scores(tp_group):
+def test_indexer_projections_match_upstream_scores(tp_group, fp32_model_dtype):
     """The key, query and head weights SpyreDsaIndexer stages give upstream's lightning
     indexer score, sum_h w_h * relu(q_h . k) * softmax_scale * n_heads**-0.5, in fp32."""
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
