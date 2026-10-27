@@ -1164,10 +1164,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kv_sharing_target_layer_name: str | None = None,
         sinks: torch.Tensor | None = None,
     ) -> None:
-        # The only guard against sink models (gpt-oss, Transformers-backend sinks):
-        # upstream checks supports_sink() on CUDA/ROCm only.
-        if sinks is not None:
-            raise NotImplementedError("Spyre attention does not support attention sinks")
+        if sinks is not None and sinks.shape != (num_heads,):
+            raise ValueError(
+                f"attention sinks must have one logit per query head ({num_heads}), "
+                f"got shape {tuple(sinks.shape)}"
+            )
+        self._sinks_source = sinks
+        self._sinks: torch.Tensor | None = None
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1301,6 +1304,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
+
+    def _device_sinks(self, device: torch.device) -> torch.Tensor | None:
+        """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
+
+        Kv-major, matching the kernels' head order. Built on first use and kept: the
+        source parameter stays on the host (``Attention._apply`` is a no-op on Spyre).
+        """
+        if self._sinks_source is None:
+            return None
+        if self._sinks is None:
+            sinks = self._sinks_source.detach().to("cpu", self.model_dtype)
+            self._sinks = convert(
+                sinks.reshape(self.num_kv_heads, self.num_queries_per_kv, 1), device
+            )
+        return self._sinks
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        # Loaded (or reloaded) weights replace the sink values; rebuild on next use.
+        self._sinks = None
 
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (
@@ -1810,6 +1832,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.head_size,
             self.logits_soft_cap,
             out,
+            sinks=self._device_sinks(query_dev.device),
         )
 
     def build_index_tables(
@@ -1863,6 +1886,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.logits_soft_cap,
             alibi_stack,
             out,
+            sinks=self._device_sinks(query.device),
         )
 
     @_record_function("spyre_attn::online_softmax")
