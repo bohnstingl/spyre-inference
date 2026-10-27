@@ -163,7 +163,7 @@ def configure_minimax_m3_moe_layers(layers: Iterable[nn.Module]) -> int:
                 prepare_down_weight=prepare_down_weight,
             ),
         )
-        install_host_router(experts.layer_name, experts, moe.gate)
+        install_host_router(experts, moe.gate)
         configured += 1
     if configured:
         logger.info("Spyre: configured %d MiniMax-M3 MoE layers.", configured)

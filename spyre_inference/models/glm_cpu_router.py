@@ -16,8 +16,7 @@
 
 This is a deliberate exception to spyre-inference's rule of no CPU fallbacks, taken to get
 correct GLM-5.x routing until Spyre can run the router GEMM with fp32 accumulation and an
-fp32 result. Remove it once that lands; the repro filed with torch-spyre is
-``vllm_spyre_next/ZRL/claude/repro_spyre_fp32_accum_router_gemm.py``.
+fp32 result. Remove it once that lands; ``SPYRE_GLM_HOST_ROUTER=0`` routes on Spyre today.
 
 Why. The router computes ``sigmoid(x @ W_gate.T) + e_score_correction_bias`` and keeps the
 top-k experts. The model is trained with that GEMM in fp32 (GLM-5.2: ``moe_router_dtype:
@@ -26,11 +25,11 @@ float32``; vLLM forces fp32 for ``glm_moe_dsa``), and on real GLM-5.2 inputs the
 accumulates and returns fp16 only, so on device only 69% of real tokens get the expert set
 vLLM's fp32 router picks (96% with fp32 accumulation rounded to fp16, 100% in fp32).
 
-What runs on the host: the gate GEMM, sigmoid, bias, top-k and renormalization, as vLLM's
-own CPU router (``cpu_router._grouped_topk``) computes them, in fp32. The experts and
-everything else stay on Spyre. Cost per MoE layer per step: the [tokens, hidden] fp16
-activation goes to the host and a [tokens, experts] fp16 routing table comes back, and the
-op is opaque to the block graph.
+What runs on the host: the gate GEMM, sigmoid, bias, top-k and renormalization, through
+vLLM's own CPU router (``cpu_router.select_experts``), in fp32. The experts and everything
+else stay on Spyre. Cost per MoE layer per step: the [tokens, hidden] activation goes to
+the host and a [tokens, experts] routing table comes back, and the op is opaque to the
+block graph.
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.router.cpu_router import _grouped_topk
+from vllm.model_executor.layers.fused_moe.router.cpu_router import select_experts
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -53,6 +52,7 @@ from spyre_inference.custom_ops.utils import convert
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
 logger = init_logger(__name__)
 
@@ -64,40 +64,42 @@ _HOST_ROUTERS: dict[str, HostRouter] = {}
 class HostRouter:
     """fp32 host copies of one MoE layer's gate and routing settings."""
 
-    def __init__(self, experts: RoutedExperts, gate: torch.nn.Module) -> None:
+    def __init__(self, experts: RoutedExperts, gate: GateLinear) -> None:
         self.gate = gate
-        self.top_k = experts.top_k
-        self.renormalize = experts.renormalize
-        self.num_expert_group = experts.num_expert_group or 1
-        self.topk_group = experts.topk_group or 1
-        self.bias_param = experts.e_score_correction_bias
+        self.experts = experts
         self.weight_t: torch.Tensor | None = None
         self.bias: torch.Tensor | None = None
 
     def capture(self) -> None:
-        """Take fp32 host copies once the checkpoint is loaded, before the device move."""
-        weight = self.gate.weight.detach()
-        # SpyreTransposedWeightMethod stores the gate as Wᵀ [hidden, experts].
-        if weight.shape[0] != self.gate.input_size:
-            weight = weight.t()
-        self.weight_t = weight.to("cpu", torch.float32).contiguous()
-        assert self.bias_param is not None
-        self.bias = self.bias_param.detach().to("cpu", torch.float32).clone()
+        """Take fp32 host copies once the checkpoint is loaded, before the device move.
+
+        Runs from the model's ``load_weights``, before ``process_weights_after_loading``
+        transposes the gate: its weight is then the checkpoint's [experts, hidden].
+        """
+        weight = self.gate.weight.data
+        assert weight.shape == (self.gate.output_size, self.gate.input_size), weight.shape
+        self.weight_t = weight.t().to("cpu", torch.float32).contiguous()
+        bias = self.experts.e_score_correction_bias
+        assert bias is not None
+        self.bias = bias.detach().to("cpu", torch.float32).clone()
 
     def route(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Dense [tokens, experts] renormalized routing weights, zero off the top-k."""
         assert self.weight_t is not None and self.bias is not None, "capture() not run"
+        experts = self.experts
         # .cpu() before the upcast: an fp32 tensor read back from Spyre may be staggered.
-        logits = hidden_states.cpu().float() @ self.weight_t
-        weights, ids = _grouped_topk(
+        hidden = hidden_states.cpu().float()
+        logits = hidden @ self.weight_t
+        weights, ids = select_experts(
+            hidden,
             logits,
-            self.top_k,
-            self.renormalize,
-            self.num_expert_group,
-            self.topk_group,
-            "sigmoid",
-            1.0,
-            self.bias,
+            top_k=experts.top_k,
+            use_grouped_topk=True,
+            renormalize=experts.renormalize,
+            topk_group=experts.topk_group or 1,
+            num_expert_group=experts.num_expert_group or 1,
+            scoring_func="sigmoid",
+            e_score_correction_bias=self.bias,
         )
         return torch.zeros_like(logits).scatter(1, ids.long(), weights)
 
@@ -129,17 +131,17 @@ def _register_op() -> None:
     )
 
 
-def _host_route_forward(self: torch.nn.Module, hidden_states: torch.Tensor):
+def _host_route_forward(self: GateLinear, hidden_states: torch.Tensor):
     """The gate's forward under the host router: the routing table in place of logits."""
     dense = torch.ops.vllm.spyre_glm_host_route(
         hidden_states,  # ty: ignore[invalid-argument-type]
-        _encode_layer_name(self.spyre_route_name),  # ty: ignore[invalid-argument-type]
-        self.output_size,  # ty: ignore[invalid-argument-type]
+        _encode_layer_name(self.spyre_route_name),
+        self.output_size,
     )
     return dense, None
 
 
-def install_host_router(name: str, experts: RoutedExperts, gate: torch.nn.Module) -> None:
+def install_host_router(experts: RoutedExperts, gate: GateLinear) -> None:
     """TEMPORARY CPU FALLBACK: make ``gate`` return the host-computed dense routing table.
 
     Both GLM MoE classes call the gate where upstream expects router logits
@@ -148,6 +150,7 @@ def install_host_router(name: str, experts: RoutedExperts, gate: torch.nn.Module
     ``dense_routes`` recipe consumes, not logits.
     """
     _register_op()
+    name = experts.layer_name
     _HOST_ROUTERS[name] = HostRouter(experts, gate)
     # A bound method reading the name off the module, as attn_layer does: one code object
     # and a hoisted LayerName keep the per-block compile shared across layers.
@@ -156,8 +159,8 @@ def install_host_router(name: str, experts: RoutedExperts, gate: torch.nn.Module
     logger.warning_once(
         "TEMPORARY CPU FALLBACK: GLM MoE router expert selection (gate GEMM, sigmoid, "
         "bias, top-k) runs on the host in fp32 for every MoE layer, because Spyre's "
-        "matmul has no fp32 accumulation; the experts stay on Spyre. "
-        "See spyre_inference/models/glm_cpu_router.py."
+        "matmul has no fp32 accumulation; the experts stay on Spyre. Set "
+        "SPYRE_GLM_HOST_ROUTER=0 to route on Spyre in fp16."
     )
 
 

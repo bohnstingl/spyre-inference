@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
+    SPYRE_GLM_HOST_ROUTER: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -121,6 +122,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" when torch runs far more threads than the CPUs it gets (e.g. with
     # SPYRE_UPDATE_THREAD_CONFIG=0 in a CPU-limited pod): there it is slower.
     "SPYRE_BLOCKED_TRANSPOSE": lambda: bool(int(os.getenv("SPYRE_BLOCKED_TRANSPOSE", "1"))),
+    # When "1" (default), GLM MoE routers (gate GEMM, sigmoid, bias, top-k) run on the
+    # host in fp32: a TEMPORARY CPU fallback, because Spyre's matmul has no fp32
+    # accumulation and picks a different expert set for about a third of GLM-5.2's real
+    # tokens. "0" routes on Spyre in fp16. See spyre_inference/models/glm_cpu_router.py.
+    "SPYRE_GLM_HOST_ROUTER": lambda: bool(int(os.getenv("SPYRE_GLM_HOST_ROUTER", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DeepSeek sparse attention (DSA: GLM-5.x, DeepSeek-V3.2) on Spyre's latent MLA attention.
+"""DeepSeek sparse attention (DSA, as GLM-5.x runs it) on Spyre's latent MLA attention.
 
 DSA's lightning indexer scores every cached token per query,
 ``sum_h w_h * relu(q_h . k)``, and the query attends only to its ``index_topk`` best.
@@ -31,7 +31,8 @@ DeepSeek uses for short prefill:
   A ``"shared"`` layer (GLM-5's IndexCache) reuses the mask of the full layer before it,
   as upstream reuses that layer's top-k indices.
 
-Context of at most ``index_topk`` tokens keeps every token, which is the dense model.
+A walk of at most ``index_topk`` positions keeps every token, which is the dense model,
+so it skips the indexer scoring altogether.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from spyre_inference.v1.worker import compile_guard
 
 if TYPE_CHECKING:
     from torch import nn
+    from vllm.model_executor.models.deepseek_v2 import Indexer
 
     from spyre_inference.v1.attention.backends.spyre_attn import (
         SpyreAttentionMetadata,
@@ -129,7 +131,7 @@ class SpyreDsaIndexer(torch.nn.Module):
     """Upstream's indexer projections: the key to cache, and the staged query and weights."""
 
     def __init__(
-        self, indexer: nn.Module, rope: nn.Module, config: SpyreDsaConfig, staging: DsaStaging
+        self, indexer: Indexer, rope: nn.Module, config: SpyreDsaConfig, staging: DsaStaging
     ):
         super().__init__()
         self.indexer = indexer
@@ -154,14 +156,13 @@ class SpyreDsaIndexer(torch.nn.Module):
 
         Its output puts the head weights half a stick into a row, which no store lowers
         from. ``wk`` is kept alone, ``weights_proj`` zero-padded to a stick with the head
-        scale folded in. Called by the model after ``process_weights_after_loading``,
-        which stores the fused weight as Wᵀ [in, out], and before the device move.
+        scale folded in. Called from ``SpyreLatentAttention.process_weights_after_loading``,
+        which runs after every linear layer's: the fused weight is then Wᵀ [in, out].
         """
         layer = self.indexer.wk_weights_proj
-        w_t = layer.weight.data
-        if w_t.shape[0] != layer.input_size:
-            w_t = w_t.t()
         cfg = self.config
+        w_t = layer.weight.data
+        assert w_t.shape == (layer.input_size, cfg.head_dim + cfg.n_heads), tuple(w_t.shape)
         wk_t, wp_t = w_t.split([cfg.head_dim, cfg.n_heads], dim=-1)
         wp_t = torch.nn.functional.pad(
             wp_t * cfg.n_heads**-0.5, (0, self.staging.shapes[1][1] - cfg.n_heads)
@@ -209,10 +210,19 @@ class SpyreDsaAttentionImpl(SpyreHeadMajorAttentionImpl):
         self.dsa = dsa
         self.dsa_staging = dsa_staging
         self._call: tuple[SpyreAttentionMetadata, tuple[torch.Tensor, ...] | None] | None = None
+        self._recording = False
 
     def _batched_decode_supported(self) -> bool:
         # The batched kernel builds its mask on the host; decode takes the per-sequence walk.
         return False
+
+    def record_graphs(self, layer, kv_cache, builder) -> int:
+        # Warmup records each layer alone, so a shared layer has no full layer's mask.
+        self._recording = True
+        try:
+            return super().record_graphs(layer, kv_cache, builder)
+        finally:
+            self._recording = False
 
     def staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         # Allocated with the query staging, before any trace (see allocate_staging_buffers).
@@ -274,9 +284,10 @@ class SpyreDsaAttentionImpl(SpyreHeadMajorAttentionImpl):
     ) -> torch.Tensor:
         assert self._call is not None
         attn_metadata, index_inputs = self._call
-        # The step's per-sequence row tables are shared by every layer of the group.
-        masks = attn_metadata.dsa_mask_stacks
-        if index_inputs is not None:
+        # A walk of at most index_topk positions keeps every valid one: the dense mask.
+        if num_blocks * self.block_size <= self.dsa.index_topk:
+            pass
+        elif index_inputs is not None:
             index_q, index_w = index_inputs
             k_folded, _ = self._folded_pages(k_pages, v_pages)
             mask_stack = _dsa_mask_compiled(
@@ -293,11 +304,16 @@ class SpyreDsaAttentionImpl(SpyreHeadMajorAttentionImpl):
                 self.dsa.index_topk,
                 _BISECT_STEPS,
             )
-            masks[id(row_table)] = mask_stack
-        else:
-            # Serving runs a full layer (layer 0 is one) before the layers sharing its
-            # mask; only warmup records a shared layer alone, which then walks unmasked.
-            mask_stack = masks.get(id(row_table), mask_stack)
+            # Keyed by the sequence's row table, which the step builds once on the
+            # metadata every layer of the group shares.
+            attn_metadata.dsa_mask_stacks[id(row_table)] = mask_stack
+        elif (shared := attn_metadata.dsa_mask_stacks.get(id(row_table))) is not None:
+            mask_stack = shared
+        elif not self._recording:
+            raise RuntimeError(
+                "DSA: a layer sharing the top-k selection ran before any layer that "
+                "computes it, so it would attend densely."
+            )
         return super()._run_page_attn(
             query,
             row_table,

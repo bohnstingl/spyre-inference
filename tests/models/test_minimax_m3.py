@@ -63,7 +63,10 @@ def test_host_router_times_folded_scale_matches_transformers_router():
     # Real M3 biases sit on a large shared offset with a small spread.
     hf.e_score_correction_bias.copy_(torch.randn(cfg.num_local_experts) * 0.05 + 9.5)
 
-    gate = SimpleNamespace(weight=hf.weight.detach().t().contiguous(), input_size=cfg.hidden_size)
+    # The checkpoint's [experts, hidden] layout, as load_weights leaves it.
+    gate = SimpleNamespace(
+        weight=hf.weight.detach(), input_size=cfg.hidden_size, output_size=cfg.num_local_experts
+    )
     experts = SimpleNamespace(
         top_k=cfg.num_experts_per_tok,
         renormalize=True,
