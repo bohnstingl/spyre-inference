@@ -19,8 +19,12 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
+from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
+from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from spyre_inference import envs, keep_sigterm_handler
@@ -150,20 +154,68 @@ class TorchSpyreWorker(Worker):
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
+        # As Worker.init_device does, after the distributed init. The platform reports
+        # device_type "cpu", so the snapshot is given the Spyre device explicitly.
+        self.init_snapshot = MemorySnapshot(device=self._spyre_memory_device())
+        self.requested_memory = request_memory(self.init_snapshot, self.cache_config)
+        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+
         # Construct the model runner directly — no monkey-patching needed.
         self.model_runner = TorchSpyreModelRunner(
             self.vllm_config,
             torch.device("spyre"),
         )
 
+    def _spyre_memory_device(self) -> torch.device:
+        # getMemoryInfo checks the index against the card the runtime opened, which is
+        # LOCAL_RANK under TP, not spyre:0.
+        return torch.device("spyre", torch.accelerator.current_device_index())
+
     def determine_available_memory(self) -> int:
-        # Spyre's KV cache lives on-device with a fixed budget set by
-        # TorchSpyrePlatform.check_and_update_config (via VLLM_CPU_KVCACHE_SPACE).
-        # For decoder models num_gpu_blocks_override is also set; pooling /
-        # encoder models leave it unset (no KV cache). This return is an upper
-        # bound sanity check for the engine.
-        assert self.cache_config.kv_cache_memory_bytes is not None
-        return self.cache_config.kv_cache_memory_bytes
+        """Upstream's Worker sizing from free device memory, capped at the pages a full
+        batch at max_model_len can use.
+
+        The runner's profile_run is a no-op, so what upstream measures is what loading
+        consumed; a forward's activations come out of the 1 - gpu_memory_utilization
+        headroom.
+        """
+        available = super().determine_available_memory()
+        bytes_per_block = self._kv_cache_bytes_per_block()
+        if not bytes_per_block:
+            return available
+        # disable_hybrid_kv_cache_manager leaves one block pool, so no step ever holds
+        # more than max_num_seqs sequences at max_model_len; the +1 is the null block.
+        blocks_per_seq = cdiv(self.model_config.max_model_len, self.cache_config.block_size)
+        cap = (self.scheduler_config.max_num_seqs * blocks_per_seq + 1) * bytes_per_block
+        if available > cap:
+            logger.info(
+                "Capping the KV cache at %s GiB, the %d blocks %d sequences at "
+                "max_model_len=%d can use.",
+                format_gib(cap),
+                cap // bytes_per_block,
+                self.scheduler_config.max_num_seqs,
+                self.model_config.max_model_len,
+            )
+        elif available > 0:
+            logger.warning(
+                "The KV cache holds %d of the %d blocks that %d sequences at "
+                "max_model_len=%d need; requests queue for pages instead. Raise "
+                "--gpu-memory-utilization or lower --max-num-seqs / --max-model-len "
+                "to fill the batch.",
+                available // bytes_per_block,
+                cap // bytes_per_block,
+                self.scheduler_config.max_num_seqs,
+                self.model_config.max_model_len,
+            )
+        return min(available, cap)
+
+    def _kv_cache_bytes_per_block(self) -> int:
+        """Bytes one block takes across every layer that keeps its own cache."""
+        return sum(
+            spec.page_size_bytes
+            for spec in self.model_runner.get_kv_cache_spec().values()
+            if isinstance(spec, AttentionSpec)
+        )
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420

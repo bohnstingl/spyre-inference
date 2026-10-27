@@ -165,6 +165,21 @@ the per-sequence loop), warmup records eligible KV-length × num-sequences combi
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
 
+## KV cache size
+
+The KV cache is sized by vLLM's own GPU worker code: after the weights load, it reads the
+card's free memory (`torch.accelerator.get_memory_info`) and gives the KV cache what is
+left of `--gpu-memory-utilization` (default 0.92) × total. Spyre then caps it at what a
+full batch can use, `--max-num-seqs` × `ceil(--max-model-len / block_size)` blocks, since
+the single block pool could not hand out more. When memory runs out before the batch area
+is full, a warning names the knobs and requests wait for pages instead of all running at
+full length.
+
+The profile run is skipped, as the first forward on Spyre would trace the model before
+the KV cache exists: a forward's activations come out of the `1 - --gpu-memory-utilization`
+headroom. Lower it if a forward fails to allocate. `--kv-cache-memory-bytes` and
+`--num-gpu-blocks-override` skip the measurement.
+
 ## FP8 KV cache
 
 Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
@@ -175,9 +190,9 @@ vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
 It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. It does not raise capacity: the platform pins the block count
-to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
-same number of tokens in half the device memory. Attention still computes in the model
+that is a multiple of 128. Since the KV cache is sized from free device memory (see
+[KV cache size](#kv-cache-size)), an fp8 cache fits twice the tokens of an fp16 one when
+memory, not the batch area, is the limit. Attention still computes in the model
 dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
 when it has none. The speedup grows with the number of cached tokens each decode step
 reads, so it is small at short contexts; check accuracy against an fp16 cache before
