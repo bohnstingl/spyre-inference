@@ -19,6 +19,7 @@ from functools import lru_cache
 from vllm.logger import init_logger
 
 from spyre_inference import moe  # noqa: F401
+from spyre_inference.v1.attention import mla  # noqa: F401
 
 from . import (
     conv,  # noqa: F401

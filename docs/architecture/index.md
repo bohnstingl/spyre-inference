@@ -227,8 +227,9 @@ hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList`
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
 (`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager unless
 marked (below) or compiled per encoder budget (see [Vision encoders](#vision-encoders)). Models whose
-attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
-whole-model graph.
+attention is not a vLLM `Attention` match nothing and fall back to a whole-model graph. MLA
+(DeepSeek, GLM) is not among them: `SpyreMultiHeadLatentAttention` (`v1/attention/mla.py`) runs it
+on a one-KV-head `Attention`.
 
 A vision tower opts in. A block cannot assemble a constant
 on the host: a CPU-resident buffer has no device layout, and layout propagation rejects
