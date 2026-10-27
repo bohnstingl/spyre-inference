@@ -27,9 +27,11 @@ The cache is flattened to 2D and placed rows-outermost (see ``place_row_gathered
 
 A head whose half is not stick-aligned (head_size=64) uses ``_rotate_neox_split_free``
 instead: the 2x2 form views each head as two halves, which cannot restickify when a
-half is narrower than a stick.
+half is narrower than a stick. Interleaved (GPT-J style, ``is_neox_style=False``) RoPE
+takes the same split-free form with a pair-swap matrix: its strided ``x[..., 0::2]``
+pairing does not lower.
 
-Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
+Only full rotary is supported; other configs raise ``NotImplementedError``.
 """
 
 import torch
@@ -85,15 +87,26 @@ def _rotate_half_matrix(head_size: int, dtype: torch.dtype) -> torch.Tensor:
     return r
 
 
+def _rotate_interleaved_matrix(head_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """``x @ R`` maps each pair ``(x[2i], x[2i+1])`` to ``(-x[2i+1], x[2i])``."""
+    even = torch.arange(0, head_size, 2)
+    r = torch.zeros(head_size, head_size, dtype=dtype)
+    r[even + 1, even] = -1.0
+    r[even, even + 1] = 1.0
+    return r
+
+
 def _rotate_neox_split_free(
     x: torch.Tensor,
     cos_sin: torch.Tensor,
     rotate_half: torch.Tensor,
     head_size: int,
 ) -> torch.Tensor:
-    """Full neox RoPE as ``x * cos + rotate_half(x) * sin``, viewing only whole heads.
+    """Full RoPE as ``x * cos + rotate(x) * sin``, viewing only whole heads.
 
     ``x`` is [T, H*head_size] or [T, H, head_size]; ``cos_sin`` is [T, 2, head_size].
+    ``rotate_half`` is the neox half rotation or the interleaved pair swap; ``cos_sin``
+    is laid out to match it.
     """
     num_tokens = x.shape[0]
     heads = x.view(num_tokens, -1, head_size)
@@ -114,23 +127,24 @@ class _SpyreRotaryMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Only neox full rotary has a Spyre kernel; gptj/interleaved and partial
-        # rotary are rejected here rather than run on CPU.
-        if not (self.is_neox_style and self.rotary_dim == self.head_size):
+        # Partial rotary is rejected here rather than run on CPU.
+        if self.rotary_dim != self.head_size:
             raise NotImplementedError(
-                "SpyreRoPE supports only neox-style full rotary (rotary_dim == "
-                f"head_size); got is_neox_style={self.is_neox_style}, "
-                f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
+                "SpyreRoPE supports only full rotary (rotary_dim == head_size); got "
+                f"is_neox_style={self.is_neox_style}, rotary_dim={self.rotary_dim}, "
+                f"head_size={self.head_size}."
             )
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
-        # Set only for the split-free path, i.e. when a half head is sub-stick.
-        self._rotate_half = (
-            _rotate_half_matrix(self.head_size, self.cos_sin_cache.dtype)
-            if self._padded_inner % _STICK != 0
-            else None
-        )
+        # Set only for the split-free path: interleaved RoPE, or a sub-stick half head.
+        dtype = self.cos_sin_cache.dtype
+        if not self.is_neox_style:
+            self._rotate_half = _rotate_interleaved_matrix(self.head_size, dtype)
+        elif self._padded_inner % _STICK != 0:
+            self._rotate_half = _rotate_half_matrix(self.head_size, dtype)
+        else:
+            self._rotate_half = None
 
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
@@ -167,12 +181,17 @@ class _SpyreRotaryMixin:
         """Device-resident rotation cache, flattened to 2D ``[max_pos, 4 * padded]`` so
         it can be stickified with the position axis outermost, and gathered on-device via
         ``index_select`` (single-row gather has a kernel since torch-spyre#3418). The
-        split-free path stores ``[cos | cos | sin | sin]`` instead."""
+        split-free path stores ``[cos | cos | sin | sin]`` instead, with each frequency
+        repeated per pair for interleaved RoPE."""
         if self._device_rotation_cache is None:
             rot = self._get_rotation_cache()
             if self._rotate_half is not None:
                 cos, sin = rot[:, 0, 0], rot[:, 1, 0]
-                self._device_rotation_cache = torch.cat([cos, cos, sin, sin], dim=-1)
+                if self.is_neox_style:
+                    parts = [cos, cos, sin, sin]
+                else:
+                    parts = [cos.repeat_interleave(2, -1), sin.repeat_interleave(2, -1)]
+                self._device_rotation_cache = torch.cat(parts, dim=-1)
             else:
                 self._device_rotation_cache = rot.flatten(1)
         return self._device_rotation_cache
