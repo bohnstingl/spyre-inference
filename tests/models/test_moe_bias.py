@@ -50,17 +50,17 @@ def _reference(x, logits, w13, w13_bias, w2, w2_bias, top_k):
     return out
 
 
-def _checkpoint_like(inter, seed=0):
+def _checkpoint_like(inter, seed=0, experts=EXPERTS):
     gen = torch.Generator().manual_seed(seed)
 
     def randn(*shape, scale):
         return (torch.randn(*shape, generator=gen) * scale).to(torch.float16)
 
     return {
-        "w13": randn(EXPERTS, 2 * inter, HIDDEN, scale=0.02),
-        "w13_bias": randn(EXPERTS, 2 * inter, scale=0.5),
-        "w2": randn(EXPERTS, HIDDEN, inter, scale=0.02),
-        "w2_bias": randn(EXPERTS, HIDDEN, scale=0.5),
+        "w13": randn(experts, 2 * inter, HIDDEN, scale=0.02),
+        "w13_bias": randn(experts, 2 * inter, scale=0.5),
+        "w2": randn(experts, HIDDEN, inter, scale=0.02),
+        "w2_bias": randn(experts, HIDDEN, scale=0.5),
     }
 
 
@@ -110,28 +110,6 @@ def test_configure_accepts_a_biased_layer():
     assert layer.spyre_moe_regions == {}
 
 
-def test_post_load_builds_the_quant_config_after_the_biases_are_freed(monkeypatch):
-    """Upstream's quant config reads ``w13_bias`` / ``w2_bias``, which the relayout frees: a
-    biased layer must still get one at load, or the first traced call builds it."""
-    from types import MethodType
-
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-
-    from spyre_inference import moe as moe_module
-
-    monkeypatch.setattr(moe_module, "_prepare_layer", lambda layer: None)
-    method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
-    method.moe = SimpleNamespace(has_bias=True)
-    method.moe_quant_config = None
-    layer = SimpleNamespace(spyre_moe_recipe=object(), quant_method=method)
-    layer._ensure_moe_quant_config_init = MethodType(
-        RoutedExperts._ensure_moe_quant_config_init, layer
-    )
-
-    method.process_weights_after_loading(layer)
-    assert method.moe_quant_config is not None
-
-
 class _RoutedExperts(torch.nn.Module):
     """Stands in for vLLM's, which needs a whole FusedMoEConfig to build."""
 
@@ -145,11 +123,11 @@ class _RoutedExperts(torch.nn.Module):
         self.top_k = TOP_K
 
 
-def _prepared(inter, monkeypatch, has_bias=True):
+def _prepared(inter, monkeypatch, has_bias=True, experts=EXPERTS):
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 
     monkeypatch.delenv("SPYRE_MOE_CHUNKS", raising=False)
-    params = _checkpoint_like(inter)
+    params = _checkpoint_like(inter, experts=experts)
     layer = _RoutedExperts(params, has_bias=has_bias)
     layer.spyre_moe_recipe = SpyreMoERecipe(*_RECIPE)
     _prepare_layer(layer)
@@ -163,13 +141,15 @@ _INTERS = [pytest.param(2880, id="tp1"), pytest.param(720, id="tp4"), pytest.par
 @pytest.mark.parametrize("inter", _INTERS)
 def test_relayout_places_the_biases_next_to_the_pools(inter, monkeypatch):
     """Gate/up biases split like ``w13``, zero in the padded lanes; the down bias whole and
-    in the gathered form's chunks; the source parameters freed."""
+    in the gathered form's chunks. The host biases stay, so upstream's quant config can
+    still read them."""
     from torch_spyre._C import get_elem_in_stick
 
     layer, p = _prepared(inter, monkeypatch)
     stick = get_elem_in_stick(torch.float16)
     width = inter + -inter % stick
-    assert not hasattr(layer, "w13_bias") and not hasattr(layer, "w2_bias")
+    torch.testing.assert_close(layer.w13_bias.detach(), p["w13_bias"])
+    torch.testing.assert_close(layer.w2_bias.detach(), p["w2_bias"])
 
     close = {"atol": 1e-4, "rtol": 1e-2}
     b = layer.spyre_moe_biases
@@ -191,10 +171,10 @@ def test_relayout_without_biases_keeps_none(monkeypatch):
     assert layer.spyre_moe_biases is None
 
 
-def _inputs(tokens, seed):
+def _inputs(tokens, seed, experts=EXPERTS):
     gen = torch.Generator().manual_seed(seed)
     x = (torch.randn(tokens, HIDDEN, generator=gen) * 0.5).to(torch.float16)
-    logits = torch.randn(tokens, EXPERTS, generator=gen)
+    logits = torch.randn(tokens, experts, generator=gen)
     # Keep the top-k boundary clear of fp16 near-ties, which the card may break either way.
     order = torch.sort(logits, dim=-1, descending=True).indices
     lift = torch.zeros_like(logits).scatter_(-1, order[:, :TOP_K], 0.25)
@@ -215,6 +195,38 @@ def test_gathered_matches_the_biased_reference(inter, monkeypatch):
     method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
     actual = method.apply_monolithic(layer, x.to("spyre"), logits.to("spyre"))
     assert set(layer.spyre_moe_regions) == {"gathered"}
+    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("inter", _INTERS)
+@pytest.mark.parametrize("tokens", [2, 8])
+def test_gathered_batch_matches_the_biased_reference(inter, tokens, monkeypatch):
+    """A stick-addressable batch of 2-8 tokens through the gathered_batch region.
+
+    Row ``t`` of the router logits starts at ``t * experts``. That stride has to be a whole
+    number of sticks or the dispatcher refuses the gathered batch and takes the all-expert
+    path. Sixteen experts do not fill an fp16 stick, so this case uses one stick of experts.
+    """
+    from contextlib import nullcontext
+
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference import moe as moe_module
+
+    experts = get_elem_in_stick(torch.float16)
+    layer, p = _prepared(inter, monkeypatch, experts=experts)
+    layer.spyre_moe_regions = {}
+    monkeypatch.setattr(moe_module, "_compiler_scopes", lambda: (nullcontext(), nullcontext()))
+    x, logits = _inputs(tokens, seed=tokens + inter, experts=experts)
+    x_dev, logits_dev = x.to("spyre"), logits.to("spyre")
+    stick = get_elem_in_stick(torch.float16)
+    assert all(
+        t.storage_offset() % stick == 0 and t.stride(0) % stick == 0 for t in (x_dev, logits_dev)
+    )
+    method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
+    actual = method.apply_monolithic(layer, x_dev, logits_dev)
+    assert set(layer.spyre_moe_regions) == {"gathered_batch"}
     expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
 
