@@ -28,9 +28,11 @@ Shapes are Nemotron-3-Nano's per-card ones at TP4: 16 heads of 64, 2 groups of s
 import pytest
 import torch
 import torch.nn.functional as F
-from spyre_testing_plugin.pytest_plugin import spyre_available
+from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
-pytestmark = pytest.mark.skipif(not spyre_available(), reason="needs a Spyre card")
+# Not spyre_available(): at collection it opens the card in the pytest process, and every
+# later subprocess engine then fails with "PCIe address was not found".
+pytestmark = pytest.mark.skipif(spyre_device_count() < 1, reason="needs a Spyre card")
 
 H, P, G, N, K = 16, 64, 2, 128, 4
 INNER, GS = H * P, G * N
