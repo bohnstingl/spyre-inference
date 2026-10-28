@@ -30,7 +30,6 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
     MoERunner,
     _moe_forward,
@@ -490,11 +489,6 @@ def _moe_persistent_in_graph(
     return result.squeeze(0)
 
 
-def _layer_biases(layer: RoutedExperts) -> _ExpertBiases | None:
-    # Set by _prepare_layer; absent on a layer built without it, which carries no biases.
-    return getattr(layer, "spyre_moe_biases", None)
-
-
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
     chunks = layer.spyre_moe_chunks
@@ -517,7 +511,7 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         recipe.activation,
         chunk_scale=layer.spyre_moe_chunk_scale,
         chunk_offsets=layer.spyre_moe_chunk_offsets,
-        biases=_layer_biases(layer),
+        biases=layer.spyre_moe_biases,
     )
 
 
@@ -572,7 +566,7 @@ def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torc
         layer.spyre_moe_up,
         layer.spyre_moe_down,
         layer.spyre_moe_recipe.activation,
-        _layer_biases(layer),
+        layer.spyre_moe_biases,
     )
 
 
@@ -705,7 +699,11 @@ def _down_chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
 def _prepare_biases(
     layer: RoutedExperts, inter: int, pad: int, chunks: int
 ) -> _ExpertBiases | None:
-    """Relayout ``w13_bias`` / ``w2_bias`` next to the pools, freeing the sources."""
+    """Relayout ``w13_bias`` / ``w2_bias`` next to the pools.
+
+    The host parameters stay. They are tiny next to the weight stacks, and upstream's
+    ``get_fused_moe_quant_config`` still reads them. The kernels read ``spyre_moe_biases``.
+    """
     # vLLM registers both exactly when ``moe_config.has_bias``.
     if not hasattr(layer, "w13_bias"):
         return None
@@ -717,6 +715,9 @@ def _prepare_biases(
             f"unexpected MoE expert bias shapes: w13_bias={tuple(w13_bias.shape)} "
             f"w2_bias={tuple(w2_bias.shape)}"
         )
+    # Every rank adds this full down bias before MoERunner's all-reduce. That matches
+    # upstream only when the loader zeros ``w2_bias`` on rank != 0. gpt-oss's loader
+    # does; vLLM's generic RoutedExperts weight loader copies it onto every rank.
     biases = _ExpertBiases(
         gate=_to_spyre_expert_weight(w13_bias[:, :inter].unsqueeze(1), (0, pad)),
         up=_to_spyre_expert_weight(w13_bias[:, inter:].unsqueeze(1), (0, pad)),
@@ -725,7 +726,6 @@ def _prepare_biases(
             w2_bias.reshape(experts * chunks, 1, hidden // chunks), ()
         ),
     )
-    del layer.w13_bias, layer.w2_bias
     return biases
 
 
@@ -840,15 +840,6 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
-    def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
-        # The biases live in spyre_moe_biases, read by the Spyre kernels; the quant config
-        # only carries them to upstream's fused kernels, and the relayout freed the sources.
-        return FusedMoEQuantConfig.make(
-            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
-            gemm1_beta=getattr(layer, "swiglu_beta", None),
-            gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
-        )
-
     def process_weights_after_loading(self, layer: _RoutedExperts) -> None:
         if getattr(layer, "spyre_moe_recipe", None) is None:
             raise NotImplementedError(
@@ -888,7 +879,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 layer.spyre_moe_up,
                 layer.spyre_moe_down,
                 recipe.activation,
-                _layer_biases(layer),
+                layer.spyre_moe_biases,
             )
         moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.

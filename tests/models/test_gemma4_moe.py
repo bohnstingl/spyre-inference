@@ -511,6 +511,7 @@ def _dispatch_layer(routing):
         spyre_moe_stick=16,
         spyre_moe_chunks=4,
         spyre_moe_route_dtype=torch.float16,
+        spyre_moe_biases=None,
         top_k=TOP_K,
     )
 
@@ -849,6 +850,7 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
         spyre_moe_chunks=device["chunks"],
         spyre_moe_chunk_scale=device["chunk_scale"],
         spyre_moe_chunk_offsets=device["chunk_offsets"],
+        spyre_moe_biases=None,
     )
 
     with warnings.catch_warnings(record=True) as caught:
@@ -981,6 +983,7 @@ def test_traced_persistent_dispatch_matches_dense_reference():
         spyre_moe_down=device["down"],
         spyre_moe_stick=stick,
         spyre_moe_route_identity=torch.eye(stick, dtype=torch.float16).to("spyre"),
+        spyre_moe_biases=None,
         top_k=top_k,
     )
     gen = torch.Generator().manual_seed(stick)
