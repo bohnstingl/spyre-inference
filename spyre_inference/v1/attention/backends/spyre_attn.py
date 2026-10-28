@@ -101,6 +101,11 @@ def _record_block(name: str):
         yield
 
 
+# What one extra grouped dispatch costs, in kernel chunks. The groups chosen barely change
+# between 0 and 4, at either granite-8b TP1 or TP4 head counts, so it is not a knob.
+_GROUP_DISPATCH_CHUNKS: int = 2
+
+
 @dataclass
 class BatchedDecodeGroup:
     num_seqs: int
@@ -1088,7 +1093,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         for s, nb in enumerate(decode_blocks):
             by_bucket.setdefault(bucketer.find_blocks_bucket(nb) or 0, []).append(s)
         groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
-        dispatch_cost = envs.SPYRE_BATCHED_DECODE_GROUP_COST
         merged = True
         while merged and len(groups) > 1:
             merged = False
@@ -1100,7 +1104,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 )
                 if ca is None or cb is None or cab is None:
                     return None
-                if cab <= ca + cb + dispatch_cost:
+                if cab <= ca + cb + _GROUP_DISPATCH_CHUNKS:
                     groups[i : i + 2] = [groups[i] + groups[i + 1]]
                     merged = True
                     break
@@ -1428,8 +1432,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     device_layout=layout,
                 ),
             )
-            # Not lazily: a buffer made in the step's inference mode misses the dispatch key
-            # the recorded variants guard on, so the batched kernel would recompile.
+            # Each grouped dispatch writes its batch here before the scatter into
+            # out_staging; same shape and layout, so it matches the recorded variants.
             if envs.SPYRE_BATCHED_DECODE_GROUPING:
                 self._group_staging = convert(
                     torch.zeros(shape, dtype=self.model_dtype), device, device_layout=layout
@@ -1514,7 +1518,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # layers whose impl can actually use the batched kernel (skips ALiBi
         # layers, eager attention and, under the tiled walk, the token-major layout).
         if (
-            not self._grouped_decode_ok(attn_metadata, k_pages.shape[0])
+            not self._grouped_decode_preconditions_met(attn_metadata, k_pages.shape[0])
             and self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
             and attn_metadata.rep_row_ids_dev is None
         ):
@@ -1731,16 +1735,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         group_out = self._group_staging
         assert group_out is not None
         for b in seq_buckets:
-            try:
-                rows = convert(self._group_store_rows([], b), device=device)
-                _scatter_rows_compiled(out_staging, rows, group_out)
-            except Exception:
-                logger.warning(
-                    "Grouped decode store for %d seqs failed to record; it will compile on "
-                    "first use instead.",
-                    b,
-                    exc_info=True,
-                )
+            rows = convert(self._group_store_rows([], b), device=device)
+            _scatter_rows_compiled(out_staging, rows, group_out)
 
     def _record_batched_one(
         self,
@@ -1925,7 +1921,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
 
-    def _grouped_decode_ok(self, attn_metadata: "SpyreAttentionMetadata", num_pages: int) -> bool:
+    def _grouped_decode_preconditions_met(
+        self, attn_metadata: "SpyreAttentionMetadata", num_pages: int
+    ) -> bool:
         groups = attn_metadata.decode_groups
         if groups is None or not self._batched_decode_supported():
             return False
@@ -2116,7 +2114,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
-        if self._grouped_decode_ok(attn_metadata, k_pages.shape[0]):
+        if self._grouped_decode_preconditions_met(attn_metadata, k_pages.shape[0]):
             self._run_grouped_decode(
                 query_dev, k_pages, v_pages, attn_metadata, output, _target_device
             )

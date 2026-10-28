@@ -58,7 +58,12 @@ def _members(md) -> list[list[int]]:
     return [g.rows_cpu.tolist() for g in md.decode_groups]
 
 
-def test_grouping_is_off_by_default(decode_config):
+def test_grouping_is_on_by_default(decode_config):
+    assert _build([32000, 2000, 2000, 2000]).decode_groups is not None
+
+
+def test_grouping_off_keeps_one_batch(decode_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "0")
     md = _build([32000, 2000, 2000, 2000])
     assert md.padded_num_seqs is not None
     assert md.decode_groups is None
@@ -124,8 +129,10 @@ def test_each_group_matches_its_own_batch(decode_config, monkeypatch, kv_lens):
 def test_groups_merge_within_the_dispatch_cost(decode_config, monkeypatch, group_cost, split):
     """256 + 2 blocks: 8 + 1 chunks apart, 16 as one batch, so a dispatch worth 8
     chunks merges them and one worth 2 does not."""
+    from spyre_inference.v1.attention.backends import spyre_attn
+
     monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUP_COST", str(group_cost))
+    monkeypatch.setattr(spyre_attn, "_GROUP_DISPATCH_CHUNKS", group_cost)
     md = _build([32000, 200])
     assert (md.decode_groups is not None) == split
 
