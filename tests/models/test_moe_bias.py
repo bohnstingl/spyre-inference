@@ -50,17 +50,17 @@ def _reference(x, logits, w13, w13_bias, w2, w2_bias, top_k):
     return out
 
 
-def _checkpoint_like(inter, seed=0):
+def _checkpoint_like(inter, seed=0, experts=EXPERTS):
     gen = torch.Generator().manual_seed(seed)
 
     def randn(*shape, scale):
         return (torch.randn(*shape, generator=gen) * scale).to(torch.float16)
 
     return {
-        "w13": randn(EXPERTS, 2 * inter, HIDDEN, scale=0.02),
-        "w13_bias": randn(EXPERTS, 2 * inter, scale=0.5),
-        "w2": randn(EXPERTS, HIDDEN, inter, scale=0.02),
-        "w2_bias": randn(EXPERTS, HIDDEN, scale=0.5),
+        "w13": randn(experts, 2 * inter, HIDDEN, scale=0.02),
+        "w13_bias": randn(experts, 2 * inter, scale=0.5),
+        "w2": randn(experts, HIDDEN, inter, scale=0.02),
+        "w2_bias": randn(experts, HIDDEN, scale=0.5),
     }
 
 
@@ -123,11 +123,11 @@ class _RoutedExperts(torch.nn.Module):
         self.top_k = TOP_K
 
 
-def _prepared(inter, monkeypatch, has_bias=True):
+def _prepared(inter, monkeypatch, has_bias=True, experts=EXPERTS):
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 
     monkeypatch.delenv("SPYRE_MOE_CHUNKS", raising=False)
-    params = _checkpoint_like(inter)
+    params = _checkpoint_like(inter, experts=experts)
     layer = _RoutedExperts(params, has_bias=has_bias)
     layer.spyre_moe_recipe = SpyreMoERecipe(*_RECIPE)
     _prepare_layer(layer)
@@ -171,10 +171,10 @@ def test_relayout_without_biases_keeps_none(monkeypatch):
     assert layer.spyre_moe_biases is None
 
 
-def _inputs(tokens, seed):
+def _inputs(tokens, seed, experts=EXPERTS):
     gen = torch.Generator().manual_seed(seed)
     x = (torch.randn(tokens, HIDDEN, generator=gen) * 0.5).to(torch.float16)
-    logits = torch.randn(tokens, EXPERTS, generator=gen)
+    logits = torch.randn(tokens, experts, generator=gen)
     # Keep the top-k boundary clear of fp16 near-ties, which the card may break either way.
     order = torch.sort(logits, dim=-1, descending=True).indices
     lift = torch.zeros_like(logits).scatter_(-1, order[:, :TOP_K], 0.25)
@@ -202,17 +202,23 @@ def test_gathered_matches_the_biased_reference(inter, monkeypatch):
 @pytest.mark.parametrize("inter", _INTERS)
 @pytest.mark.parametrize("tokens", [2, 8])
 def test_gathered_batch_matches_the_biased_reference(inter, tokens, monkeypatch):
-    """A stick-addressable batch of 2-8 tokens through the gathered_batch region."""
+    """A stick-addressable batch of 2-8 tokens through the gathered_batch region.
+
+    Row ``t`` of the router logits starts at ``t * experts``. That stride has to be a whole
+    number of sticks or the dispatcher refuses the gathered batch and takes the all-expert
+    path. Sixteen experts do not fill an fp16 stick, so this case uses one stick of experts.
+    """
     from contextlib import nullcontext
 
     from torch_spyre._C import get_elem_in_stick
 
     from spyre_inference import moe as moe_module
 
-    layer, p = _prepared(inter, monkeypatch)
+    experts = get_elem_in_stick(torch.float16)
+    layer, p = _prepared(inter, monkeypatch, experts=experts)
     layer.spyre_moe_regions = {}
     monkeypatch.setattr(moe_module, "_compiler_scopes", lambda: (nullcontext(), nullcontext()))
-    x, logits = _inputs(tokens, seed=tokens + inter)
+    x, logits = _inputs(tokens, seed=tokens + inter, experts=experts)
     x_dev, logits_dev = x.to("spyre"), logits.to("spyre")
     stick = get_elem_in_stick(torch.float16)
     assert all(
