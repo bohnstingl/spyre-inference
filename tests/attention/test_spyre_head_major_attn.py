@@ -906,7 +906,7 @@ def test_head_major_grouped_decode_matches_reference(
     from vllm.config import get_current_vllm_config
 
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     envs.clear_env_cache()
     cfg = get_current_vllm_config()
     cfg.scheduler_config.max_num_seqs = 8

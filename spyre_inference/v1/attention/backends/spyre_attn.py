@@ -948,7 +948,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 )
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_start_loc[:num_decode_seqs].tolist() == prefix
-                if envs.SPYRE_BATCHED_DECODE_GROUPING and decode_uniformity < 1.0:
+                if envs.SPYRE_JAGGED_DECODE and decode_uniformity < 1.0:
                     decode_groups = self._batched_decode_groups(
                         decode_blocks,
                         blocks_per_seq,
@@ -1434,7 +1434,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
             # Each grouped dispatch writes its batch here before the scatter into
             # out_staging; same shape and layout, so it matches the recorded variants.
-            if envs.SPYRE_BATCHED_DECODE_GROUPING:
+            if envs.SPYRE_JAGGED_DECODE:
                 self._group_staging = convert(
                     torch.zeros(shape, dtype=self.model_dtype), device, device_layout=layout
                 )
@@ -1725,7 +1725,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 realized,
                 time.time() - t0,
             )
-        if envs.SPYRE_BATCHED_DECODE_GROUPING:
+        if envs.SPYRE_JAGGED_DECODE:
             self._record_group_scatter(sorted({v.num_seqs for v in variants}), kv_cache)
         return len(recorded)
 
