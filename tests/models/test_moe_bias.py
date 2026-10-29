@@ -17,26 +17,35 @@
 A biased layer carries ``w13_bias`` [E, 2M] (gate half, then up) and ``w2_bias`` [E, H]. The
 relayout places them next to the weight pools as [E, 1, F] stacks, and every expert form adds
 them: gate/up after their matmuls, down after the down matmul, the down bias weighted by
-routing like the rest of the expert output. The reference is a plain silu MoE with biases, so
-a missing, misplaced or unpadded bias shows up as a value error. The hidden width is 45 sticks,
-so the gathered form splits the down bias into chunks; the intermediate width is stick-aligned
-at TP1 and lands mid-stick at TP4, so the biases are zero-padded there.
+routing like the rest of the expert output. The reference follows the recipe's activation and
+routing, so a missing, misplaced or unpadded bias shows up as a value error. The hidden width
+is 45 sticks, so the gathered form splits the down bias into chunks; the intermediate width is
+stick-aligned at TP1 and lands mid-stick at TP4, so the biases are zero-padded there.
 """
 
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._dynamo.exc import BackendCompilerFailed
 
 EXPERTS, HIDDEN, TOP_K = 16, 2880, 4
 
 
-def _reference(x, logits, w13, w13_bias, w2, w2_bias, top_k):
-    """Biased silu MoE in float32 on vLLM's parameter layout: ``w13`` [E, 2M, H] as
+def _reference(
+    x, logits, w13, w13_bias, w2, w2_bias, top_k, activation="silu", routing="full_softmax"
+):
+    """Biased MoE in float32 on vLLM's parameter layout: ``w13`` [E, 2M, H] as
     ``[gate | up]``, ``w13_bias`` [E, 2M], ``w2`` [E, H, M], ``w2_bias`` [E, H]."""
-    weights, indices = torch.topk(torch.softmax(logits.float(), dim=-1), top_k, dim=-1)
-    weights = weights / weights.sum(-1, keepdim=True)
+    if routing == "full_softmax":
+        weights, indices = torch.topk(torch.softmax(logits.float(), dim=-1), top_k, dim=-1)
+        weights = weights / weights.sum(-1, keepdim=True)
+    else:
+        selected, indices = torch.topk(logits.float(), top_k, dim=-1)
+        weights = torch.softmax(selected, dim=-1)
+    act = partial(F.gelu, approximate="tanh") if activation == "gelu_tanh" else F.silu
     inter = w2.shape[-1]
     out = torch.zeros(x.shape, dtype=torch.float32)
     for token in range(x.shape[0]):
@@ -44,7 +53,7 @@ def _reference(x, logits, w13, w13_bias, w2, w2_bias, top_k):
         for slot in range(top_k):
             e = int(indices[token, slot])
             gate_up = w13[e].float() @ row + w13_bias[e].float()
-            activated = F.silu(gate_up[:inter]) * gate_up[inter:]
+            activated = act(gate_up[:inter]) * gate_up[inter:]
             hidden = w2[e].float() @ activated + w2_bias[e].float()
             out[token] += hidden * float(weights[token, slot])
     return out
@@ -66,6 +75,25 @@ def _checkpoint_like(inter, seed=0, experts=EXPERTS):
 
 # Full-softmax routing, as a biased model adapter requests it (with its own routing function).
 _RECIPE = ("silu", "full_softmax")
+# The persistent forms also run the default top-k routing and Gemma-4's GELU with biases.
+_RECIPES = [
+    pytest.param(_RECIPE, id="silu-full"),
+    pytest.param(
+        ("silu", "topk_softmax"),
+        id="silu-topk",
+        marks=pytest.mark.xfail(
+            strict=True,
+            raises=BackendCompilerFailed,
+            reason=(
+                "_topk_probs does not compile on Spyre, biases or not: torch-spyre's topk "
+                "keeps its indices in the input dtype (torch-spyre#3878), which scatter "
+                "rejects, and casting them to int32 fails to re-tile instead. Drop this "
+                "mark once the dense top-k routing compiles."
+            ),
+        ),
+    ),
+    pytest.param(("gelu_tanh", "full_softmax"), id="gelu-full"),
+]
 
 
 def _routing(hidden_states, gating_output, topk, renormalize):
@@ -123,13 +151,13 @@ class _RoutedExperts(torch.nn.Module):
         self.top_k = TOP_K
 
 
-def _prepared(inter, monkeypatch, has_bias=True, experts=EXPERTS):
+def _prepared(inter, monkeypatch, has_bias=True, experts=EXPERTS, recipe=_RECIPE):
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 
     monkeypatch.delenv("SPYRE_MOE_CHUNKS", raising=False)
     params = _checkpoint_like(inter, experts=experts)
     layer = _RoutedExperts(params, has_bias=has_bias)
-    layer.spyre_moe_recipe = SpyreMoERecipe(*_RECIPE)
+    layer.spyre_moe_recipe = SpyreMoERecipe(*recipe)
     _prepare_layer(layer)
     return layer, params
 
@@ -169,6 +197,34 @@ def test_relayout_places_the_biases_next_to_the_pools(inter, monkeypatch):
 def test_relayout_without_biases_keeps_none(monkeypatch):
     layer, _ = _prepared(720, monkeypatch, has_bias=False)
     assert layer.spyre_moe_biases is None
+
+
+@pytest.mark.parametrize("kind", ["hidden", "experts"])
+def test_bad_bias_shape_is_rejected_before_relayout(kind, monkeypatch):
+    """The check uses the weight shapes, and it runs before any pool is copied to the device.
+
+    A wrong expert count on both biases used to match them against each other and pass.
+    """
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreMoERecipe
+
+    copied = []
+    monkeypatch.setattr(
+        moe_module,
+        "_to_spyre_expert_weight",
+        lambda *args, **kwargs: copied.append(1),
+    )
+    params = _checkpoint_like(720)
+    if kind == "hidden":
+        params["w2_bias"] = params["w2_bias"][:, :-1]
+    else:
+        params["w13_bias"] = params["w13_bias"][: EXPERTS // 2]
+        params["w2_bias"] = params["w2_bias"][: EXPERTS // 2]
+    layer = _RoutedExperts(params)
+    layer.spyre_moe_recipe = SpyreMoERecipe(*_RECIPE)
+    with pytest.raises(ValueError, match="w2_bias"):
+        moe_module._prepare_layer(layer)
+    assert copied == []
 
 
 def _inputs(tokens, seed, experts=EXPERTS):
@@ -233,24 +289,35 @@ def test_gathered_batch_matches_the_biased_reference(inter, tokens, monkeypatch)
 
 @pytest.mark.parametrize("inter", _INTERS)
 @pytest.mark.parametrize("tokens", [16, 64])
-def test_persistent_matches_the_biased_reference(inter, tokens, monkeypatch):
-    """A prefill-sized batch through the all-expert regions, as ``apply_monolithic`` runs them."""
+@pytest.mark.parametrize("recipe", _RECIPES)
+def test_persistent_matches_the_biased_reference(inter, tokens, recipe, monkeypatch):
+    """A prefill-sized batch through the all-expert regions, as ``apply_monolithic`` runs them.
+
+    Top-k routing takes the ``topk_probs`` / ``route_selected`` regions instead of
+    ``probs`` / ``route``.
+    """
     from spyre_inference import moe as moe_module
 
-    layer, p = _prepared(inter, monkeypatch)
+    layer, p = _prepared(inter, monkeypatch, recipe=recipe)
     layer.spyre_moe_regions = {}
     x, logits = _inputs(tokens, seed=tokens)
     method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
     actual = method.apply_monolithic(layer, x.to("spyre"), logits.to("spyre"))
     assert "experts" in layer.spyre_moe_regions
-    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
+    if recipe[1] == "topk_softmax":
+        assert "route_selected" in layer.spyre_moe_regions
+    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K, *recipe)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize("inter", [pytest.param(720, id="tp4")])
-def test_traced_dispatch_matches_the_biased_reference(inter, monkeypatch):
+@pytest.mark.parametrize("inter", [pytest.param(2880, id="tp1"), pytest.param(720, id="tp4")])
+@pytest.mark.parametrize("recipe", _RECIPES)
+def test_traced_dispatch_matches_the_biased_reference(inter, recipe, monkeypatch):
     """Traced into one graph with in-graph producers, as a compiled block runs one stick of
-    tokens: the in-graph persistent form, biases included."""
+    tokens: the in-graph persistent form, biases included.
+
+    ``tp1`` is stick-aligned (no intermediate pad); ``tp4`` pads mid-stick.
+    """
     import warnings
 
     from torch_spyre._C import get_elem_in_stick
@@ -258,7 +325,7 @@ def test_traced_dispatch_matches_the_biased_reference(inter, monkeypatch):
 
     from spyre_inference import moe as moe_module
 
-    layer, p = _prepared(inter, monkeypatch)
+    layer, p = _prepared(inter, monkeypatch, recipe=recipe)
     tokens = get_elem_in_stick(torch.float16)
     x, logits = _inputs(tokens, seed=1)
 
@@ -273,5 +340,5 @@ def test_traced_dispatch_matches_the_biased_reference(inter, monkeypatch):
         actual = compiled(x.to("spyre"), logits.to("spyre"))
     fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
     assert not fallbacks, f"the traced dispatch fell back to CPU: {fallbacks}"
-    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K)
+    expected = _reference(x, logits, p["w13"], p["w13_bias"], p["w2"], p["w2_bias"], TOP_K, *recipe)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
