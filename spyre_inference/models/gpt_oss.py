@@ -17,7 +17,8 @@
 gpt-oss takes a softmax over its top-k router logits. With ``renormalize`` that is softmax
 over all experts, top-k, then renormalized, so the ``full_softmax`` recipe is exact. Its
 experts are ``swigluoai`` with gate/up and down biases, and the checkpoint interleaves gate
-and up rows in ``w13``.
+and up rows in ``w13`` and ``w13_bias``. The backend still refuses expert biases; applying
+``prepare_gate_up_weight`` to ``w13_bias`` belongs with that support.
 """
 
 from __future__ import annotations

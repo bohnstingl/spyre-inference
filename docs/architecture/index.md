@@ -152,7 +152,9 @@ Two adaptations worth knowing:
   narrower `M` — zero-widened to whole sticks where a shard lands mid-stick — and
   `MoERunner` all-reduces the per-rank partial sums. Each model's own adaptation module
   supplies its recipe and any model-owned scaling (`configure_gemma4_moe_layers` in
-  `models/gemma4.py`). `Gemma4DecoderLayer.forward` is untouched. `SpyreMoERunner`, an OOT
+  `models/gemma4.py`, `configure_gpt_oss_moe_layers` in `models/gpt_oss.py`: swigluoai,
+  full-softmax routing, and a `prepare_gate_up_weight` de-interleave of `w13`). Decoder
+  `forward` is untouched. `SpyreMoERunner`, an OOT
   `MoERunner`, takes vLLM's direct `_moe_forward` entry — as upstream does on CPU and TPU —
   instead of the opaque `torch.ops.vllm.moe_forward` custom op, so a compiled block traces
   the expert forms into its own graph; an eager run dispatches them to compiled regions.

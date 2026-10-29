@@ -73,6 +73,10 @@ def test_deinterleave_gate_up_splits_even_and_odd_rows_into_halves():
     halves = deinterleave_gate_up(w13)
     torch.testing.assert_close(halves[:, :3], w13[:, 0::2])
     torch.testing.assert_close(halves[:, 3:], w13[:, 1::2])
+    bias = torch.arange(2 * 6, dtype=torch.float32).reshape(2, 6)
+    bias_halves = deinterleave_gate_up(bias)
+    torch.testing.assert_close(bias_halves[:, :3], bias[:, 0::2])
+    torch.testing.assert_close(bias_halves[:, 3:], bias[:, 1::2])
 
 
 def test_swigluoai_activation_matches_transformers():
@@ -261,3 +265,41 @@ def test_traced_dispatch_matches_the_gpt_oss_reference(inter, monkeypatch):
     assert not fallbacks, f"the traced dispatch fell back to CPU: {fallbacks}"
     expected = _reference(x, logits, p["w13"], p["w2"], TOP_K)
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
+
+
+def test_configure_walks_mlp_blocks(monkeypatch):
+    """vLLM's decoder holds the experts under ``layer.mlp``; a rename must not skip the recipe."""
+    from spyre_inference.models import gpt_oss
+
+    class _MLPBlock:
+        pass
+
+    calls = []
+    monkeypatch.setattr(gpt_oss, "MLPBlock", _MLPBlock)
+    monkeypatch.setattr(gpt_oss, "configure_spyre_moe_layer", lambda *a: calls.append(a))
+    routed = SimpleNamespace()
+    mlp = _MLPBlock()
+    mlp.experts = SimpleNamespace(routed_experts=routed)
+    assert (
+        gpt_oss.configure_gpt_oss_moe_layers([SimpleNamespace(mlp=mlp), SimpleNamespace(mlp=None)])
+        == 1
+    )
+    ((experts, recipe),) = calls
+    assert experts is routed
+    assert recipe is gpt_oss.GPT_OSS_MOE_RECIPE
+    assert routed.custom_routing_function is gpt_oss.gpt_oss_routing
+
+
+def test_missing_mlp_block_raises(monkeypatch):
+    from torch import nn
+    from vllm.model_executor.models.gpt_oss import GptOssForCausalLM
+
+    from spyre_inference.models import gpt_oss
+
+    def parent_init(self, *, vllm_config, prefix=""):
+        nn.Module.__init__(self)
+        self.model = SimpleNamespace(layers=[SimpleNamespace(mlp=None)])
+
+    monkeypatch.setattr(GptOssForCausalLM, "__init__", parent_init)
+    with pytest.raises(RuntimeError, match="no decoder layer has an MLPBlock"):
+        gpt_oss.SpyreGptOssForCausalLM(vllm_config=None)
