@@ -314,9 +314,7 @@ def test_persistent_matches_the_biased_reference(inter, tokens, recipe, monkeypa
     torch.testing.assert_close(actual.cpu().float(), expected, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize(
-    "inter", [pytest.param(2880, id="tp1"), pytest.param(720, id="tp4")]
-)
+@pytest.mark.parametrize("inter", [pytest.param(2880, id="tp1"), pytest.param(720, id="tp4")])
 @pytest.mark.parametrize("recipe", _RECIPES)
 def test_traced_dispatch_matches_the_biased_reference(inter, recipe, monkeypatch):
     """Traced into one graph with in-graph producers, as a compiled block runs one stick of
