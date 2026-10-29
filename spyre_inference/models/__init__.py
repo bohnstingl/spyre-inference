@@ -56,6 +56,7 @@ _ADAPTED_ARCHS: dict[str, str] = {
     ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    "NemotronHForCausalLM": "spyre_inference.models.nemotron_h:SpyreNemotronHForCausalLM",
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (
         "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"
