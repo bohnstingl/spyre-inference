@@ -1283,6 +1283,42 @@ def test_attention_sinks_are_held_kv_major(default_vllm_config):
     [pytest.param("spyre", id="device_spyre")],
     indirect=True,
 )
+def test_attention_sinks_follow_the_parameter_moved_to_spyre(
+    default_vllm_config, monkeypatch, configure_device
+):
+    """gpt-oss and granite register the sinks on their own attention module, so
+    ``model.to("spyre")`` replaces that Parameter and a reload writes the replacement. A
+    host-only test cannot see this: on CPU the move keeps the original."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    from spyre_inference.v1.worker.model_load import move_model_to_spyre
+
+    # move_model_to_spyre patches the class for good; restore it after the test.
+    monkeypatch.setattr(Attention, "_apply", Attention._apply)
+    model = torch.nn.Module()
+    model.sinks = torch.nn.Parameter(torch.arange(8, dtype=torch.float16), requires_grad=False)
+    model.attn = torch.nn.Module()
+    model.attn.impl = SpyreAttentionImpl(
+        num_heads=8, head_size=64, scale=0.125, num_kv_heads=2, sinks=model.sinks
+    )
+    device = torch.device("spyre")
+
+    move_model_to_spyre(model, device)
+    assert model.sinks.device.type == "spyre"
+
+    model.sinks.data.copy_(torch.full((8,), 3.0, dtype=torch.float16))
+    model.attn.impl.process_weights_after_loading(torch.float16)
+    torch.testing.assert_close(
+        model.attn.impl._device_sinks(device).cpu(),
+        torch.full((2, 4, 1), 3.0, dtype=torch.float16),
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
 @pytest.mark.parametrize(
     "configure_compilation",
     [
@@ -1907,13 +1943,28 @@ def test_spyre_attn_batched_decode_correctness(
     [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
     indirect=True,
 )
-def test_spyre_attn_batched_decode_sinks(
+def test_spyre_attn_multi_seq_decode_sinks(
     default_vllm_config,
-    enable_batched_decode,
+    monkeypatch,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """The token-major batched decode kernel adds the sinks once per sequence."""
+    """The token-major multi-sequence decode kernel adds the sinks once per sequence.
+
+    Named and set up clear of the conftest batched-decode skip. The kernel serves only the
+    untiled walk, so this pins that walk and counts the kernel's calls.
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    calls: list[bool] = []
+    real_decode_fn = spyre_attn._batched_decode_compiled
+
+    def spy(*args, **kwargs):
+        calls.append(True)
+        return real_decode_fn(*args, **kwargs)
+
+    # Patched before the impl is built: __init__ reads this global into the impl.
+    monkeypatch.setattr(spyre_attn, "_batched_decode_compiled", spy)
     _run_spyre_attn_test(
         seq_lens=[(1, 256), (1, 512), (1, 128), (1, 384)],
         block_size=64,
@@ -1926,6 +1977,7 @@ def test_spyre_attn_batched_decode_sinks(
         num_kv_heads=1,
         head_size=64,
     )
+    assert calls, "the multi-sequence decode kernel never ran"
 
 
 @pytest.mark.parametrize(

@@ -972,6 +972,10 @@ def test_head_major_attn_soft_cap(
         pytest.param([(1, 512), (1, 300), (1, 64)], None, True, id="multi_seq_decode"),
     ],
 )
+# One KV head cannot tell the kv-major sink order from a transposed one; two can.
+@pytest.mark.parametrize(
+    "num_kv_heads", [pytest.param(1, id="8q_1kv"), pytest.param(2, id="8q_2kv")]
+)
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -986,6 +990,7 @@ def test_head_major_attn_sinks(
     seq_lens,
     sliding_window,
     multi_seq_decode,
+    num_kv_heads,
     configure_compilation,
     configure_device,
 ):
@@ -1014,7 +1019,7 @@ def test_head_major_attn_sinks(
         # to 0.3 here, which the default 0.2 + 20% bound would absorb.
         tolerance=(0.05, 0.05),
         num_query_heads=8,
-        num_kv_heads=1,
+        num_kv_heads=num_kv_heads,
         head_size=64,
     )
     assert bool(calls) == multi_seq_decode, calls

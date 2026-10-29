@@ -1308,13 +1308,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _device_sinks(self, device: torch.device) -> torch.Tensor | None:
         """The layer's sink logits as ``[num_kv_heads, num_queries_per_kv, 1]`` on ``device``.
 
-        Kv-major, matching the kernels' head order. Built on first use and kept: the
-        source parameter stays on the host (``Attention._apply`` is a no-op on Spyre).
+        Kv-major, matching the kernels' head order. Built on first use and dropped by
+        ``process_weights_after_loading``. ``move_model_to_spyre`` points the source at the
+        parameter the model holds on Spyre, which is the one a reload writes.
         """
         if self._sinks_source is None:
             return None
         if self._sinks is None:
-            sinks = self._sinks_source.detach().to("cpu", self.model_dtype)
+            sinks = convert(self._sinks_source, device="cpu", dtype=self.model_dtype)
             self._sinks = convert(
                 sinks.reshape(self.num_kv_heads, self.num_queries_per_kv, 1), device
             )
@@ -1419,7 +1420,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def graph_key(self) -> tuple:
         """The kernel arguments that may differ between layers of one attention group."""
         alibi = None if self.alibi_slopes is None else tuple(self.alibi_slopes.flatten().tolist())
-        return (self.num_heads, self.scale, self.logits_soft_cap, alibi, self._kv_scales)
+        return (
+            self.num_heads,
+            self.scale,
+            self.logits_soft_cap,
+            alibi,
+            self._kv_scales,
+            self._sinks_source is not None,
+        )
 
     def record_graphs(
         self,
