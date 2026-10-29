@@ -134,8 +134,8 @@ class SpyreMoERecipe:
 class _ExpertBiases:
     """Per-expert bias stacks, ``[E, 1, F]`` so each tiles and gathers like its weight pool.
 
-    ``down_chunks`` is ``down`` split along the hidden axis into the gathered form's
-    ``[E*chunks, 1, hidden/chunks]`` entries; the persistent forms read ``down`` whole.
+    ``down_chunks`` aliases ``down`` along the hidden axis into the gathered form's
+    ``[E*chunks, 1, hidden/chunks]`` entries. The persistent forms read ``down`` whole.
     """
 
     gate: torch.Tensor
@@ -198,6 +198,14 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
         raise NotImplementedError("Spyre MoE backend requires normalized top-k routing weights.")
     if layer.apply_router_weight_on_input:
         raise NotImplementedError("Spyre MoE backend does not support input-weighted routing.")
+    # prepare_down_weight scales the down stack (Gemma folds per_expert_scale there) and
+    # does not see w2_bias, so a biased expert would add an unscaled d_e.
+    if moe.has_bias and recipe.prepare_down_weight is not None:
+        raise NotImplementedError(
+            "Spyre MoE backend does not support expert biases together with "
+            "prepare_down_weight; that transform scales the down stack and would "
+            "leave w2_bias unscaled."
+        )
     if layer.activation.value != recipe.activation:
         raise NotImplementedError(
             f"Spyre MoE recipe requires activation={recipe.activation!r}, "
@@ -696,37 +704,71 @@ def _down_chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
     return _C.reinterpret_tensor_with_layout(pool, size, stride, 0, layout)
 
 
+def _down_bias_chunk_alias(bias: torch.Tensor, chunks: int) -> torch.Tensor:
+    """View an ``[E, 1, H]`` down bias as gathered ``[E*chunks, 1, H/chunks]`` entries.
+
+    Shares storage with ``bias``. The dma layout keeps H contiguous per expert, and
+    ``H/chunks`` is stick-aligned, so each entry is one contiguous run of those sticks.
+    """
+    from torch_spyre import _C
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    experts, contract, hidden = bias.shape
+    if contract != 1:
+        raise ValueError(f"down bias must be [E, 1, H], got {tuple(bias.shape)}")
+    eps = SpyreTensorLayout([experts, contract, hidden], bias.dtype).elems_per_stick()
+    if hidden % chunks or (hidden // chunks) % eps:
+        raise ValueError(
+            f"down bias hidden size {hidden} must divide into {chunks} stick-aligned chunks"
+        )
+    device_dtype = get_device_dtype(bias.dtype)
+    _check_pool_layout(
+        bias,
+        SpyreTensorLayout(
+            [experts, contract, hidden // eps, eps],
+            [contract * hidden, hidden, eps, 1],
+            device_dtype,
+        ),
+    )
+    chunk_hidden = hidden // chunks
+    layout = SpyreTensorLayout(
+        [experts * chunks, 1, chunk_hidden // eps, eps],
+        [chunk_hidden, chunk_hidden, eps, 1],
+        device_dtype,
+    )
+    return _C.reinterpret_tensor_with_layout(
+        bias,
+        [experts * chunks, 1, chunk_hidden],
+        [chunk_hidden, chunk_hidden, 1],
+        0,
+        layout,
+    )
+
+
 def _prepare_biases(
     layer: RoutedExperts, inter: int, pad: int, chunks: int
 ) -> _ExpertBiases | None:
     """Relayout ``w13_bias`` / ``w2_bias`` next to the pools.
 
-    The host parameters stay. They are tiny next to the weight stacks, and upstream's
-    ``get_fused_moe_quant_config`` still reads them. The kernels read ``spyre_moe_biases``.
+    ``_prepare_layer`` has already checked both shapes against the weights. The host
+    parameters stay, so upstream's ``get_fused_moe_quant_config`` can still read them.
+    The kernels read ``spyre_moe_biases``.
     """
     # vLLM registers both exactly when ``moe_config.has_bias``.
     if not hasattr(layer, "w13_bias"):
         return None
     w13_bias = layer.get_parameter("w13_bias").data
     w2_bias = layer.get_parameter("w2_bias").data
-    experts, hidden = w2_bias.shape
-    if w13_bias.shape != (experts, 2 * inter):
-        raise ValueError(
-            f"unexpected MoE expert bias shapes: w13_bias={tuple(w13_bias.shape)} "
-            f"w2_bias={tuple(w2_bias.shape)}"
-        )
-    # Every rank adds this full down bias before MoERunner's all-reduce. That matches
-    # upstream only when the loader zeros ``w2_bias`` on rank != 0. gpt-oss's loader
+    # Every rank adds this full down bias before MoERunner's all-reduce, as upstream's
+    # kernels do. The model loader must zero ``w2_bias`` off rank 0. gpt-oss's loader
     # does; vLLM's generic RoutedExperts weight loader copies it onto every rank.
-    biases = _ExpertBiases(
+    down = _to_spyre_expert_weight(w2_bias.unsqueeze(1), ())
+    return _ExpertBiases(
         gate=_to_spyre_expert_weight(w13_bias[:, :inter].unsqueeze(1), (0, pad)),
         up=_to_spyre_expert_weight(w13_bias[:, inter:].unsqueeze(1), (0, pad)),
-        down=_to_spyre_expert_weight(w2_bias.unsqueeze(1), ()),
-        down_chunks=_to_spyre_expert_weight(
-            w2_bias.reshape(experts * chunks, 1, hidden // chunks), ()
-        ),
+        down=down,
+        down_chunks=_down_bias_chunk_alias(down, chunks),
     )
-    return biases
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
@@ -746,6 +788,17 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         raise ValueError(
             f"unexpected MoE expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
         )
+    # Against the weight-derived shapes, and before any device copy: a bias with the
+    # wrong expert count matches its sibling and would otherwise gather out of range.
+    if hasattr(layer, "w13_bias"):
+        w13_bias_shape = tuple(layer.get_parameter("w13_bias").shape)
+        w2_bias_shape = tuple(layer.get_parameter("w2_bias").shape)
+        if w13_bias_shape != (experts, 2 * inter) or w2_bias_shape != (experts, hidden):
+            raise ValueError(
+                f"unexpected MoE expert bias shapes: w13_bias={w13_bias_shape} "
+                f"w2_bias={w2_bias_shape}, expected {(experts, 2 * inter)} and "
+                f"{(experts, hidden)}"
+            )
 
     from torch_spyre._inductor import config as spyre_config
 

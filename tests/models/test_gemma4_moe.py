@@ -424,6 +424,10 @@ def test_post_load_advertises_no_preprocessed_weight_support(monkeypatch):
 _STANDARD = ("silu", "topk_softmax")
 
 
+def _identity_down(weight):
+    return weight
+
+
 @pytest.mark.parametrize(
     ("overrides", "recipe_args", "match"),
     [
@@ -438,6 +442,8 @@ _STANDARD = ("silu", "topk_softmax")
         ({"local_num_experts": EXPERTS // 2}, _STANDARD, "remapped experts"),
         ({"renormalize": False}, _STANDARD, "normalized top-k"),
         ({"apply_router_weight_on_input": True}, _STANDARD, "input-weighted"),
+        # A down-weight transform scales w2 and never sees w2_bias.
+        ({"moe_config": {"has_bias": True}}, (*_STANDARD, _identity_down), "prepare_down_weight"),
         ({"quant_method": object()}, _STANDARD, "quantized experts"),
         ({"moe_config": {"is_lora_enabled": True}}, _STANDARD, "LoRA experts"),
         # The recipe's activation must be the one the layer actually asks for.
