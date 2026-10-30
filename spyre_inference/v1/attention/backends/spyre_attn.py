@@ -197,7 +197,7 @@ _batched_decode_compiled = torch.compile(
 )
 
 
-# Compiled: eager index_copy_ falls back to CPU and segfaults on vLLM output buffers.
+# Compiled: eager index_copy_ rejects the int32 row index that convert() uploads.
 def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     dst.index_copy_(0, rows, src[: rows.shape[0]])
     return dst
