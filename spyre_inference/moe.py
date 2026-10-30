@@ -536,11 +536,19 @@ def _rows_are_stick_addressable(x: torch.Tensor, router_logits: torch.Tensor, st
 
 
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    """Materialize canonical vLLM top-k weights in dense expert order."""
-    topk_weights, topk_ids = _routing_weights(
-        router_logits, top_k, "topk_softmax", router_logits.dtype
+    """Materialize canonical vLLM top-k weights in dense expert order.
+
+    A softmax over the row with the unselected experts at -inf is the softmax over the
+    selected logits. Unlike scattering those weights back, it lowers on Spyre.
+    """
+    _, selected = _topk(router_logits, top_k)
+    masked = torch.ops.spyre.keep_by_index(
+        router_logits,  # ty: ignore[invalid-argument-type]
+        selected,  # ty: ignore[invalid-argument-type]
+        -1,  # ty: ignore[invalid-argument-type]
+        float("-inf"),  # ty: ignore[invalid-argument-type]
     )
-    return torch.zeros_like(router_logits).scatter(-1, topk_ids, topk_weights)
+    return torch.softmax(masked, dim=-1)
 
 
 def _route(layer: RoutedExperts, probs: torch.Tensor) -> torch.Tensor:

@@ -29,7 +29,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from torch._dynamo.exc import BackendCompilerFailed
 
 EXPERTS, HIDDEN, TOP_K = 16, 2880, 4
 
@@ -78,20 +77,7 @@ _RECIPE = ("silu", "full_softmax")
 # The persistent forms also run the default top-k routing and Gemma-4's GELU with biases.
 _RECIPES = [
     pytest.param(_RECIPE, id="silu-full"),
-    pytest.param(
-        ("silu", "topk_softmax"),
-        id="silu-topk",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=BackendCompilerFailed,
-            reason=(
-                "_topk_probs does not compile on Spyre, biases or not: torch-spyre's topk "
-                "keeps its indices in the input dtype (torch-spyre#3878), which scatter "
-                "rejects, and casting them to int32 fails to re-tile instead. Drop this "
-                "mark once the dense top-k routing compiles."
-            ),
-        ),
-    ),
+    pytest.param(("silu", "topk_softmax"), id="silu-topk"),
     pytest.param(("gelu_tanh", "full_softmax"), id="gelu-full"),
 ]
 
