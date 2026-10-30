@@ -63,21 +63,21 @@ def test_grouping_is_on_by_default(decode_config):
 
 
 def test_grouping_off_keeps_one_batch(decode_config, monkeypatch):
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "0")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "0")
     md = _build([32000, 2000, 2000, 2000])
     assert md.padded_num_seqs is not None
     assert md.decode_groups is None
 
 
 def test_same_bucket_batch_stays_one_batch(decode_config, monkeypatch):
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     assert _build([30000, 30500, 31000, 30000]).decode_groups is None
 
 
 def test_uniform_batch_skips_grouping(decode_config, monkeypatch):
     from spyre_inference.v1.attention.backends import spyre_attn
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
 
     def fail(*args, **kwargs):
         raise AssertionError("grouping evaluated for a uniform batch")
@@ -89,7 +89,7 @@ def test_uniform_batch_skips_grouping(decode_config, monkeypatch):
 
 
 def test_multi_bucket_batch_splits_by_block_bucket(decode_config, monkeypatch):
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     md = _build([2000, 32000, 2000, 2000])
     assert _members(md) == [[1], [0, 2, 3]]
     # The single batch is still built, as the fallback.
@@ -102,7 +102,7 @@ def test_multi_bucket_batch_splits_by_block_bucket(decode_config, monkeypatch):
 def test_each_group_matches_its_own_batch(decode_config, monkeypatch, kv_lens):
     """A group's precomputes are those of a batch holding only its members, with its
     query rows mapped back to their place in the full batch."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     width = 256
     block_table = torch.randperm(len(kv_lens) * width, dtype=torch.int32).reshape(-1, width)
     md = _build(kv_lens, block_table=block_table)
@@ -131,7 +131,7 @@ def test_groups_merge_within_the_dispatch_cost(decode_config, monkeypatch, group
     chunks merges them and one worth 2 does not."""
     from spyre_inference.v1.attention.backends import spyre_attn
 
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     monkeypatch.setattr(spyre_attn, "_GROUP_DISPATCH_CHUNKS", group_cost)
     md = _build([32000, 200])
     assert (md.decode_groups is not None) == split
@@ -139,12 +139,12 @@ def test_groups_merge_within_the_dispatch_cost(decode_config, monkeypatch, group
 
 def test_neighbouring_buckets_merge(decode_config, monkeypatch):
     """3 and 5 blocks cost one chunk each, apart or together."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     assert _build([300, 600]).decode_groups is None
 
 
 def test_groups_cover_only_the_decode_prefix(decode_config, monkeypatch):
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE_GROUPING", "1")
+    monkeypatch.setenv("SPYRE_JAGGED_DECODE", "1")
     md = _build([32000, 2000, 300], query_lens=[1, 1, 100])
     assert md.num_decode_seqs == 2
     assert _members(md) == [[0], [1]]
