@@ -734,10 +734,15 @@ SINK_TOLERANCE = (0.05, 0.05)
         pytest.param([(32, 200)], 128, id="prefill_sliding_window(128)"),
     ],
 )
+# One KV head cannot tell the kv-major sink order from a transposed one; two can.
+@pytest.mark.parametrize(
+    "num_kv_heads", [pytest.param(1, id="8q_1kv"), pytest.param(2, id="8q_2kv")]
+)
 def test_spyre_attn_sinks(
     default_vllm_config,
     seq_lens: list[tuple[int, int]],
     sliding_window: int | None,
+    num_kv_heads: int,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
@@ -751,7 +756,7 @@ def test_spyre_attn_sinks(
         use_sinks=True,
         tolerance=SINK_TOLERANCE,
         num_query_heads=8,
-        num_kv_heads=1,
+        num_kv_heads=num_kv_heads,
         head_size=64,
     )
 
@@ -1943,9 +1948,13 @@ def test_spyre_attn_batched_decode_correctness(
     [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
     indirect=True,
 )
+@pytest.mark.parametrize(
+    "num_kv_heads", [pytest.param(1, id="8q_1kv"), pytest.param(2, id="8q_2kv")]
+)
 def test_spyre_attn_multi_seq_decode_sinks(
     default_vllm_config,
     monkeypatch,
+    num_kv_heads: int,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
@@ -1974,7 +1983,7 @@ def test_spyre_attn_multi_seq_decode_sinks(
         use_sinks=True,
         tolerance=SINK_TOLERANCE,
         num_query_heads=8,
-        num_kv_heads=1,
+        num_kv_heads=num_kv_heads,
         head_size=64,
     )
     assert calls, "the multi-sequence decode kernel never ran"
