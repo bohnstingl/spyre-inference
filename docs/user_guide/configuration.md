@@ -49,6 +49,20 @@ That is also the configuration the tensor-parallel and compile e2e tests run the
 checkpoints under. A repository with no vision tower gets the override by default, so
 this is only needed for the multimodal ones.
 
+## Muse Glimmer: text only
+
+`meta-models/Muse-Glimmer-30B` serves its text decoder only. Its vision tower is not
+adapted to Spyre, so the plugin defaults the checkpoint to `language_model_only=True`:
+the tower is neither loaded nor warmed up, and the frontend refuses image and video
+input per request. An explicit `--limit-mm-per-prompt` keeps the tower, which has not
+been run on Spyre.
+
+```bash
+vllm serve meta-models/Muse-Glimmer-30B --max-model-len 8192
+```
+
+The fp16 weights (about 56 GB) fit on one card.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup
