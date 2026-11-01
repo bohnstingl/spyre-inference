@@ -216,11 +216,11 @@ class SpyreDsaAttentionImpl(SpyreHeadMajorAttentionImpl):
         # The batched kernel builds its mask on the host; decode takes the per-sequence walk.
         return False
 
-    def record_graphs(self, layer, kv_cache, builder) -> int:
+    def record_graphs(self, layer, kv_cache, builder, **kwargs) -> int:
         # Warmup records each layer alone, so a shared layer has no full layer's mask.
         self._recording = True
         try:
-            return super().record_graphs(layer, kv_cache, builder)
+            return super().record_graphs(layer, kv_cache, builder, **kwargs)
         finally:
             self._recording = False
 
