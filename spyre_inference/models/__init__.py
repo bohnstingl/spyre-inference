@@ -45,6 +45,7 @@ _ADAPTED_ARCHS: dict[str, str] = {
     # its language model through the registry as Gemma4ForCausalLM, which resolves here,
     # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Glm4MoeForCausalLM": "spyre_inference.models.glm:SpyreGlm4MoeForCausalLM",
     "Glm4MoeLiteForCausalLM": "spyre_inference.models.glm:SpyreGlm4MoeLiteForCausalLM",
     "GlmMoeDsaForCausalLM": "spyre_inference.models.glm:SpyreGlmMoeDsaForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
