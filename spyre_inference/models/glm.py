@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre adaptations for vLLM's GLM MoE models with DeepSeek-style attention.
+"""Spyre adaptations for vLLM's GLM MoE models.
 
 GLM-4.7-Flash (``Glm4MoeLiteForCausalLM``) and GLM-5.x (``GlmMoeDsaForCausalLM``) share
-DeepSeek-V2's MLA attention and a noaux_tc router: sigmoid scores, a selection-only
-correction bias, renormalized top-k and a routed scale. Their MLA attention needs no
-adapter (``spyre_inference.v1.attention.mla``); their MoE layers opt in here, and two
-upstream code paths that do not run on Spyre as written are worked around.
+DeepSeek-V2's MLA attention, and with GLM-4.5/4.6/4.7 (``Glm4MoeForCausalLM``, GQA
+attention) a noaux_tc router: sigmoid scores, a selection-only correction bias,
+renormalized top-k and a routed scale. Their attention needs no adapter (MLA:
+``spyre_inference.v1.attention.mla``); their MoE layers opt in here, and two upstream code
+paths that do not run on Spyre as written are worked around.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2MoE,
     GlmMoeDsaForCausalLM,
 )
-from vllm.model_executor.models.glm4_moe import Glm4MoE
+from vllm.model_executor.models.glm4_moe import Glm4MoE, Glm4MoeForCausalLM
 from vllm.model_executor.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
 from vllm.model_executor.models.utils import PPMissingLayer
 
@@ -188,6 +189,23 @@ class SpyreGlm4MoeLiteForCausalLM(Glm4MoeLiteForCausalLM):
     def load_weights(self, weights):
         loaded = super().load_weights(weights)
         # Before process_weights_after_loading transposes and moves the gate weights.
+        capture_host_routers()
+        return loaded
+
+
+class SpyreGlm4MoeForCausalLM(Glm4MoeForCausalLM):
+    """GLM-4.5/4.6/4.7 on Spyre with Spyre MoE expert dispatch; GQA attention needs no adapter.
+
+    Glm4MoeDecoderLayer does not divide the residual stream in fp16, so the routed scale is
+    folded into the down stack, as for GLM-4.7-Flash.
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        configure_glm_moe_layers(self.model.layers, fold_routed_scale=True)
+
+    def load_weights(self, weights):
+        loaded = super().load_weights(weights)
         capture_host_routers()
         return loaded
 
