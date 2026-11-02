@@ -20,13 +20,10 @@ from contextlib import AbstractContextManager, nullcontext
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
-from vllm.v1.core.kv_cache_utils import (
-    _max_memory_usage_bytes_from_groups,
-    _pool_bytes_per_block,
-    get_kv_cache_groups,
-)
+from vllm.v1.core.kv_cache_planning import _pool_bytes_per_block, get_kv_cache_groups
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheSpec, UniformTypeKVCacheSpecs
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
@@ -66,9 +63,19 @@ def _kv_block_layout(
         for group in groups
         for name in group.layer_names
     )
-    per_request = _max_memory_usage_bytes_from_groups(vllm_config, groups) // pool_bytes
+    per_request = sum(_max_pages_per_request(vllm_config, group) for group in groups)
     batch_blocks = vllm_config.scheduler_config.max_num_seqs * per_request + 1
     return pool_bytes, spyre_bytes, batch_blocks
+
+
+def _max_pages_per_request(vllm_config: VllmConfig, group: KVCacheGroupSpec) -> int:
+    """Pool blocks one request at max_model_len claims in ``group``, as upstream counts them."""
+    if group.host_resident:
+        return 0
+    spec = group.kv_cache_spec
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        return spec.max_memory_usage_pages(vllm_config)
+    return cdiv(spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes)
 
 
 def _layer_spec(group: KVCacheGroupSpec, layer_name: str) -> KVCacheSpec:
