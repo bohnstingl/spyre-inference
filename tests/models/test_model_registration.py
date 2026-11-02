@@ -50,7 +50,10 @@ def _load(target: str) -> type:
 
 def _upstream_class(arch: str) -> type:
     module, cls_name = _VLLM_MODELS[arch]
-    return getattr(importlib.import_module(f"vllm.model_executor.models.{module}"), cls_name)
+    # New-layout entries (vllm.models.<name>) carry their full module path.
+    if not module.startswith("vllm."):
+        module = f"vllm.model_executor.models.{module}"
+    return getattr(importlib.import_module(module), cls_name)
 
 
 def test_every_spyre_arch_is_known_to_vllm():
@@ -59,7 +62,11 @@ def test_every_spyre_arch_is_known_to_vllm():
     assert not unknown, f"not registered by this vLLM: {unknown}"
 
 
-@pytest.mark.parametrize("arch", sorted(SPYRE_MODELS))
+# Spyre reimplementations rather than adaptations: upstream's class cannot be built here.
+_REIMPLEMENTED = {"MuseSparkForConditionalGeneration"}
+
+
+@pytest.mark.parametrize("arch", sorted(set(SPYRE_MODELS) - _REIMPLEMENTED))
 def test_spyre_model_subclasses_the_arch_it_replaces(arch):
     """The lazy ``"module:Class"`` half is unvalidated until vLLM resolves it.
 

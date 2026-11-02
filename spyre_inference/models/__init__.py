@@ -60,6 +60,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "MuseGlimmerForConditionalGeneration": (
         "spyre_inference.models.muse_glimmer:SpyreMuseGlimmerForCausalLM"
     ),
+    # Text only, and not a subclass: upstream's Muse Spark is CUDA/ROCm code throughout.
+    "MuseSparkForConditionalGeneration": (
+        "spyre_inference.models.muse_spark:SpyreMuseSparkForCausalLM"
+    ),
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
     "PixtralForConditionalGeneration": (
         "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"
