@@ -1325,3 +1325,39 @@ def test_spyre_module_to_keeps_parameter_objects(spyre_device):
     new = torch.full((8,), 3.0, dtype=torch.float16)
     model.sinks.data.copy_(new.to(spyre_device))
     torch.testing.assert_close(held.cpu(), new)
+
+
+# ---------------------------------------------------------------------------
+# 15. Interleaved (GPT-J style) RoPE as upstream writes it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=torch._dynamo.exc.BackendCompilerFailed,
+    reason=(
+        "torch-spyre cannot compile a stride inside the stick: x[..., ::2] fails with "
+        "'Unexpected stick expression 2*d2', and the interleave back, "
+        "torch.stack(..., dim=-1).flatten(-2), with 'Unexpected stick expression 1' "
+        "(torch-spyre#5974). When this XPASS-es, SpyreRoPE can run interleaved RoPE as "
+        "upstream writes it and drop the pair-swap matrix (_rotate_interleaved_matrix)."
+    ),
+)
+@pytest.mark.parametrize("num_tokens,num_heads", [(32, 20), (1, 20)])
+def test_spyre_interleaved_rope_strided_slice(spyre_device, num_tokens, num_heads):
+    """Upstream's interleaved RoPE (is_neox_style=False), compiled, on the q_pe of GLM's
+    MLA (head_size 64): even/odd split by strided slice, then re-interleave."""
+    from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, num_heads, 64, dtype=torch.float16)
+    cos = torch.randn(num_tokens, 32, dtype=torch.float16)
+    sin = torch.randn(num_tokens, 32, dtype=torch.float16)
+
+    def fn(x, cos, sin):
+        return ApplyRotaryEmb.forward_static(x, cos, sin, is_neox_style=False)
+
+    compiled = torch.compile(fn, dynamic=False, backend="inductor")
+    out = compiled(x.to(spyre_device), cos.to(spyre_device), sin.to(spyre_device))
+    expected = fn(x.float(), cos.float(), sin.float())
+    torch.testing.assert_close(out.cpu().float(), expected, atol=3e-2, rtol=1e-2)
