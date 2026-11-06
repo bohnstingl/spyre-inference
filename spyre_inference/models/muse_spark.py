@@ -207,12 +207,9 @@ def local_experts(
     """
     h = torch.matmul(x.unsqueeze(0).expand(w13.shape[0], -1, -1), w13)
     gate, up = h.split(w2.shape[1], dim=-1)
-    y = torch.matmul(F.silu(gate) * up, w2) * (1.0 + norm_weight)
-    # The norm reduces in fp32; an fp32 weighted sum feeding the unpooler's matmul does not
-    # lower ("batchmatmul stick constraint violated").
-    yf = y.float()
-    y = (yf * torch.rsqrt(yf.pow(2).mean(-1, keepdim=True) + eps)).to(x.dtype)
-    return (y * routes.amax(-1, keepdim=True)).sum(0)
+    y = (torch.matmul(F.silu(gate) * up, w2) * (1.0 + norm_weight)).float()
+    y = y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
+    return (y * routes.float().amax(-1, keepdim=True)).sum(0).to(x.dtype)
 
 
 class SpyreMuseSparkMoE(nn.Module):
