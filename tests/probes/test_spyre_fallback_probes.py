@@ -1336,28 +1336,31 @@ def test_spyre_module_to_keeps_parameter_objects(spyre_device):
     strict=True,
     raises=torch._dynamo.exc.BackendCompilerFailed,
     reason=(
-        "torch-spyre cannot compile a stride inside the stick: x[..., ::2] fails with "
-        "'Unexpected stick expression 2*d2', and the interleave back, "
-        "torch.stack(..., dim=-1).flatten(-2), with 'Unexpected stick expression 1' "
-        "(torch-spyre#5974). When this XPASS-es, SpyreRoPE can run interleaved RoPE as "
-        "upstream writes it and drop the pair-swap matrix (_rotate_interleaved_matrix)."
+        "torch-spyre cannot compile upstream's interleaved RoPE into MLA's query: the "
+        "strided x[..., ::2] reads fail with 'Unexpected stick expression 2*d2' "
+        "(torch-spyre#6090), the re-interleave stack(..., -1).flatten(-2) with "
+        "'Unexpected stick expression 1' (torch-spyre#5974), and with both, the cat "
+        "after it in restickify codegen. When this XPASS-es, _rotate_interleaved can "
+        "re-interleave with stack as upstream does instead of its gather."
     ),
 )
 @pytest.mark.parametrize("num_tokens,num_heads", [(32, 20), (1, 20)])
 def test_spyre_interleaved_rope_strided_slice(spyre_device, num_tokens, num_heads):
     """Upstream's interleaved RoPE (is_neox_style=False), compiled, on the q_pe of GLM's
-    MLA (head_size 64): even/odd split by strided slice, then re-interleave."""
+    MLA query (head_size 64), then MLA's cat(q_nope, q_pe)."""
     from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
 
     torch.manual_seed(0)
-    x = torch.randn(num_tokens, num_heads, 64, dtype=torch.float16)
+    q = torch.randn(num_tokens, num_heads, 192, dtype=torch.float16)
     cos = torch.randn(num_tokens, 32, dtype=torch.float16)
     sin = torch.randn(num_tokens, 32, dtype=torch.float16)
 
-    def fn(x, cos, sin):
-        return ApplyRotaryEmb.forward_static(x, cos, sin, is_neox_style=False)
+    def fn(q, cos, sin):
+        q_nope, q_pe = q.split([128, 64], dim=-1)
+        q_pe = ApplyRotaryEmb.forward_static(q_pe, cos, sin, is_neox_style=False)
+        return torch.cat((q_nope, q_pe), dim=-1)
 
     compiled = torch.compile(fn, dynamic=False, backend="inductor")
-    out = compiled(x.to(spyre_device), cos.to(spyre_device), sin.to(spyre_device))
-    expected = fn(x.float(), cos.float(), sin.float())
+    out = compiled(q.to(spyre_device), cos.to(spyre_device), sin.to(spyre_device))
+    expected = fn(q.float(), cos.float(), sin.float())
     torch.testing.assert_close(out.cpu().float(), expected, atol=3e-2, rtol=1e-2)

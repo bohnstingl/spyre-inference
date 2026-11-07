@@ -333,15 +333,18 @@ def test_rotary_partial_config_raises(default_vllm_config, head_size, partial_ro
 
 
 @pytest.mark.rotary
-@pytest.mark.parametrize("head_size", [64, 128])
-def test_rotary_interleaved_forward_oot_on_spyre(default_vllm_config, head_size):
+@pytest.mark.parametrize("head_size,num_tokens", [(64, 32), (128, 32), (64, 1), (64, 2048)])
+def test_rotary_interleaved_forward_oot_on_spyre(default_vllm_config, head_size, num_tokens):
     """Interleaved (is_neox_style=False) RoPE, GLM's and DeepSeek's MLA rotary, runs on
-    Spyre through the pair-swap form and matches forward_native."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
+    Spyre through upstream's even/odd form and matches forward_native. At 2048 tokens a
+    gather along the stick would pass the 256 MB per-core span, and the single key head
+    overflowed a dbo-opt immediate before torch-spyre#6090 dropped its size-1 dim."""
+    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
     torch.manual_seed(42)
-    max_position, num_tokens = 2048, 32
+    max_position = 2048
+    _ROPE_DICT.clear()
     rope = get_rope(
         head_size=head_size,
         max_position=max_position,
@@ -353,7 +356,8 @@ def test_rotary_interleaved_forward_oot_on_spyre(default_vllm_config, head_size)
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
     # MLA rotates one shared key head ([T, 1, D]) against every query head.
     query, key = _make_qk(num_tokens, 4, 1, head_size, flatten=False)
-    actual_query, actual_key = rope.forward_oot(
+    # Compiled, as in the block graph: the strided reads only lower there.
+    actual_query, actual_key = torch.compile(rope.forward_oot, dynamic=False)(
         positions.to("spyre"), query.to("spyre"), key.to("spyre")
     )
 
