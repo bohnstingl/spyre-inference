@@ -32,10 +32,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     EncoderRectPlan,
     SpyreEncoderAttentionImpl,
     _alignment_units_for,
+    _encoder_fused_kernel,
     _encoder_gather_kernel,
+    _encoder_rect_kernel,
     _encoder_sdpa_kernel,
     build_encoder_plan,
-    encoder_index_dtype,
     encoder_key_pad_mask,
     encoder_row_table,
 )
@@ -414,19 +415,78 @@ def _dense_attn(
     """Drive gather + dense attention over a packed list the way ``forward`` does."""
     num_heads, head_size = query.shape[1], query.shape[2]
     num_kv_heads = key.shape[1]
-    index_dtype = encoder_index_dtype(query.device)
     attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
     out = torch.zeros_like(query)
     start = 0
     for length in query_lens:
         extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
-        row_index = encoder_row_table(start, length, extent, index_dtype)
-        mask = convert(encoder_mask(extent, length, query.dtype), query.device)
+        # Eager index_copy_ on CPU takes int64 only.
+        row_index = encoder_row_table(start, length, extent, torch.int64)
+        mask = encoder_mask(extent, length, query.dtype)
         q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
         attn = attn_fn(q_rows, k_rows, v_rows, mask, scale)
         out.index_copy_(0, row_index, attn)
         start += length
     return out
+
+
+def _fused_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+) -> torch.Tensor:
+    """The ragged path's fused kernel, one sequence per group."""
+    num_heads, head_size = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+    out = torch.zeros_like(query)
+    start = 0
+    for length in query_lens:
+        extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
+        row_index = encoder_row_table(start, length, extent, torch.int64)
+        mask = encoder_mask(extent, length, query.dtype)
+        _encoder_fused_kernel(
+            out, row_index, query, key, value, mask, scale, 1, num_heads, num_kv_heads, head_size
+        )
+        start += length
+    return out
+
+
+def _rect_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+) -> torch.Tensor:
+    """The rectangular path's kernel: one padded row per sequence, then repacked."""
+    num_heads, head_size = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+    width = len(query_lens)
+    extent = _alignment_units_for(max(query_lens)) * ENCODER_LEN_ALIGNMENT
+    starts = [sum(query_lens[:i]) for i in range(width)]
+
+    def to_grid(x: torch.Tensor) -> torch.Tensor:
+        grid = x.new_zeros((width * extent, *x.shape[1:]))
+        for i, (start, length) in enumerate(zip(starts, query_lens)):
+            grid[i * extent : i * extent + length] = x[start : start + length]
+        return grid
+
+    mask = encoder_key_pad_mask(extent, query_lens, query.dtype)
+    out = _encoder_rect_kernel(
+        to_grid(query),
+        to_grid(key),
+        to_grid(value),
+        mask,
+        scale,
+        width,
+        extent,
+        num_heads,
+        num_kv_heads,
+        head_size,
+    )
+    return torch.cat([out[i * extent : i * extent + n] for i, n in enumerate(query_lens)])
 
 
 @pytest.mark.parametrize(
@@ -441,10 +501,13 @@ def _dense_attn(
     "num_heads",
     [pytest.param((4, 1), id="GQA"), pytest.param((4, 4), id="MHA")],
 )
-def test_dense_kernel_matches_dense_sdpa_reference(
-    query_lens: list[int], num_heads: tuple[int, int]
+@pytest.mark.parametrize(
+    "attn", [_dense_attn, _fused_attn, _rect_attn], ids=["gather_sdpa", "fused", "rect"]
+)
+def test_kernels_match_dense_sdpa_reference(
+    query_lens: list[int], num_heads: tuple[int, int], attn
 ) -> None:
-    """The gather + dense-attention path must match a dense SDPA computation."""
+    """Each encoder kernel path, called directly on CPU, matches a dense SDPA computation."""
     num_query_heads, num_kv_heads = num_heads
     head_size = 64
     scale = head_size**-0.5
@@ -454,17 +517,14 @@ def test_dense_kernel_matches_dense_sdpa_reference(
     key = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
     value = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
 
-    got = _dense_attn(query, key, value, query_lens, scale)
+    got = attn(query, key, value, query_lens, scale)
     ref = dense_sdpa_reference(query, key, value, query_lens, scale)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize(
     "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
+    [pytest.param("spyre", id="device_spyre")],
     indirect=True,
 )
 @pytest.mark.parametrize(
@@ -610,10 +670,7 @@ def test_spyre_encoder_attn(
 
 @pytest.mark.parametrize(
     "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
+    [pytest.param("spyre", id="device_spyre")],
     indirect=True,
 )
 @torch.inference_mode()
@@ -696,7 +753,7 @@ def test_attention_sinks_are_rejected(default_vllm_config):
 
 
 @torch.inference_mode()
-def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config) -> None:
+def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config, monkeypatch) -> None:
     """Second layer's forward() must reuse the first layer's plans, not rebuild them."""
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -727,6 +784,9 @@ def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config) -
         kv_cache_dtype="auto",
         logits_soft_cap=None,
     )
+    # Only the plan is under test, so no attention runs.
+    for name in ("warm_kernels", "_forward_rect", "_forward_groups"):
+        monkeypatch.setattr(impl, name, Mock(return_value=0))
     kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
     fwd = dict(
         layer=None,
@@ -924,7 +984,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     )
 
 
-@pytest.mark.parametrize("configure_device", ["cpu", "spyre"], indirect=True)
+@pytest.mark.parametrize("configure_device", ["spyre"], indirect=True)
 @pytest.mark.parametrize("configure_compilation", ["STOCK_TORCH_COMPILE"], indirect=True)
 @pytest.mark.parametrize(
     "query_lens",

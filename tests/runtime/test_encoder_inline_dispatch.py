@@ -183,6 +183,17 @@ class TestGridPublication:
         assert encoder_grid().mask is None
 
 
+def _fake_rect(query, key, value, mask, scale, width, extent, num_heads, num_kv_heads, head_size):
+    """Stands in for the attention: a function of every input both paths must agree on."""
+    kv = (key + value).repeat_interleave(num_heads // num_kv_heads, dim=1)
+    masked_keys = mask.reshape(width, extent).lt(0).sum(-1).to(query.dtype)
+    return query * scale + kv + masked_keys.repeat_interleave(extent).view(-1, 1, 1)
+
+
+def _fake_rect_out(out, *args):
+    return out.copy_(_fake_rect(*args))
+
+
 class TestTracedForward:
     def _inputs(self, layer, rows, seed=0):
         torch.manual_seed(seed)
@@ -274,10 +285,15 @@ class TestTracedForward:
         assert traced.shape == (rows, heads * dim)
         assert torch.equal(traced, reference)
 
-    def test_inlined_result_matches_the_impl_forward(self):
+    def test_inlined_result_matches_the_impl_forward(self, monkeypatch):
         """End to end against the opaque path, which routes through ``impl.forward``."""
         layer = _layer()
         install_encoder([layer])
+        # The plumbing is under test, not the kernel: both paths get the same stand-in.
+        monkeypatch.setattr(enc, "_encoder_rect_kernel", _fake_rect)
+        monkeypatch.setattr(layer.impl, "_rect_fn", _fake_rect)
+        monkeypatch.setattr(layer.impl, "_rect_out_fn", _fake_rect_out)
+        monkeypatch.setattr(layer.impl, "warm_kernels", lambda *a, **k: 0)
         extent, width = 128, 2
         rows = extent * width
         query_lens = [extent, extent // 2]

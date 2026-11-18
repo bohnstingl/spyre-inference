@@ -87,13 +87,6 @@ def _alignment_units_for(length: int) -> int:
     return next_power_of_2(cdiv(length, ENCODER_LEN_ALIGNMENT))
 
 
-def encoder_index_dtype(device: torch.device) -> torch.dtype:
-    """int32 on Spyre, which has no int64 and whose compiled ``index_copy_``
-    takes it; int64 everywhere else, where eager ``index_copy_`` rejects int32.
-    """
-    return torch.int32 if device.type == "spyre" else torch.int64
-
-
 def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtype) -> torch.Tensor:
     """One sequence's absolute rows, pad lanes clamped to its last real row.
 
@@ -157,10 +150,8 @@ def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
     """
     if x.shape[-1] == padded:
         return x
-    device = x.device
-    on_host = convert(x, "cpu") if device.type == "spyre" else x
-    on_host = F.pad(on_host.contiguous(), (0, padded - x.shape[-1]))
-    return convert(on_host, device) if device.type == "spyre" else on_host
+    on_host = F.pad(convert(x, "cpu").contiguous(), (0, padded - x.shape[-1]))
+    return convert(on_host, x.device)
 
 
 def _widen_head_dim(
@@ -446,7 +437,8 @@ def build_encoder_plan(
         extent = _alignment_units_for(member[1]) * ENCODER_LEN_ALIGNMENT
         by_extent.setdefault(extent, []).append(member)
 
-    index_dtype = encoder_index_dtype(device)
+    # Spyre has no int64, and its compiled index_copy_ takes int32.
+    index_dtype = torch.int32
 
     def plan(chunk: list[tuple[int, int, int]], extent: int) -> EncoderGroupPlan:
         # The row table's pad lanes repeat the last real row, so the scatter writes it
@@ -692,7 +684,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             return 0
         self._warmed_rows.add(rows)
         dtype, device = query.dtype, query.device
-        index_dtype = encoder_index_dtype(device)
+        index_dtype = torch.int32
         traced = 0
 
         # Traced in, a rectangle's shape *is* a block graph, warmed by the runner's

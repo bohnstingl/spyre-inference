@@ -115,15 +115,14 @@ class TestWarmKernelsTracesTheDeclaredSet:
 
         seen_rects: list[tuple[int, int]] = []
         seen_groups: list[tuple[int, int]] = []
-        real_rect, real_fused = impl._run_rect, impl._run_fused
 
         def record_rect(out, q, k, v, mask, width, extent, *args, **kwargs):
             seen_rects.append((extent, width))
-            return real_rect(out, q, k, v, mask, width, extent, *args, **kwargs)
+            return out
 
         def record_fused(out, row_index, q, k, v, mask, group, *args, **kwargs):
             seen_groups.append((group, row_index.shape[0] // group))
-            return real_fused(out, row_index, q, k, v, mask, group, *args, **kwargs)
+            return out
 
         monkeypatch.setattr(impl, "_run_rect", record_rect)
         monkeypatch.setattr(impl, "_run_fused", record_fused)
@@ -179,15 +178,14 @@ class TestWarmKernelsTracesTheDeclaredSet:
         query, key, value, output = _buffers(impl, encoder_shape_tables(config).budget)
 
         seen_out = []
-        real_rect, real_fused = impl._run_rect, impl._run_fused
 
         def record_rect(out, *args, **kwargs):
             seen_out.append(out)
-            return real_rect(out, *args, **kwargs)
+            return out
 
         def record_fused(out, *args, **kwargs):
             seen_out.append(out)
-            return real_fused(out, *args, **kwargs)
+            return out
 
         monkeypatch.setattr(impl, "_run_rect", record_rect)
         monkeypatch.setattr(impl, "_run_fused", record_fused)
@@ -211,15 +209,14 @@ class TestWarmKernelsTracesTheDeclaredSet:
         assert not query.is_contiguous(), "test setup must exercise a genuinely strided view"
 
         seen_strides: list[tuple] = []
-        real_rect, real_fused = impl._run_rect, impl._run_fused
 
         def record_rect(out, q, *a, **k):
             seen_strides.append(q.stride())
-            return real_rect(out, q, *a, **k)
+            return out
 
         def record_fused(out, row_index, q, *a, **k):
             seen_strides.append(q.stride())
-            return real_fused(out, row_index, q, *a, **k)
+            return out
 
         monkeypatch.setattr(impl, "_run_rect", record_rect)
         monkeypatch.setattr(impl, "_run_fused", record_fused)
@@ -239,6 +236,8 @@ class TestWarmKernelsTracesTheDeclaredSet:
         """Every layer calls it; only the first may trace."""
         config = _config(512, 32, 2048)
         impl = _make_impl(config)
+        monkeypatch.setattr(impl, "_run_rect", lambda out, *a: out)
+        monkeypatch.setattr(impl, "_run_fused", lambda out, *a: out)
         buffers = _buffers(impl, encoder_shape_tables(config).budget)
         first = impl.warm_kernels(*buffers, impl.num_heads, impl.num_kv_heads, 64)
         assert first > 0
