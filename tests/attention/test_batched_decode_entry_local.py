@@ -341,7 +341,7 @@ def test_temp_split_layout_fields():
 
 
 def _shared_slot_case(
-    blocks, rows, kv, num_chunks=None, first_block_offset=0.0, slots=32, dtype=torch.float32
+    blocks, rows, kv, num_chunks=None, first_block_offset=0.0, slots=32, dtype=torch.float32, q=4
 ):
     """Distinct pages per sequence and a part-filled last block, laid out by the builder.
 
@@ -366,6 +366,7 @@ def _shared_slot_case(
         block_size=BLOCK,
         model_dtype=dtype,
         num_kv_heads=kv,
+        num_heads=kv * q,
         _attn_bucketer=SimpleNamespace(shared_slot_seqs=rows, shared_slots=slots),
     )
     fields = SpyreAttentionMetadataBuilder._shared_slot_tensors(
@@ -387,7 +388,7 @@ def _slot_pages(num_pages, kv):
 
 
 def _run_shared_slots(query, k_pages, v_pages, fields, kv, q, **kwargs):
-    (_, slots, _, rep, page_ids, mask), onehot = fields
+    (_, slots, _, rep, page_ids, mask), row_ids, onehot = fields
     page_ids, mask = split_by_chunk(page_ids, mask, slots)
     return bdhm.batched_decode_kernel(
         query=query,
@@ -404,6 +405,7 @@ def _run_shared_slots(query, k_pages, v_pages, fields, kv, q, **kwargs):
         block_size=BLOCK,
         head_size=HEAD,
         entry_local=True,
+        slot_row_ids=row_ids,
         slot_onehot=onehot,
         **kwargs,
     )
@@ -571,9 +573,10 @@ def test_shared_slots_walk_the_active_blocks():
         block_size=BLOCK,
         model_dtype=torch.float32,
         num_kv_heads=1,
+        num_heads=1,
         _attn_bucketer=SimpleNamespace(shared_slot_seqs=1, shared_slots=32),
     )
-    (_, _, _, _, page_ids, mask), _ = SpyreAttentionMetadataBuilder._shared_slot_tensors(
+    (_, _, _, _, page_ids, mask), _, _ = SpyreAttentionMetadataBuilder._shared_slot_tensors(
         owner,
         [0],
         SharedSlotPlan(1, None, [4]),

@@ -473,9 +473,12 @@ then 32; each layer group's builder has its own. The per-bucket kernels give eve
 `32 / bucket` block slots. The shared-slot kernels let the host share them out by length at
 every step instead: it picks the fewest chunks `C` that fit the batch and gives each sequence
 `ceil(blocks / C)` consecutive block slots. At chunk `c`, a sequence's block slot `k` reads
-its block `c * slots + k`. After the last chunk, an `[E, S]` one-hot sums each sequence's
-block slots into its output row, as the per-bucket kernel sums a sequence's block slots.
-Output rows past the batch copy row 0, so they stay finite.
+its block `c * slots + k`. After the last chunk, an `[S, E]` one-hot sums each sequence's
+block slots' weighted values into its output row with a matmul batched over the KV heads and
+the queries per KV head, the two batch axes `lower_bmm` allows; the maximum and the softmax
+sum, which have no head dim, use a broadcast instead. Output rows past the batch copy row 0, so
+they stay finite. The kernel stores the merged rows into the output in the same graph, as
+the per-bucket kernels do.
 
 One dynamic variant serves every batch of up to `S` sequences. Its chunk count runs from one
 chunk, or from `MIN_RESERVED_DIM_SIZE` if you export it, up to what `S` sequences at

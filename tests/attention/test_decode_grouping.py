@@ -268,10 +268,15 @@ def test_each_shared_slot_group_matches_its_own_batch(shared_slot_config):
         rows = g.rows_cpu.tolist()
         alone = _build([kv_lens[r] for r in rows], block_table=block_table[rows])
         assert alone.decode_groups is None
-        for name in ("chunk_page_ids_cpu", "mask_by_chunk_cpu", "slot_onehot_cpu"):
+        for name in (
+            "chunk_page_ids_cpu",
+            "mask_by_chunk_cpu",
+            "slot_row_ids_cpu",
+            "slot_onehot_cpu",
+        ):
             assert torch.equal(getattr(g, name), getattr(alone, name)), name
         # A spare block slot, in no row, reads query row 0.
-        real = alone.slot_onehot_cpu.flatten(1).sum(1) > 0
+        real = alone.slot_onehot_cpu[0, 0].sum(0) > 0
         expected = torch.where(real, torch.tensor(rows)[alone.rep_row_ids_cpu.long()], 0)
         assert torch.equal(g.rep_row_ids_cpu, expected.to(torch.int32))
 
@@ -307,6 +312,7 @@ def test_shared_slot_call_covers_only_the_decode_prefix(shared_slot_config):
     assert md.num_decode_seqs == 2
     assert md.shared_slot_seqs == 32
     assert md.rep_row_ids_cpu.max() < 2
-    onehot = md.slot_onehot_cpu.flatten(1)
+    # [rows, slots] -> [slots, rows]
+    onehot = md.slot_onehot_cpu[0, 0].t()
     assert onehot.shape == (32, 32)
     assert torch.equal(onehot[:, 2:], onehot[:, :1].expand(-1, 30))

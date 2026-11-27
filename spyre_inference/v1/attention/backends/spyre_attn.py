@@ -143,6 +143,7 @@ class BatchedDecodeGroup:
     mask_by_chunk_cpu: torch.Tensor
     chunk_range: DynamicRange | None
     shared_slot_seqs: int | None = None
+    slot_row_ids_cpu: torch.Tensor | None = None
     slot_onehot_cpu: torch.Tensor | None = None
     rows_dev: torch.Tensor | None = None
     metadata: "SpyreAttentionMetadata | None" = None
@@ -555,7 +556,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Shared-slot mode: the gather is the B=1, J=slots one above, and the kernel writes
     # shared_slot_seqs output rows. None otherwise.
     shared_slot_seqs: int | None = None
-    # [slots, shared_slot_seqs, 1, 1, 1] model dtype: the rows each block slot counts towards.
+    # [slots] int32: the row each block slot's maximum is read from.
+    slot_row_ids_cpu: torch.Tensor | None = None
+    slot_row_ids_dev: torch.Tensor | None = None
+    # [num_kv_heads, num_queries_per_kv, shared_slot_seqs, slots] model dtype: the rows each
+    # block slot counts towards, repeated per head for the merge's matmul.
     slot_onehot_cpu: torch.Tensor | None = None
     slot_onehot_dev: torch.Tensor | None = None
     decode_groups: list[BatchedDecodeGroup] | None = None
@@ -1188,6 +1193,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         mask_by_chunk_cpu = None
         chunk_range = None
         shared_slot_seqs = None
+        slot_row_ids_cpu = None
         slot_onehot_cpu = None
         decode_groups = None
         decode_uniformity = 0.0
@@ -1213,7 +1219,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 )
                 if isinstance(plan, SharedSlotPlan):
                     shared_slot_seqs = self._attn_bucketer.shared_slot_seqs
-                    fields, slot_onehot_cpu = self._shared_slot_tensors(prefix, plan, *rest)
+                    fields, slot_row_ids_cpu, slot_onehot_cpu = self._shared_slot_tensors(
+                        prefix, plan, *rest
+                    )
                 else:
                     fields = self._batched_decode_tensors(prefix, plan, *rest)
                 (
@@ -1266,6 +1274,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             mask_by_chunk_cpu=mask_by_chunk_cpu,
             chunk_range=chunk_range,
             shared_slot_seqs=shared_slot_seqs,
+            slot_row_ids_cpu=slot_row_ids_cpu,
             slot_onehot_cpu=slot_onehot_cpu,
             decode_groups=decode_groups,
         )
@@ -1305,9 +1314,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         query_start_loc: torch.Tensor,
         active_block_indices: list | None,
         attention_mask_stacks: list[torch.Tensor],
-    ) -> tuple[tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    ) -> tuple[
+        tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
+    ]:
         """The shared-slot kernel's inputs, in the batched kernel's layout at B=1 and
-        J=slots, and the ``[slots, rows, 1, 1, 1]`` one-hot that merges them.
+        J=slots, then the ``[slots]`` row of each slot and the
+        ``[num_kv_heads, num_queries_per_kv, rows, slots]`` one-hot that merges them.
 
         Member i takes ``plan.slots[i]`` consecutive block slots, and at chunk c its slot k
         reads block ``c * plan.slots[i] + k``. A spare slot reads page 0 under an all--inf
@@ -1319,7 +1331,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         num_chunks = plan.num_chunks
         block_size = self.block_size
         rep_row_ids = torch.zeros(slots, dtype=torch.int32)
-        slot_onehot = torch.zeros(slots, rows, dtype=self.model_dtype)
+        slot_row_ids = torch.zeros(slots, dtype=torch.int32)
+        slot_onehot = torch.zeros(rows, slots, dtype=self.model_dtype)
         page_ids = torch.zeros(num_chunks, slots, dtype=torch.int32)
         mask = torch.full((num_chunks, slots, block_size), float("-inf"), dtype=self.model_dtype)
         first = 0
@@ -1337,9 +1350,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             page_ids[:, own] = seq_pages.reshape(num_chunks, width)
             mask[:, own] = seq_mask.reshape(num_chunks, width, block_size)
             rep_row_ids[own] = int(query_start_loc[m])
-            slot_onehot[own, row] = 1
+            slot_row_ids[own] = row
+            slot_onehot[row, own] = 1
             first += width
-        slot_onehot[:, len(members) :] = slot_onehot[:, :1]
+        slot_onehot[len(members) :] = slot_onehot[:1]
         # The KV axis is materialized, as in _batched_decode_tensors.
         mask_by_chunk = (
             mask.reshape(num_chunks * slots, 1, 1, 1, block_size)
@@ -1354,8 +1368,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             page_ids.reshape(num_chunks * slots, 1),
             mask_by_chunk,
         )
-        # The carry's rank, so every input of the merge's pointwise ops has it too.
-        return fields, slot_onehot.reshape(slots, rows, 1, 1, 1)
+        num_queries_per_kv = self.num_heads // self.num_kv_heads
+        onehot = slot_onehot.expand(self.num_kv_heads, num_queries_per_kv, -1, -1).contiguous()
+        return fields, slot_row_ids, onehot
 
     def _batched_decode_tensors(
         self,
@@ -1495,10 +1510,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             members.sort()
             plan = group_plan(members)
             assert plan is not None
-            shared_slot_seqs = slot_onehot = None
+            shared_slot_seqs = slot_row_ids = slot_onehot = None
             if isinstance(plan, SharedSlotPlan):
                 shared_slot_seqs = bucketer.shared_slot_seqs
-                fields, slot_onehot = self._shared_slot_tensors(members, plan, *rest)
+                fields, slot_row_ids, slot_onehot = self._shared_slot_tensors(members, plan, *rest)
             else:
                 fields = self._batched_decode_tensors(members, plan, *rest)
             out.append(
@@ -1508,6 +1523,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     *fields,
                     chunk_range=plan.chunk_range,
                     shared_slot_seqs=shared_slot_seqs,
+                    slot_row_ids_cpu=slot_row_ids,
                     slot_onehot_cpu=slot_onehot,
                 )
             )
@@ -2426,6 +2442,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             blocks_per_chunk,
             block_size,
             output if store_out else None,
+            attn_metadata.slot_row_ids_dev,
             attn_metadata.slot_onehot_dev,
         )
         if store_out:
@@ -2480,6 +2497,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     mask_by_chunk_dev=None,
                     chunk_range=group.chunk_range,
                     shared_slot_seqs=group.shared_slot_seqs,
+                    slot_row_ids_cpu=group.slot_row_ids_cpu,
+                    slot_row_ids_dev=None,
                     slot_onehot_cpu=group.slot_onehot_cpu,
                     slot_onehot_dev=None,
                     decode_groups=None,
@@ -2515,7 +2534,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.mask_by_chunk_cpu is not None
         attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
         if attn_metadata.shared_slot_seqs is not None:
+            assert attn_metadata.slot_row_ids_cpu is not None
             assert attn_metadata.slot_onehot_cpu is not None
+            attn_metadata.slot_row_ids_dev = convert(attn_metadata.slot_row_ids_cpu, device=device)
             attn_metadata.slot_onehot_dev = convert(attn_metadata.slot_onehot_cpu, device=device)
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
@@ -2570,6 +2591,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        slot_row_ids: torch.Tensor | None = None,
         slot_onehot: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale, v_scale = self._read_scales()
@@ -2594,6 +2616,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out=out,
             v_scale=v_scale,
             sinks=self._device_sinks(query_dev.device),
+            slot_row_ids=slot_row_ids,
             slot_onehot=slot_onehot,
         )
 

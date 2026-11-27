@@ -26,9 +26,10 @@ slot 0 processes blocks 0, 2, 4, ... and slot 1 processes blocks 1, 3, 5, ... of
 sequence.
 Only the temporary softmax state grows; the permanent KV cache is unchanged.
 
-In shared-slot mode the chunk's 32 block slots are not tied to a sequence: the host
-assigns each one to a sequence per step, and a ``[slots, rows]`` one-hot then merges each
-sequence's block slots into its output row, so no shape depends on the batch size.
+In shared-slot mode the chunk's block slots are not tied to a sequence: the host assigns
+each one to a sequence per step, and a ``[rows, slots]`` one-hot then merges each
+sequence's block slots into its output row with a matmul, so no shape depends on the
+batch size.
 """
 
 import torch
@@ -95,26 +96,48 @@ def _merge_entry_local(
     )
 
 
-def _merge_shared_slots(*, tile_max, tile_sum, tile_output, slot_onehot, sinks=None):
-    """Rescale each row's block slots to the row's maximum, sum them, then normalize once.
+def _merge_shared_slots(
+    *,
+    tile_max,
+    tile_sum,
+    tile_output,
+    slot_row_ids,
+    slot_onehot,
+    num_kv_heads,
+    num_queries_per_kv,
+    head_size,
+    sinks=None,
+):
+    """Merge each row's block slots into one output row, then normalize once.
 
-    ``slot_onehot`` [E, R, 1, 1, 1] marks the rows each block slot counts towards, so it is
-    ``_merge_entry_local`` with the ``(J, B)`` split replaced by a one-hot: every input
-    keeps the carry's rank and the sums run over dim 0. A row past the batch repeats row
-    0's slots, so all of a slot's rows share one maximum. An idle slot is in no row.
+    ``slot_onehot`` [KV, Q, R, E] marks the block slots of each output row, repeated per head
+    so the weighted values sum with a matmul batched over (KV, Q), the two batch axes
+    lower_bmm allows, instead of a broadcast over the rows; ``slot_row_ids`` [E] is the row
+    each slot's maximum is read from. The maximum and the sum have no head dim, so they keep
+    the broadcast: as a matmul the sum's N=1 output needs E to fill whole sticks, and 32
+    slots fill half of one. The heads stay split until the final reshape, as in
+    _merge_entry_local: torch-spyre cannot put a merged (KV, Q) axis on the stick. A row
+    past the batch repeats row 0's slots, and an idle slot is in no row and reads row 0.
     """
-    a = slot_onehot
+    num_out, entries = slot_onehot.shape[2:]
     neg = torch.finfo(tile_max.dtype).min
-    # Masked, not multiplied out: a slot outside a row must not lift its maximum.
-    row_max = torch.amax(a * tile_max + (1 - a) * neg, dim=0, keepdim=True)
-    slot_ref = torch.amax(a * row_max + (1 - a) * neg, dim=1, keepdim=True)
-    weight = torch.exp(-torch.relu(slot_ref - tile_max))
+    tm = tile_max.reshape(entries, num_kv_heads, num_queries_per_kv, 1)
+    in_row = (slot_onehot[0, 0] > 0).reshape(num_out, entries, 1, 1, 1)
+    # Selected, not offset: a slot outside a row must not lift its maximum.
+    row_max = torch.amax(torch.where(in_row, tm.unsqueeze(0), neg), dim=1)
+    weight = torch.exp(tm - row_max.index_select(0, slot_row_ids))
     # Selected, not multiplied out: an idle slot reads a fully masked page, so its sums grow
     # with every chunk and can overflow, and 0 * inf would carry NaN into every row.
-    in_row = a > 0
-    row_sum = torch.sum(torch.where(in_row, weight * tile_sum, 0.0), dim=0)
-    row_out = torch.sum(torch.where(in_row, weight * tile_output, 0.0), dim=0)
-    return normalize(row_max[0], row_sum, row_out, sinks)
+    slot_sum = weight * tile_sum.reshape(entries, num_kv_heads, num_queries_per_kv, 1)
+    row_sum = torch.sum(torch.where(in_row, slot_sum.unsqueeze(0), 0.0), dim=1)
+    in_any = (torch.amax(slot_onehot[0, 0], dim=0) > 0).reshape(entries, 1, 1, 1)
+    tile_output = tile_output.reshape(entries, num_kv_heads, num_queries_per_kv, head_size)
+    slot_out = torch.where(in_any, weight * tile_output, 0.0)
+    # [KV, Q, R, E] @ [KV, Q, E, D] -> [KV, Q, R, D] -> [R, KV, Q, D]
+    row_out = torch.matmul(slot_onehot, slot_out.permute(1, 2, 0, 3)).permute(2, 0, 1, 3)
+    return normalize(row_max, row_sum, row_out, sinks).reshape(
+        num_out, num_kv_heads * num_queries_per_kv, head_size
+    )
 
 
 def batched_decode_kernel(
@@ -137,6 +160,7 @@ def batched_decode_kernel(
     v_scale=None,
     sinks=None,
     entry_local,
+    slot_row_ids=None,
     slot_onehot=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
@@ -157,9 +181,9 @@ def batched_decode_kernel(
     defer. A dynamic chunk count must keep it, since branching on the count would be a
     guard.
 
-    Shared-slot mode: ``slot_onehot`` [E, R, 1, 1, 1] (see ``_merge_shared_slots``), with
-    num_seqs=1, blocks_per_chunk=E and entry_local, since only the merge assigns the slots
-    to sequences. The output is [R, num_heads, head_size].
+    Shared-slot mode: ``slot_row_ids`` [E] and ``slot_onehot`` [KV, Q, R, E] (see
+    ``_merge_shared_slots``), with num_seqs=1, blocks_per_chunk=E and entry_local, since only
+    the merge assigns the slots to sequences. The output is [R, num_heads, head_size].
     """
     from torch_spyre._inductor.wsr import for_each_tile
 
@@ -260,16 +284,18 @@ def batched_decode_kernel(
         ),
     )
     tile_max, tile_sum, tile_output = carry
-    out_rows = num_seqs
     if slot_onehot is not None:
-        out_rows = slot_onehot.shape[1]
         attn = _merge_shared_slots(
             tile_max=tile_max,
             tile_sum=tile_sum,
             tile_output=tile_output,
+            slot_row_ids=slot_row_ids,
             slot_onehot=slot_onehot,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=num_queries_per_kv,
+            head_size=head_size,
             sinks=sinks,
-        ).reshape(out_rows, num_heads, head_size)
+        )
     elif entry_local:
         attn = _merge_entry_local(
             tile_max=tile_max,
@@ -290,6 +316,6 @@ def batched_decode_kernel(
     if out is not None:
         # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
         # don't-care and kept finite by the builder.
-        out[:out_rows].copy_(attn)
+        out[: attn.shape[0]].copy_(attn)
         return out
     return attn
